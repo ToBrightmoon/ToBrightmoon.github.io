@@ -1,10 +1,9 @@
 ---
 title: "coredump的那些事:01.coredump的启动"
-date: 2025-08-29
-index_img: /images/raii.png
-categories: 
-  - coredump
-  - 程序员的自我修养
+date: 2025-08-20
+categories:
+   - 程序员的自我修养
+   - coredump
 tags:
   - coredump
   - linux

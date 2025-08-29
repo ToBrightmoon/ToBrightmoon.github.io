@@ -80,7 +80,7 @@ exclude:
 ignore:
 
 # Extensions
-theme: next
+theme: butterfly
 
 # Deployment
 deploy:
