@@ -28,7 +28,7 @@
 <meta property="og:description" content="前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。 在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的">
 <meta property="og:locale" content="zh_CN">
 <meta property="article:published_time" content="2025-08-26T16:00:00.000Z">
-<meta property="article:modified_time" content="2025-08-29T02:18:47.656Z">
+<meta property="article:modified_time" content="2025-08-29T09:02:31.294Z">
 <meta property="article:author" content="ToBrightMoon">
 <meta property="article:tag" content="C++">
 <meta property="article:tag" content="muduo">
@@ -223,7 +223,7 @@
                   <i class="far fa-calendar-check"></i>
                 </span>
                 <span class="post-meta-item-text">更新于</span>
-                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+                <time title="修改时间：2025-08-29 17:02:31" itemprop="dateModified" datetime="2025-08-29T17:02:31+08:00">2025-08-29</time>
               </span>
             <span class="post-meta-item">
               <span class="post-meta-item-icon">
@@ -341,12 +341,12 @@
         
     <div class="post-nav">
       <div class="post-nav-item">
-    <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/" rel="prev" title="muduo源码剖析:03.定时器的实现">
-      <i class="fa fa-chevron-left"></i> muduo源码剖析:03.定时器的实现
+    <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:02.%E4%BA%8B%E4%BB%B6%E7%9A%84%E5%A4%84%E7%90%86/" rel="prev" title="muduo源码剖析:02.事件的处理">
+      <i class="fa fa-chevron-left"></i> muduo源码剖析:02.事件的处理
     </a></div>
       <div class="post-nav-item">
-    <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:02.%E4%BA%8B%E4%BB%B6%E7%9A%84%E5%A4%84%E7%90%86/" rel="next" title="muduo源码剖析:02.事件的处理">
-      muduo源码剖析:02.事件的处理 <i class="fa fa-chevron-right"></i>
+    <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:01.%E4%B8%80%E4%B8%AA%E7%BA%BF%E7%A8%8B%E4%B8%80%E4%B8%AAEventloop/" rel="next" title="muduo源码剖析:01.一个线程一个Eventloop">
+      muduo源码剖析:01.一个线程一个Eventloop <i class="fa fa-chevron-right"></i>
     </a></div>
     </div>
       </footer>
