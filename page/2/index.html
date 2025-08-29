@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<meta name="theme-color" content="#222">
+<meta name="generator" content="Hexo 7.3.0">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Lora:300,300italic,400,400italic,700,700italic|Roboto:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+<link rel="stylesheet" href="/lib/font-awesome/css/all.min.css">
+
+<script id="hexo-configurations">
+    var NexT = window.NexT || {};
+    var CONFIG = {"hostname":"tobrightmoon.github.io","root":"/","scheme":"Gemini","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"always","padding":20,"offset":12,"onmobile":true},"copycode":{"enable":true,"show_result":true,"style":"mac"},"back2top":{"enable":true,"sidebar":false,"scrollpercent":true},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}},"path":"search.xml"};
+  </script>
+
+  <meta name="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+<meta property="og:type" content="website">
+<meta property="og:title" content="ToBrightMoon 的个人博客">
+<meta property="og:url" content="https://tobrightmoon.github.io/page/2/index.html">
+<meta property="og:site_name" content="ToBrightMoon 的个人博客">
+<meta property="og:description" content="记录我的开发与成长，分享 C++ 和源码分析">
+<meta property="og:locale" content="zh_CN">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="C++, spdlog, 源码分析">
+<meta name="twitter:card" content="summary">
+
+<link rel="canonical" href="https://tobrightmoon.github.io/page/2/">
+
+
+<script id="page-configurations">
+  // https://hexo.io/docs/variables.html
+  CONFIG.page = {
+    sidebar: "",
+    isHome : true,
+    isPost : false,
+    lang   : 'zh-CN'
+  };
+</script>
+
+  <title>ToBrightMoon 的个人博客</title>
+  
+
+
+
+
+
+
+  <noscript>
+  <style>
+  .use-motion .brand,
+  .use-motion .menu-item,
+  .sidebar-inner,
+  .use-motion .post-block,
+  .use-motion .pagination,
+  .use-motion .comments,
+  .use-motion .post-header,
+  .use-motion .post-body,
+  .use-motion .collection-header { opacity: initial; }
+
+  .use-motion .site-title,
+  .use-motion .site-subtitle {
+    opacity: initial;
+    top: initial;
+  }
+
+  .use-motion .logo-line-before i { left: initial; }
+  .use-motion .logo-line-after i { right: initial; }
+  </style>
+</noscript>
+
+</head>
+
+<body itemscope itemtype="http://schema.org/WebPage">
+  <div class="container use-motion">
+    <div class="headband"></div>
+
+    <header class="header" itemscope itemtype="http://schema.org/WPHeader">
+      <div class="header-inner"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏">
+      <span class="toggle-line toggle-line-first"></span>
+      <span class="toggle-line toggle-line-middle"></span>
+      <span class="toggle-line toggle-line-last"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <span class="logo-line-before"><i></i></span>
+      <h1 class="site-title">ToBrightMoon 的个人博客</h1>
+      <span class="logo-line-after"><i></i></span>
+    </a>
+      <p class="site-subtitle" itemprop="description">探索代码的奥秘</p>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+
+<nav class="site-nav">
+  <ul id="menu" class="main-menu menu">
+        <li class="menu-item menu-item-home">
+
+    <a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a>
+
+  </li>
+        <li class="menu-item menu-item-tags">
+
+    <a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a>
+
+  </li>
+        <li class="menu-item menu-item-categories">
+
+    <a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a>
+
+  </li>
+        <li class="menu-item menu-item-archives">
+
+    <a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a>
+
+  </li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup">
+        <div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div id="search-result">
+  <div id="no-result">
+    <i class="fa fa-spinner fa-pulse fa-5x fa-fw"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</div>
+    </header>
+
+    
+  <div class="back-to-top">
+    <i class="fa fa-arrow-up"></i>
+    <span>0%</span>
+  </div>
+  <div class="reading-progress-bar"></div>
+
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="content-wrap">
+          
+
+          <div class="content index posts-expand">
+            
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/" class="post-title-link" itemprop="url">muduo源码剖析:03.定时器的实现</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-27 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-27T00:00:00+08:00">2025-08-27</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/muduo/" itemprop="url" rel="index"><span itemprop="name">muduo</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a><strong>前言</strong></h2><p>在muduo源码剖析的前两篇文章中，我们深入探讨了 muduo 的核心并发模型——“One Loop Per Thread” 的实现，以及 TCP<br>连接从建立、数据收发到关闭的完整生命周期管理。</p>
+<p>这些内容实际上已经对陈硕大佬在网络库上的设计设计思想体现的很清晰了。但是仅有这些还是不够的， 除了处理网络 I&#x2F;O<br>事件，一个完备的网络库还需要处理时间相关的事件。<br>例如，在固定的时间点执行某个任务（runAt）、在一段延迟之后执行任务（runAfter），或者以固定的时间间隔重复执行任务（runEvery）。这些都离不开一个高效且精准的定时器机制。</p>
+<p>正如陈硕大佬在《Linux多线程服务端编程》一书中所强调的，muduo 的一个重要设计选择是<strong>利用 timerfd_create 这个 Linux<br>系统调用，将时间事件也转化为文件描述符事件</strong>，从而能够被 EventLoop 的 Poller (通常是 epoll) 统一管理和调度。</p>
+<p>本文，我们将聚焦于 muduo::net::TimerQueue 类，深入剖析其如何巧妙地利用 timerfd 实现了一个高效、线程安全的定时器队列，并与<br>EventLoop 的事件驱动模型完美融合。</p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:05.%E5%9F%BA%E4%BA%8E%E5%AF%B9%E8%B1%A1%E4%B8%8E%E9%9D%A2%E5%90%91%E5%AF%B9%E8%B1%A1%E7%9A%84%E8%AE%BE%E8%AE%A1/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:05.%E5%9F%BA%E4%BA%8E%E5%AF%B9%E8%B1%A1%E4%B8%8E%E9%9D%A2%E5%90%91%E5%AF%B9%E8%B1%A1%E7%9A%84%E8%AE%BE%E8%AE%A1/" class="post-title-link" itemprop="url">muduo源码剖析:05.基于对象与面向对象的设计</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-27 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-27T00:00:00+08:00">2025-08-27</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/muduo/" itemprop="url" rel="index"><span itemprop="name">muduo</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="前言："><a href="#前言：" class="headerlink" title="前言："></a>前言：</h2><p>在前几篇文章中，我们依次剖析了：</p>
+<ul>
+<li><code>EventLoop</code> 的单线程事件循环模型（One Loop Per Thread）</li>
+<li><code>TcpConnection</code> 的连接生命周期与“三个半事件”机制</li>
+<li><code>TimerQueue</code> 在事件驱动框架下的使用</li>
+<li><code>Buffer</code> 模块在高性能数据处理中的角色</li>
+</ul>
+<p>至此，我们已经基本掌握了陈硕大佬在《Linux 多线程服务端编程》中提出的网络编程核心思想及其在 muduo 中的具象实现。</p>
+<p>在这篇文章中，我们不再分析具体功能的实现细节，而是谈一谈陈硕大佬对 C++ 进行开发的一个理念：<strong>muduo 并未采用传统的“面向对象”编程风格，而是秉持“基于对象”的理念进行系统设计。</strong></p>
+<h2 id="我们要具体分析这两者在使用上，功能实现上的区别。"><a href="#我们要具体分析这两者在使用上，功能实现上的区别。" class="headerlink" title="我们要具体分析这两者在使用上，功能实现上的区别。"></a>我们要具体分析这两者在使用上，功能实现上的区别。<br>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:05.%E5%9F%BA%E4%BA%8E%E5%AF%B9%E8%B1%A1%E4%B8%8E%E9%9D%A2%E5%90%91%E5%AF%B9%E8%B1%A1%E7%9A%84%E8%AE%BE%E8%AE%A1/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/" class="post-title-link" itemprop="url">spdlog源码阅读:01.异步机制解析</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h1 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h1><p>在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。</p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/" class="post-title-link" itemprop="url">spdlog源码阅读:03.实现自定义压缩sink</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h1 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h1><p>spdlog 是一个功能强大且高度可扩展的 C++ 日志库，其模块化设计允许开发者通过自定义 sink 实现灵活的日志输出。在前两篇文章中，我们分析了 spdlog 的异步日志机制以及 <code>daily_file_sink</code> 和 <code>rotating_file_sink</code> 的实现。本文将聚焦于 <strong>如何在 spdlog 中实现自定义 sink</strong>，以 <code>compressed_file_sink</code> 为例，详细讲解如何利用 zlib 库实现日志压缩功能，减少磁盘空间占用。</p>
+<p>通过本文，你将学会：</p>
+<ul>
+<li>spdlog 中自定义 sink 的实现步骤。</li>
+<li><code>compressed_file_sink</code> 如何通过 zlib 实现日志压缩。</li>
+<li>自定义 sink 的关键设计要点和注意事项。</li>
+</ul>
+<p><strong>注：本文分析的源码基于 spdlog v1.15.1 和提供的 <code>compressed_file_sink</code> 实现。</strong></p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/" class="post-title-link" itemprop="url">spdlog源码阅读:02.sink分析</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h2><p>上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。</p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:04.format%E6%A0%BC%E5%BC%8F%E5%8C%96%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:04.format%E6%A0%BC%E5%BC%8F%E5%8C%96%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90/" class="post-title-link" itemprop="url">spdlog源码阅读:04.format格式化引擎分析</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h2><p>在本系列的前三篇文章中，我们依次探讨了 spdlog 的核心异步日志机制、两种常用的内建文件 Sink（<code>daily_file_sink</code> 和 <code>rotating_file_sink</code>），以及如何通过实现自定义 Sink（以 <code>compressed_file_sink</code> 为例）来扩展其功能。至此，我们已经对日志消息的产生、处理、流转以及最终输出有了较为深入的理解。</p>
+<p>现在我们开始剖析spdlog日志中的最后一个组件 <code>formmatter</code>。</p>
+<p><code>spdlog</code> 提供了强大的日志格式化功能，允许用户通过模式字符串 (pattern string) 精确控制日志输出的每一个细节，例如时间戳、日志级别、线程 ID、源代码位置以及日志消息本身。这一核心功能主要由 <code>pattern_formatter</code> 类负责。</p>
+<p>本文将聚焦于 <code>spdlog</code> 的**核心格式化引擎 <code>pattern_formatter</code>**，剖析其如何将用户定义的模式字符串解析、编译，并最终应用于日志消息，生成格式化的输出。通过本文，你将理解：</p>
+<ul>
+<li><code>pattern_formatter</code> 的两阶段工作机制：“编译”与“执行”。</li>
+<li>模式字符串是如何被解析成一系列格式化单元 (<code>flag_formatter</code>) 的。</li>
+<li><code>spdlog</code> 如何支持丰富的内置格式标志（如 <code>%Y</code>, <code>%m</code>, <code>%l</code>, <code>%v</code> 等）。</li>
+<li><code>spdlog</code> 格式化引擎的扩展性：如何实现并注册自定义的格式标志。</li>
+</ul>
+<p><strong>注：本文分析的源码基于 spdlog v1.15.1。</strong></p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:04.format%E6%A0%BC%E5%BC%8F%E5%8C%96%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:05.spdlog%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%B0%9D%E8%AF%95/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:05.spdlog%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%B0%9D%E8%AF%95/" class="post-title-link" itemprop="url">spdlog源码阅读:05.spdlog性能优化尝试</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h2><p>在本系列的前四篇文章中，我们对 <code>spdlog</code> 的异步机制、文件 Sink、自定义 Sink 扩展以及核心格式化引擎 <code>pattern_formatter</code> 进行了深入剖析。通过这些分析，我们对 <code>spdlog</code> 的设计哲学和实现细节有了全面的理解。<code>spdlog</code> 以其丰富的功能和相对不错的性能得到了广泛应用，但其默认的异步日志模型（基于共享的 MPMC 阻塞队列）在高并发、多生产者场景下，队列的锁竞争可能成为性能瓶颈。</p>
+<p>受到 <code>nanolog</code> 等高性能日志库关于利用 <code>thread_local</code> 减少前端竞争思想的启发，本文将详细阐述一种对 <code>spdlog</code> 异步日志机制的改进方案。核心思路是将原有的“多生产者-单消费者 (MPSC)”模型，演进为“<strong>多个独立的单生产者-单消费者 (SPSC) 模型集合 + 后端统一合并处理</strong>”的架构，旨在显著降低生产者线程间的锁竞争，并利用最小堆保证全局日志的时间顺序，以期获得性能上的提升。</p>
+<p>通过本文，你将了解到：</p>
+<ul>
+<li>该改进方案的设计思想与架构。</li>
+<li>如何利用 <code>thread_local</code> 为每个生产者线程创建独立的 SPSC 队列。</li>
+<li>后端消费者线程如何发现、管理这些动态创建的队列。</li>
+<li>如何通过最小堆（优先级队列）对来自不同 SPSC 队列的日志消息进行时间戳排序，以保证全局顺序。</li>
+<li>关键组件（如 <code>details::thread_pool_local</code>、<code>spsc_blocking_queue</code>）的设计与核心实现。</li>
+<li>以及笔者通过实验验证此方案相较于原版 <code>spdlog</code> 带来的性能提升。</li>
+</ul>
+<p><strong>注：本文的改进方案基于对 <code>spdlog</code> v1.15.1 的理解和修改实践。</strong></p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:05.spdlog%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%B0%9D%E8%AF%95/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+      
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h2 class="post-title" itemprop="name headline">
+          
+            <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/" class="post-title-link" itemprop="url">spdlog源码阅读:06.spdlog中的设计模式</a>
+        </h2>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+          <h2 id="前言：从功能到架构，探寻-spdlog-的设计之美"><a href="#前言：从功能到架构，探寻-spdlog-的设计之美" class="headerlink" title="前言：从功能到架构，探寻 spdlog 的设计之美"></a><strong>前言：从功能到架构，探寻 spdlog 的设计之美</strong></h2><p>在本系列之前的文章中，我们深入剖析了 spdlog 的异步机制、核心组件，并且尝试拓展实现一个压缩sink，还尝试进行了性能优化实践。</p>
+<p>我们理解了 spdlog 在功能和性能上“做了什么”以及“怎么做的”。现在，我们跳出具体实现的细节，从<strong>设计模式</strong>的角度重新看一下这个库，</p>
+<p>深入探讨 spdlog 是如何巧妙地运用**策略模式 (Strategy)<strong>、</strong>组合模式 (Composite)<strong>、</strong>工厂模式 (Factory)<strong>、以及</strong>单例模式 (Singleton)**，来构建其灵活、高效且用户友好的体系的。</p>
+          <!--noindex-->
+            <div class="post-button">
+              <a class="btn" href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/#more" rel="contents">
+                阅读全文 &raquo;
+              </a>
+            </div>
+          <!--/noindex-->
+        
+      
+    </div>
+
+    
+    
+    
+      <footer class="post-footer">
+        <div class="post-eof"></div>
+      </footer>
+  </article>
+  
+  
+  
+
+
+  
+  <nav class="pagination">
+    <a class="extend prev" rel="prev" href="/"><i class="fa fa-angle-left" aria-label="上一页"></i></a><a class="page-number" href="/">1</a><span class="page-number current">2</span>
+  </nav>
+
+
+
+          </div>
+          
+
+<script>
+  window.addEventListener('tabs:register', () => {
+    let { activeClass } = CONFIG.comments;
+    if (CONFIG.comments.storage) {
+      activeClass = localStorage.getItem('comments_active') || activeClass;
+    }
+    if (activeClass) {
+      let activeTab = document.querySelector(`a[href="#comment-${activeClass}"]`);
+      if (activeTab) {
+        activeTab.click();
+      }
+    }
+  });
+  if (CONFIG.comments.storage) {
+    window.addEventListener('tabs:click', event => {
+      if (!event.target.matches('.tabs-comment .tab-content .tab-pane')) return;
+      let commentClass = event.target.classList[1];
+      localStorage.setItem('comments_active', commentClass);
+    });
+  }
+</script>
+
+        </div>
+          
+  
+  <div class="toggle sidebar-toggle">
+    <span class="toggle-line toggle-line-first"></span>
+    <span class="toggle-line toggle-line-middle"></span>
+    <span class="toggle-line toggle-line-last"></span>
+  </div>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <ul class="sidebar-nav motion-element">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <!--noindex-->
+      <div class="post-toc-wrap sidebar-panel">
+      </div>
+      <!--/noindex-->
+
+      <div class="site-overview-wrap sidebar-panel">
+        <div class="site-author motion-element" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="ToBrightMoon"
+      src="/images/avatar.png">
+  <p class="site-author-name" itemprop="name">ToBrightMoon</p>
+  <div class="site-description" itemprop="description">记录我的开发与成长，分享 C++ 和源码分析</div>
+</div>
+<div class="site-state-wrap motion-element">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+          <a href="/archives/">
+        
+          <span class="site-state-item-count">18</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+            <a href="/categories/">
+          
+        <span class="site-state-item-count">7</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+            <a href="/tags/">
+          
+        <span class="site-state-item-count">10</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author motion-element">
+      <span class="links-of-author-item">
+        <a href="https://github.com/ToBrightmoon" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;ToBrightmoon" rel="noopener" target="_blank"><i class="fab fa-github fa-fw"></i></a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="https://www.zhihu.com/people/meng-zhong-ren-5-90" title="知乎 → https:&#x2F;&#x2F;www.zhihu.com&#x2F;people&#x2F;meng-zhong-ren-5-90" rel="noopener" target="_blank"><i class="fa-custom zhihu fa-fw"></i></a>
+      </span>
+  </div>
+
+
+
+      </div>
+
+    </div>
+  </aside>
+  <div id="sidebar-dimmer"></div>
+
+
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        
+
+        
+
+<div class="copyright">
+  
+  &copy; 
+  <span itemprop="copyrightYear">2025</span>
+  <span class="with-love">
+    <i class="fa fa-heart"></i>
+  </span>
+  <span class="author" itemprop="copyrightHolder">ToBrightMoon</span>
+</div>
+  <div class="powered-by">由 <a href="https://hexo.io/" class="theme-link" rel="noopener" target="_blank">Hexo</a> & <a href="https://theme-next.org/" class="theme-link" rel="noopener" target="_blank">NexT.Gemini</a> 强力驱动
+  </div>
+
+        
+
+
+
+
+
+
+
+
+      </div>
+    </footer>
+  </div>
+
+  
+  <script src="/lib/anime.min.js"></script>
+  <script src="/lib/velocity/velocity.min.js"></script>
+  <script src="/lib/velocity/velocity.ui.min.js"></script>
+
+<script src="/js/utils.js"></script>
+
+<script src="/js/motion.js"></script>
+
+
+<script src="/js/schemes/pisces.js"></script>
+
+
+<script src="/js/next-boot.js"></script>
+
+
+
+
+  
+
+
+
+
+  
+<script src="/js/local-search.js"></script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+</body>
+</html>

@@ -1,0 +1,1729 @@
+<?xml version="1.0" encoding="utf-8"?>
+<search>
+  <entry>
+    <title>coredump的那些事:01.coredump的启动</title>
+    <url>/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/</url>
+    <content><![CDATA[前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候，
+一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。
+注：本文的一些终端操作均在ubuntu22.04下进行
+
+coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册
+The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 whichcause a process to dump core can be found in signal(7)....
+上面的英文，使用中文简单总结就是:
+当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息
+从上面的介绍中可以得到一些信息:
+
+没有处理一些信号会导致进程终止并产生coredump文件
+coredump是操作系统产生的
+coredump可以供gdb调试器使用
+
+核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。
+产生coredump生成的信号那么到底那些信号会导致coredump的产生呢? 我们使用 man 7 signal 这个命令去查看信号的手册，在 Standard signals 小节中有着相关的内容，相关的内容如下
+Standard signals      Linux  supports  the  standard signals listed below.        ......      Signal      Standard   Action   Comment      ────────────────────────────────────────────────────────────────────────      SIGABRT      P1990      Core    Abort signal from abort(3)      SIGBUS       P2001      Core    Bus error (bad memory access)      SIGFPE       P1990      Core    Floating-point exception      SIGILL       P1990      Core    Illegal Instruction      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT      SIGQUIT      P1990      Core    Quit from keyboard      SIGSEGV      P1990      Core    Invalid memory reference      SIGSYS       P2001      Core    Bad system call (SVr4);                                      see also seccomp(2)      SIGTRAP      P2001      Core    Trace/breakpoint trap      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);                                      see setrlimit(2)      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);                                      see setrlimit(2)
+这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。
+具体的coredump的产生的细节，可以参考知乎上的一篇文章
+coredump的配置之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。
+coredump生成的限制Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 man 5 core这个命令去查看coredump的手册，去找到相关的内容:
+    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐    nal; see getrlimit(2) for details.    There are various circumstances in which a core dump file is not produced:    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumpedcore, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be createdis not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.    ......
+
+将手册中的内容简单使用中文总结就是:
+有多种情况会导致 不生成 core dump 文件：
+
+进程没有权限写 core 文件（默认文件名为 core 或 core.pid，存放在当前工作目录）。
+目标文件已存在并有多个硬链接。
+文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。
+目录不存在。
+RLIMIT_CORE 或 RLIMIT_FSIZE 被设置为 0。
+可执行文件没有读取权限（安全措施）。
+程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 prctl(2) PR_SET_DUMPABLE 和 /proc/sys/fs/suid_dumpable 允许）。
+/proc/sys/kernel/core_pattern 为空 且 /proc/sys/kernel/core_uses_pid &#x3D; 0。
+内核编译时未启用 CONFIG_COREDUMP（Linux 3.7+）。
+进程使用了 madvise(MADV_DONTDUMP) 屏蔽了部分地址空间。
+在 systemd 系统中，core dump 可能由 systemd-coredump(8) 接管。
+
+那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:
+针对系统本身:
+
+磁盘空间足够，支持生成coredump。
+生成coredump的大小在受限范围内。
+生成文件的目录存在。
+
+针对进程：
+
+进程未被systemd接管，没有屏蔽 地址空间
+有相关位置的读写权限。
+
+我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。
+此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容
+操作步骤临时开启linux提供了ulimit这个命令去修改coredump的限制，相关的内容可以通过 man ulimit去查阅。
+## 打开终端,修改系统限制为不限制 coredumop大小## 不要关闭终端，因为ulimit命令只在当前终端下生效。ulimit -c unlimited## 将当前的coredump输出目录修改成你的进程有权限读写的位置## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符sudo bash -c &#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下
+长久开启想要长久的配置coredump文件的启动，需要修改 /etc/security/limits.conf和 /etc/sysctl.conf 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效
+# 使用gedit工具打开limits.conf文件 sudo gedit /etc/security/limits.conf # 在文件的最后一行增加如下内容,注意*不能省略*               soft    core            unlimited # 编辑/etc/sysctl.conf文件sudo gedit /etc/sysctl.conf# 在文件的最后一行增加如下内容kernel.core_pattern=/path/%e-%p.core
+
+配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用
+创建服务文件:
+sudo gedit /etc/systemd/system/sysctl-reload.service
+
+文件内容如下所示
+[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target
+
+执行如下命令配置服务
+# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+配套的脚本读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够知其然,也知其所以然,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。
+这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 ~/coredump 目录下。
+#!/bin/bash# 获取当前用户的用户名USERNAME=$(whoami)CORE_PATH=&quot;/home/$USERNAME/coredump&quot;# 创建coredump存储目录mkdir -p $CORE_PATH# 定义新脚本的文件名和路径SCRIPT_PATH=&quot;$CORE_PATH/rename_core.sh&quot;# 使用重定向符号将内容写入新脚本cat &lt;&lt; EOF &gt; $SCRIPT_PATH#!/bin/bashCOREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;EOFcat &lt;&lt; &#x27;EOF&#x27; &gt;&gt; $SCRIPT_PATHTIMESTAMP=&quot;$(date +%Y-%m-%d-%H-%M-%S)&quot;COREFILE_NAME=&quot;$&#123;1&#125;-$&#123;2&#125;-$TIMESTAMP.core&quot;# 创建coredump文件cat &gt; &quot;$COREFILE_DIR/$COREFILE_NAME&quot;EOFchmod +x $SCRIPT_PATH# 永久设置coredump文件大小限制sudo bash -c  &#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;sudo bash -c &#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;# 确保设置在重启后仍然有效echo &quot;Making changes persistent...&quot;sudo bash -c &#x27;echo &quot;kernel.core_pattern=|&#x27;$SCRIPT_PATH&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;SERVICE=&quot;/etc/systemd/system/sysctl-reload.service&quot;sudo bash -c &#x27;echo &quot;[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target&quot; &gt; &#x27;$SERVICE&#x27;&#x27;# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+相关部分的部分内核源码解读之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。
+这个函数的位置是 linux内核中的 fs/coredump.c中。我查看的源码的分支是 v6.9,读者也可以从 https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635 这个网址查看。
+初始化参数struct mm_struct *mm = current-&gt;mm; // 进程的内存描述符，保存了进程的虚拟内存信息struct linux_binfmt * binfmt;......struct coredump_params cprm = &#123;	.siginfo = siginfo,	.limit = rlimit(RLIMIT_CORE), // coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）	.mm_flags = mm-&gt;flags,	.vma_meta = NULL,	.cpu = raw_smp_processor_id(),&#125;;
+
+这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制
+简单的检查如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败
+binfmt = mm-&gt;binfmt;if (!binfmt || !binfmt-&gt;core_dump)	goto fail;if (!__get_dumpable(cprm.mm_flags))	goto fail;
+
+输出方式的决定如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入
+ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);if (ispipe) &#123;   ......    /* 管道模式，把 core dump 交给用户态程序处理 */    sub_info = call_usermodehelper_setup(helper_argv[0],                        helper_argv, NULL, GFP_KERNEL,                        umh_pipe_setup, NULL, &amp;cprm);    retval = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);&#125; else &#123;    .....    // 检查文件的大小和suid模式下是否是绝对路径    if (cprm.limit &lt; binfmt-&gt;min_coredump)			goto fail_unlock;		if (need_suid_safe &amp;&amp; cn.corename[0] != &#x27;/&#x27;) &#123;			printk(KERN_WARNING &quot;Pid %d(%s) can only dump core &quot;\				&quot;to fully qualified path!\n&quot;,				task_tgid_vnr(current), current-&gt;comm);			printk(KERN_WARNING &quot;Skipping core dump\n&quot;);			goto fail_unlock;		&#125;    /* 文件模式，直接写入 core 文件 */    cprm.file = filp_open(cn.corename, open_flags, 0600);&#125;
+
+static int format_corename(struct core_name *cn, struct coredump_params *cprm,			   size_t **argv, int *argc)&#123;	....	int ispipe = (*pat_ptr == &#x27;|&#x27;); // 就是通过core_pattern 是否是| 决定的	bool was_space = false;	.....	// 一些coredump name的输出配置	while (*pat_ptr) &#123;		...		if (*pat_ptr != &#x27;%&#x27;) &#123;			err = cn_printf(cn, &quot;%c&quot;, *pat_ptr++);		&#125; else &#123;			switch (*++pat_ptr) &#123;			/* single % at the end, drop that */			case 0:				goto out;			/* Double percent, output one percent */			case &#x27;%&#x27;:				err = cn_printf(cn, &quot;%c&quot;, &#x27;%&#x27;);				break;			/* pid */			case &#x27;p&#x27;:				pid_in_pattern = 1;				err = cn_printf(cn, &quot;%d&quot;,					      task_tgid_vnr(current));				break;			...		&#125;		....	&#125;out:    ......	return ispipe;&#125;
+这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”
+写入内存镜像遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中
+if (!dump_vma_snapshot(&amp;cprm))		goto close_fail;	file_start_write(cprm.file);	core_dumped = binfmt-&gt;core_dump(&amp;cprm);	if (cprm.to_skip) &#123;		cprm.to_skip--;		dump_emit(&amp;cprm, &quot;&quot;, 1);	&#125;	file_end_write(cprm.file);	free_vma_snapshot(&amp;cprm);
+
+收尾关闭一些文件,回收些资源
+if (cprm.file)filp_close(cprm.file, NULL);coredump_finish(core_dumped);revert_creds(old_cred);put_cred(cred);
+
+总结本文围绕 coredump 的生成与配置 展开，主要内容如下：
+
+coredump 的本质
+
+操作系统在进程异常退出时生成的内存镜像文件
+可用于 gdb 等工具还原程序当时的运行状态
+
+
+生成条件与限制
+
+信号触发：SIGSEGV、SIGABRT、SIGBUS 等
+限制因素：RLIMIT_CORE、权限、文件系统、core_pattern 等
+
+
+配置方法
+
+临时配置：ulimit -c unlimited + 修改 /proc/sys/kernel/core_pattern
+长期配置：编辑 /etc/security/limits.conf、/etc/sysctl.conf，配合 systemd 保持生效
+
+
+内核实现
+
+do_coredump() 是核心函数
+负责检查限制、解析 core_pattern、最终写入 core 文件
+从源码角度验证了手册与实际操作的正确性
+
+
+
+]]></content>
+      <categories>
+        <category>coredump</category>
+        <category>程序员的自我修养</category>
+      </categories>
+      <tags>
+        <tag>coredump</tag>
+        <tag>linux</tag>
+        <tag>问题分析</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:01.同步客户端的使用</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言：因为最近的个人需要,想要自己多做一点实践，因此我决定 ：开发一个带 GUI 的、用于管理和监控一个外部核心服务 (Core Service) 的跨平台桌面应用。 
+在我的设想中，这个应用的架构是分层的：UI 层（我选择了 Qt）负责界面展示和用户交互，而 Service 层（我将用 C++ 实现）则负责与那个外部核心服务进行通信，并处理所有复杂的后端逻辑。
+很自然，我决定将 UI 和 Service 设计成两个独立的进程。这样不仅能让架构更清晰、权责更分明，也能避免任何一端的崩溃影响到另一端。于是，第一个核心问题就摆在了面前：UI 进程和 Service 进程之间，该如何通信？
+
+思考：我的进程间通信（IPC）技术选型常见的 IPC 手段有很多，比如命名管道、共享内存、套接字，或者更高层的 RESTful API。因为我之前在公司的项目中写过 IPC 相关的代码（虽然不是 gRPC），并且我设想的这个“外部核心服务”有大量实时状态需要流式传输给 UI，所以我很快将目光锁定在了更现代的 RPC 框架上。
+最终，我选择了 gRPC。理由如下：
+
+流式传输 (Streaming) 是刚需： 这是决定性因素。我需要将 Service 层的实时日志和连接状态源源不断地推送到 UI。gRPC 原生支持服务端流和双向流，这完美地解决了我的核心痛点。
+跨语言的未来： 虽然现在 UI 和 Service 都是 C++ 生态（Qt + C++），但 gRPC 的跨语言特性给了我极大的灵活性。未来，如果我想把 UI 换成其他语言实现，或者想用 Python&#x2F;Go 写一些简单的测试脚本来调用我的 Service，gRPC 都能轻松应对。
+性能与效率： 基于 HTTP&#x2F;2 和 Protocol Buffers，gRPC 在性能和数据压缩方面都优于传统的 REST+JSON 组合。
+强类型契约： 通过 .proto 文件定义服务，避免了手写协议和序列化的繁琐与易错。
+
+这个系列文章，就是我对自己学习和实践 gRPC 过程的笔记与复盘。我计划把如何简单地使用 gRPC 的同步模式、流模式，以及如何与 Qt 框架优雅地集成都记录下来。后续如果精力允许，可能还会去剖析一些 gRPC 的核心组件内部原理。
+准备工作：gRPC 的安装在开始之前，有一个非常重要的建议：gRPC 的手动编译安装有些麻烦，强烈建议使用 vcpkg 这个包管理器来安装。
+vcpkg 是微软推出的 C++ 包管理器，可以极大地简化第三方库的安装和集成过程。你只需要执行简单的命令，它就会自动帮你下载源码、处理依赖、编译并安装好 gRPC 及其所需的 protobuf, openssl, zlib 等所有依赖项。
+# 克隆 vcpkg  git clone https://github.com/microsoft/vcpkg.git  cd vcpkg# 运行引导脚本  ./bootstrap-vcpkg.sh # Linux / macOS  # 或者 .bootstrap-vcpkg.bat (Windows)# 安装 gRPC  ./vcpkg install grpc
+
+安装完成后，你可以通过 CMake 的 toolchain 文件非常方便地在你的项目中使用它。不要自己手动去编译，相信我，这会为你省下大量的时间和精力，让你能专注于 gRPC 本身。
+“Hello, gRPC!”：核心使用流程下面，我们来走一遍 gRPC 的核心使用流程，实现一个最简单的客户端-服务端通信。
+第一步：定义“代码合同” (.proto 文件)gRPC 的一切都始于 .proto 文件，它使用 Protocol Buffers 语法来定义服务接口和消息结构。
+对于我的项目，我先定义一个最简单的服务 Controller，它只有一个“点对点”的 RPC 调用，用于获取核心服务的版本号。
+controller.proto
+// 指定使用 proto3 语法syntax = &quot;proto3&quot;;// 定义包名，避免命名冲突package controller;// GetVersion 服务的请求消息message GetVersionRequest &#123;  // 消息字段，这里为空，因为获取版本不需要参数&#125;// GetVersion 服务的响应消息message GetVersionResponse &#123;  string version = 1; // 1 是字段的唯一编号，不是值&#125;// 定义我们的核心服务service Controller &#123;  // 定义一个 Unary RPC (一元 RPC，即点对点调用)  // 方法名叫 GetVersion，接收 GetVersionRequest，返回 GetVersionResponse  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);&#125;
+
+第二步：生成代码与文件解析定义好 .proto 文件后，我们使用 protoc 编译器和 gRPC C++ 插件来生成 C++ 代码。
+假设你的 .proto 文件在 protos 目录下，输出到当前目录protoc -I&#x3D;.&#x2F;protos –cpp_out&#x3D;.&#x2F;grpc_gen –grpc_out&#x3D;.&#x2F;grpc_gen –plugin&#x3D;protoc-gen-grpc&#x3D;which grpc_cpp_plugin .&#x2F;protos&#x2F;controller.proto
+当你使用vcpkg安装grpc的时候，你会将 protos工具和 protoc-gen-grpc工具一并安装，安装目录一般在 /home/username/.vcpkg/vcpkg/installed/x64-linux/tools 的 protobuf目录和 grpc目录下
+执行后，会生成四个关键文件：
+
+controller.pb.h &#x2F; controller.pb.cc： 这两个文件是 Protocol Buffers 生成的。它们包含了你在 .proto 中定义的 message（如 GetVersionRequest）所对应的 C++ 类，以及这些类的序列化和反序列化方法。它们只负责数据的载体。
+controller.grpc.pb.h &#x2F; controller.grpc.pb.cc： 这两个文件是 gRPC 插件生成的。它们包含了你在 .proto 中定义的 service（如 Controller）相关的 C++ 代码。这里面有：
+一个用于服务端实现的抽象基类 (Controller::Service)。
+一个用于客户端调用的桩代码类 (Controller::Stub)。
+
+
+
+理解这四个文件的分工非常重要，它体现了 gRPC 的分层设计：数据层 (Protobuf) 和通信层 (gRPC) 是分离的。
+第三步：编写服务端我们需要创建一个类，继承自生成的 Controller::Service，并重写 .proto 中定义的 GetVersion 虚函数。
+server.cc
+#include &lt;iostream&gt;#include &lt;memory&gt;#include &lt;string&gt;#include &lt;grpcpp/grpcpp.h&gt;#include &quot;grpc_gen/controller.grpc.pb.h&quot; // 引入 gRPC 生成的头文件// 继承自生成的服务基类class ControllerServiceImpl final : public controller::Controller::Service&#123;    // 重写 GetVersion 方法    grpc::Status GetVersion(grpc::ServerContext *context,                            const controller::GetVersionRequest *request,                            controller::GetVersionResponse *response) override    &#123;        std::string version_str = &quot;Core Service v1.0.0&quot;;        std::cout &lt;&lt; &quot;Received GetVersion request. Responding with: &quot; &lt;&lt; version_str &lt;&lt; std::endl;        response-&gt;set_version(version_str); // 设置响应消息        return grpc::Status::OK; // 返回 OK 状态    &#125;&#125;;void RunServer()&#123;    std::string server_address(&quot;0.0.0.0:50051&quot;);    ControllerServiceImpl service;    grpc::ServerBuilder builder;    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());    builder.RegisterService(&amp;service); // 注册我们的服务实现    std::unique_ptr&lt;grpc::Server&gt; server(builder.BuildAndStart()); // 构建并启动服务器    std::cout &lt;&lt; &quot;Server listening on &quot; &lt;&lt; server_address &lt;&lt; std::endl;    server-&gt;Wait(); // 阻塞等待服务器关闭&#125;int main(int argc, char **argv)&#123;    RunServer();    return 0;&#125;
+
+第四步：编写客户端客户端通过生成的 Controller::Stub 来调用远程方法，这个过程被封装得就像调用本地函数一样简单。
+client.cc
+#include &lt;iostream&gt;#include &lt;memory&gt;#include &lt;string&gt;#include &lt;grpcpp/grpcpp.h&gt;#include &quot;grpc_gen/controller.grpc.pb.h&quot; // 同样引入class ControllerClient&#123;public:    ControllerClient(std::shared_ptr&lt;grpc::Channel&gt; channel)        : stub_(controller::Controller::NewStub(channel))    &#123;    &#125; // 通过 Channel 创建 Stub    std::string GetVersion()    &#123;        controller::GetVersionRequest request;        controller::GetVersionResponse response;        grpc::ClientContext context;        // 发起 RPC 调用，就像调用一个本地方法        grpc::Status status = stub_-&gt;GetVersion(&amp;context, request, &amp;response);        if (status.ok())        &#123;            return response.version();        &#125;        else        &#123;            std::cout &lt;&lt; status.error_code() &lt;&lt; &quot;: &quot; &lt;&lt; status.error_message() &lt;&lt; std::endl;            return &quot;RPC failed&quot;;        &#125;    &#125;private:    std::unique_ptr&lt;controller::Controller::Stub&gt; stub_;&#125;;int main(int argc, char **argv)&#123;    std::string target_str = &quot;localhost:50051&quot;;    // 创建一个到服务端的 Channel    ControllerClient client(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials()));    std::string version = client.GetVersion();    std::cout &lt;&lt; &quot;Controller version received: &quot; &lt;&lt; version &lt;&lt; std::endl;    return 0;&#125;
+
+第五步：运行！先启动服务端，再启动客户端，你就能看到客户端成功获取到了服务端返回的版本号信息。一个完整的 RPC 调用就这么简单地完成了！
+下面就是这个服务的简单调用时序图
+总结与展望本文作为 gRPC 系列的开篇，我们从一个真实的个人项目需求出发，探讨了为什么选择 gRPC 作为我们的 IPC 方案。接着，我们通过定义一个简单的 .proto 文件和实现一个完整的“Hello, gRPC!”示例，迈出了实践的第一步。
+我们看到，gRPC 借助 Protocol Buffers 和代码生成，极大地简化了网络通信应用的开发，让我们能更专注于业务逻辑本身。
+当然，我们目前只接触了最简单的 Unary RPC 和同步调用。这只是冰山一角。在接下来的文章中，我们将深入探讨：
+
+如何利用 gRPC 强大的流式通信能力，实现实时数据推送？
+如何在 GUI 应用（如 Qt）中优雅地使用 gRPC，避免界面卡死？
+服务端和客户端的核心组件是如何工作的？
+
+最后，有一个强烈的建议： 本系列文章是我个人的学习笔记和思考，而 gRPC 的官方文档和 GitHub 仓库中的例子是最好的、最权威的学习资料。官方文档和示例远比我写得好，强烈建议大家去阅读！ 希望我的文章能作为一个有益的补充和不同的视角。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:02.流的使用</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:02.%E6%B5%81%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在上一篇文章《gRPC 实践之路（一）：从一个项目需求谈起》中，我们成功地搭建了一个 gRPC 服务，并让客户端通过一次“请求-响应”式的 Unary RPC 调用，获取到了服务端的版本号。这就像是我们去前台问了个问题，前台给了我们一个确切的答案，然后对话就结束了。
+但是实际中,很多消息不是一个一次性产生完成的，可能需要你去持续的接受，比如 ：数据源持续的产生日志，每条日志都要你去处理，但是日志产生的时间间隔比较长
+如果还用 Unary RPC，那么可能就是不断的去轮询，每隔几百毫秒就去调用一次获取日志的方法。这种轮询方式不仅效率低下，浪费网络和 CPU 资源，而且 UI 的实时性也得不到保证。
+我需要的是一种更优雅的模式，就像订阅一份实时消息：我只需要订阅一次，然后只要有新的情况发生，你（Service）就主动把战报推送给我。
+这，就是 gRPC 服务端流式 RPC (Server-side Streaming RPC) 的核心思想。本文，我们将深入实践这种模式，模拟一个日志间隔产生，客户端订阅的方式。
+
+什么是流 (Streaming)？在深入代码之前，我想先谈谈我对“流”的个人理解。
+我认为，“流”特别适合处理这样一“大坨”数据，这坨数据有几个特点：
+
+数据的源头不是一次性产生完的，而是随着时间的推移，源源不断地产生的。
+每次产生一小部分数据之间，存在一定的时间间隔。
+每一小部分独立产生的数据，本身就是有意义的，可以直接使用或存储。
+
+现在最火的例子就是大语言模型。当模型生成回答时，它不是瞬间完成的，而是一个字一个字或一个词一个词地“思考”和产生。为了让用户能尽快看到内容，而不是干等几十秒，大模型就会通过类似流式服务的技术，将产生的文字一点点地推送到你的聊天窗口里。
+这种长连接、持续推送的场景，正是流式服务大展拳脚的地方。
+下面是流的简单示意图:
+第一步：在 .proto 中定义流式服务我们首先需要回到我们的“代码合同”——.proto 文件中，定义一个新的流式服务接口。我们在 Controller 服务中实现一个 GetRealtimeLogs 方法。
+关键在于，我们在返回类型 LogEntry 前面加上了 stream 关键字。
+controller.proto
+syntax = &quot;proto3&quot;;package controllerStream;// 用于请求实时日志的消息message GetLogsRequest &#123;  // 我们可以留空，或者未来加入一些过滤条件，比如日志级别  string level_filter = 1;&#125;// 定义单条日志的数据结构message LogEntry &#123;  int64 timestamp = 1;  string level = 2;  string message = 3;&#125;service Controller &#123;  // 定义一个服务端流式 RPC  // 接收一个 GetLogsRequest，返回一个 LogEntry 的数据流  rpc GetRealtimeLogs(GetLogsRequest) returns (stream LogEntry);&#125;
+
+修改完 .proto 文件后，别忘了重新运行 protoc 命令来生成新的 C++ 代码。
+第二步：服务端实现 —— 成为一个“数据源”实现流式服务的服务端，与 Unary RPC 的主要区别在于，方法的第三个参数不再是一个简单的响应对象指针，而是一个写入器 (Writer) 对象：grpc::ServerWriter* writer。
+这个 writer 就是我们向客户端推送数据的管道。我们可以通过不断调用 writer-&gt;Write(log_entry) 来发送一条条日志。
+server.cc
+#include &lt;iostream&gt;#include &lt;memory&gt;#include &lt;string&gt;#include &lt;thread&gt; // 用于模拟日志生成#include &lt;chrono&gt; // 用于 sleep#include &lt;grpcpp/grpcpp.h&gt;#include &quot;grpc_gen/controllerStream.grpc.pb.h&quot;class ControllerServiceImpl final : public controllerStream::Controller::Service &#123;    // 实现 GetRealtimeLogs 方法    grpc::Status GetRealtimeLogs(grpc::ServerContext* context,                                 const controllerStream::GetLogsRequest* request,                                 grpc::ServerWriter&lt;controllerStream::LogEntry&gt;* writer) override &#123;        std::cout &lt;&lt; &quot;Client subscribed for logs...&quot; &lt;&lt; std::endl;        // 模拟一个持续产生日志的场景        for (int i = 1; i &lt;= 10; ++i) &#123;            // 错误处理：检查客户端是否已经取消了请求（例如，关闭了UI）            if (context-&gt;IsCancelled()) &#123;                std::cout &lt;&lt; &quot;Client cancelled the request. Stopping the log stream.&quot; &lt;&lt; std::endl;                break;            &#125;            controllerStream::LogEntry log_entry;            log_entry.set_timestamp(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));            log_entry.set_level(&quot;INFO&quot;);            log_entry.set_message(&quot;This is log message number &quot; + std::to_string(i));            // 通过 writer 将这条日志发送给客户端            if (!writer-&gt;Write(log_entry)) &#123;                // 错误处理：如果写入失败（例如，连接断开），就退出循环                std::cout &lt;&lt; &quot;Failed to write log to stream. Connection might be broken.&quot; &lt;&lt; std::endl;                break;            &#125;            // 暂停一秒，模拟日志产生的间隔            std::this_thread::sleep_for(std::chrono::seconds(1));        &#125;        std::cout &lt;&lt; &quot;Finished sending logs.&quot; &lt;&lt; std::endl;        // 当函数返回时，gRPC 会自动关闭流，并向客户端发送一个 OK 状态，        // 表示“我说完了，一切正常”。        return grpc::Status::OK;    &#125;&#125;;void RunServer()&#123;    std::string server_address(&quot;0.0.0.0:50051&quot;);    ControllerServiceImpl service;    grpc::ServerBuilder builder;    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());    builder.RegisterService(&amp;service); // 注册我们的服务实现    std::unique_ptr&lt;grpc::Server&gt; server(builder.BuildAndStart()); // 构建并启动服务器    std::cout &lt;&lt; &quot;Server listening on &quot; &lt;&lt; server_address &lt;&lt; std::endl;    server-&gt;Wait(); // 阻塞等待服务器关闭&#125;int main(int argc, char **argv)&#123;    RunServer();    return 0;&#125;
+下面是流服务产生数据的过程:在真实的项目中，我们不会在 RPC 处理函数里用一个循环来阻塞线程。更优雅的方式是，将 writer 对象保存起来，然后由 Service 层的其他部分（比如一个真正的日志系统）在产生新日志时，异步地调用这个 writer 的 Write 方法。
+第三步：客户端实现 —— 成为一个“订阅者”客户端的实现同样发生了变化。调用流式服务的 Stub 方法，不再直接返回一个 Status 和响应对象，而是返回一个读取器 (Reader) 对象：std::unique_ptr&lt;grpc::ClientReadercontroller::LogEntry&gt;。
+我们需要在一个循环中不断调用 reader-&gt;Read(&amp;log_entry)，直到它返回 false，这表示服务端已经关闭了数据流。
+client.cc
+#include &lt;iostream&gt;#include &lt;memory&gt;#include &lt;string&gt;#include &lt;grpcpp/grpcpp.h&gt;#include &quot;grpc_gen/controllerStream.grpc.pb.h&quot;class ControllerClient&#123;public:    ControllerClient(std::shared_ptr&lt;grpc::Channel&gt; channel)        : stub_(controllerStream::Controller::NewStub(channel))    &#123;    &#125;    void GetRealtimeLogs()    &#123;        controllerStream::GetLogsRequest request;        controllerStream::LogEntry log_entry;        grpc::ClientContext context;        // 调用流式 RPC，获取一个 reader        std::unique_ptr&lt;grpc::ClientReader&lt;controllerStream::LogEntry&gt; &gt; reader(            stub_-&gt;GetRealtimeLogs(&amp;context, request));        std::cout &lt;&lt; &quot;Subscribed to log stream. Waiting for logs...&quot; &lt;&lt; std::endl;        // 在循环中不断读取从服务端推送来的日志        while (reader-&gt;Read(&amp;log_entry))        &#123;            std::cout &lt;&lt; &quot;[LOG RECEIVED] &quot;                    &lt;&lt; &quot;Time: &quot; &lt;&lt; log_entry.timestamp()                    &lt;&lt; &quot;, Level: &quot; &lt;&lt; log_entry.level()                    &lt;&lt; &quot;, Message: &quot; &lt;&lt; log_entry.message() &lt;&lt; std::endl;        &#125;        // 当 Read() 返回 false 后，通过 Finish() 获取最终的状态        grpc::Status status = reader-&gt;Finish();        // 错误处理：检查最终状态        if (status.ok())        &#123;            std::cout &lt;&lt; &quot;Log stream finished cleanly.&quot; &lt;&lt; std::endl;        &#125;        else        &#123;            std::cout &lt;&lt; &quot;RPC failed with error: &quot; &lt;&lt; status.error_code() &lt;&lt; &quot;: &quot; &lt;&lt; status.error_message() &lt;&lt;                    std::endl;        &#125;    &#125;private:    std::unique_ptr&lt;controllerStream::Controller::Stub&gt; stub_;&#125;;int main(int argc, char **argv)&#123;    ControllerClient client(grpc::CreateChannel(        &quot;localhost:50051&quot;, grpc::InsecureChannelCredentials()));    std::cout &lt;&lt; &quot;n--- Calling GetRealtimeLogs ---&quot; &lt;&lt; std::endl;    client.GetRealtimeLogs();    return 0;&#125;
+
+下面是整个调用过程的时序图:
+关于错误处理的初步思考从上面的代码中，我们可以看到 gRPC 在流式通信中处理错误的基本方式：
+
+服务端：
+可以通过检查 context-&gt;IsCancelled() 来判断客户端是否已经主动断开了连接。
+writer-&gt;Write() 的返回值可以判断写入是否成功。如果返回 false，通常意味着底层的连接已经出问题了。
+
+
+客户端：
+reader-&gt;Read() 循环结束后，必须调用 reader-&gt;Finish() 来获取整个流的最终状态。
+如果 status.ok() 为 true，表示流正常结束。
+如果为 false，则表示流是因错误而中断的，我们可以从 status 对象中获取错误码和错误信息。
+
+
+
+这只是最基础的错误处理。在真实的健壮应用中，我们还需要考虑网络抖动、超时、重试等更复杂的策略，这些都是后续可以深入的话题。
+总结与展望本文我们成功地解决了项目中的一个核心需求——实时数据推送。通过学习和实践 gRPC 的服务端流式 RPC，我们已经从“一问一答”的通信模式，迈向了更灵活、更高效的“实时订阅”模式。
+我们深入了解了如何在 .proto 中定义流式服务，以及如何在 C++ 中实现流的服务端（ServerWriter）和客户端（ClientReader）。
+在下一篇文章中，我们将讲解 在Qt应用中如何直接集成Grpc
+最后，再次强调： 本系列文章是我个人的学习笔记和思考，而 gRPC 的官方文档和 grpc&#x2F;grpc GitHub 仓库中的例子是最好的、最权威的学习资料。官方文档和示例远比我写得好，强烈建议大家去阅读！ 希望我的文章能作为一个有益的补充和不同的视角。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:03.Qt与grpc的集成使用</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:03.Qt%E4%B8%8Egrpc%E7%9A%84%E9%9B%86%E6%88%90%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们从一个Qt应用的角度出发，探讨了怎么使用grpc作为进程间通信的手段，进行点对点的调用，并且讲解了怎么处理服务端产生的流数据。但是，既然都没涉及到Qt相关的内容，本篇文章就讲解下在Qt中怎么去使用Grpc作为客户端的集成。
+Qt作为一个主要应用在GUI中的应用框架，在其中最大的挑战就是：如何避免阻塞 UI 主线程。当然可以利用QThread和信号槽的机制去解决这个问题，但是却有些繁琐，需要我们自己去进行线程管理和对象的生命周期。但是，好消息是自动 Qt6.9版本之后，Qt 官方已经正式提供了对 gRPC 的原生支持 (Qt Grpc 模块)。这意味着我们不再需要手动创建线程来包装gRPC 调用了。Qt 将 gRPC与它核心的事件循环和信号槽机制完美地融合在了一起。
+本文，我们将探索这个“官方解决方案”，看看如何利用 Qt Grpc 模块，以一种前所未有的、极其优雅的方式，在 Qt 应用中实践 gRPC 通信。
+
+准备工作：CMake 与 Qt gRPC 模块要使用 Qt 官方的 gRPC 支持，首先你需要确保在安装 Qt 时，已经勾选并安装了 Qt Protobuf 和 Qt Grpc 这两个模块，并且安装好了Grpc和Protobuf。
+并且Qt官方也提供了Grpc的函数去处理grpc的原生命令
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.16)  project(MyGrpcQtProject)#配置你的项目,保证先安装了grpc和protobuf# 找到 Qt6，并确保 Protobuf 和 Grpc 组件可用  find_package(Qt6 REQUIRED COMPONENTS Protobuf Grpc)  qt_standard_project_setup()# 添加你的可执行文件  qt_add_executable(MyApp main.cpp clientguide.cpp) # 假设你的客户端逻辑在 clientguide.cpp# Qt 提供的 magic command，自动处理 .proto 文件！  # 它会调用 protoc 和 grpc_cpp_plugin 生成 Qt 风格的代码  qt_add_grpc(MyApp CLIENT # 或者 SERVER, BIDI  PROTO_FILES  path/to/your/service.proto  )# 链接到 Qt 提供的库  target_link_libraries(MyApp PRIVATE Qt6::Protobuf Qt6::Grpc)
+
+qt_add_grpc 这个命令了它会自动处理代码生成和编译，也不需要去手动处理proto文件的生成c代码了
+代码生成我们还是使用之前类似的 .proto 文件，但这次，由 qt_add_grpc 生成的文件会有些不同，它们是为 Qt 量身定做的。
+clientguide.proto
+syntax = &quot;proto3&quot;;  package client.guide; // enclosing namespacemessage Request &#123; /* ... */ &#125;  message Response &#123; /* ... */ &#125;service ClientGuideService &#123;  rpc UnaryCall (Request) returns (Response);  rpc ServerStreaming (Request) returns (stream Response);&#125;
+
+生成的文件名会带有 .qpb.h 和 .grpc.qpb.h 的后缀。它们不仅包含了 Protobuf 消息的 C++ 类，更重要的是，生成的 gRPC Stub 和Service 基类，其所有方法都原生返回 Qt 的异步对象，并通过信号槽来通知结果。
+下面是生成Qt grpc中源码生成的示意图
+实践：一个纯 Qt 风格的体验现在，让我们看看 Qt 官方示例中的客户端代码是如何利用这些新工具的。
+clientguide.cpp (核心逻辑)
+1. 初始化：创建 Channel 和 Client Stub//引入Qt生成的头文件#include &quot;clientguide.qpb.h&quot;#include &quot;clientguide_client.grpc.qpb.h&quot;//! [gen-includes]#include &lt;QtGrpc/QGrpcHttp2Channel&gt;#include &lt;QtGrpc/QGrpcServerStream.h&gt;#include &lt;QtCore/QCommandLineParser&gt;#include &lt;QtCore/QCoreApplication&gt;#include &lt;QtCore/QDateTime&gt;#include &lt;QtCore/QProcess&gt;#include &lt;QtCore/QThread&gt;#include &lt;QtCore/QUrl&gt;#include &lt;limits&gt;#include &lt;memory&gt;using namespace client;void startServerProcess();QDebug operator&lt;&lt;(QDebug debug, const guide::Response &amp;response);class ClientGuide : public QObject&#123;public:    explicit ClientGuide(std::shared_ptr&lt;QAbstractGrpcChannel&gt; channel)    &#123;        // 将 Qt 的 Channel 附加到 Qt 生成的 Client Stub 上         // 这一步和原生 gRPC 类似，但 Channel 和 Client 都是 Qt gRPC 提供的类型。        m_client.attachChannel(std::move(channel));    &#125;    static guide::Request createRequest(int32_t num, bool fail = false)    &#123;        guide::Request request;        request.setNum(num);        request.setTime(fail ? std::numeric_limits&lt;int64_t&gt;::max()                             : QDateTime::currentMSecsSinceEpoch());        return request;    &#125;       void unaryCall(const guide::Request &amp;request)    &#123;        std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);        const auto *replyPtr = reply.get();        QObject::connect(            replyPtr, &amp;QGrpcCallReply::finished, replyPtr,            [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;                if (status.isOk()) &#123;                    if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                        qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;                    else                        qDebug(&quot;Client (UnaryCall) deserialization failed&quot;);                &#125; else &#123;                    qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;                &#125;            &#125;,            Qt::SingleShotConnection);    &#125;    void serverStreaming(const guide::Request &amp;initialRequest)    &#123;        std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);        const auto *streamPtr = stream.get();        QObject::connect(            streamPtr, &amp;QGrpcServerStream::finished, streamPtr,            [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;                if (status.isOk())                    qDebug(&quot;Client (ServerStreaming) finished&quot;);                else                    qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;            &#125;,            Qt::SingleShotConnection);        QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, streamPtr, [streamPtr] &#123;            if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())                qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;            else                qDebug(&quot;Client (ServerStream) deserialization failed&quot;);        &#125;);    &#125;private:    guide::ClientGuideService::Client m_client;&#125;;int main(int argc, char *argv[])&#123;    QCoreApplication app(argc, argv);    QCommandLineParser parser;    QCommandLineOption enableUnary(&quot;U&quot;, &quot;Enable UnaryCalls&quot;);    QCommandLineOption enableSStream(&quot;S&quot;, &quot;Enable ServerStream&quot;);    parser.addHelpOption();    parser.addOption(enableUnary);    parser.addOption(enableSStream);    parser.process(app);    bool defaultRun = !parser.isSet(enableUnary) &amp;&amp; !parser.isSet(enableSStream)        &amp;&amp; !parser.isSet(enableCStream) &amp;&amp; !parser.isSet(enableBStream);    qDebug(&quot;Welcome to the clientguide!&quot;);    qDebug(&quot;Starting the server process ...&quot;);    startServerProcess();    //! [basic-0]    auto channel = std::make_shared&lt;QGrpcHttp2Channel&gt;(        QUrl(&quot;http://localhost:50056&quot;)        /* without channel options. */    );    ClientGuide clientGuide(channel);        if (defaultRun || parser.isSet(enableUnary)) &#123;        clientGuide.unaryCall(ClientGuide::createRequest(1));        clientGuide.unaryCall(ClientGuide::createRequest(2, true)); // fail the RPC        clientGuide.unaryCall(ClientGuide::createRequest(3));    &#125;    if (defaultRun || parser.isSet(enableSStream)) &#123;        clientGuide.serverStreaming(ClientGuide::createRequest(3));    &#125;    return app.exec();&#125;
+
+2. Unary RPC (点对点调用)Qt生成的客户端可以让我们直接利用信号槽的机制，不必为了避免阻塞UI，自动手动处理线程
+void ClientGuide::unaryCall(const guide::Request &amp;request)  &#123;  // 调用 RPC 方法，不再返回 Status，而是返回一个 QGrpcCallReply 指针！  std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);    // QGrpcCallReply 是一个 QObject，我们可以连接它的 finished 信号！      QObject::connect(reply.get(), &amp;QGrpcCallReply::finished, this,          // Lambda 表达式作为槽函数          [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;              // 这个 Lambda 将在 Qt 的事件循环中被安全地调用，不会阻塞              if (status.isOk()) &#123;                  if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                      qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;              &#125; else &#123;                  qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;              &#125;          &#125;);  &#125;
+
+m_client.UnaryCall 立即返回一个 QGrpcCallReply 对象，完全不会阻塞。我们只需要连接它的 finished信号，就可以在未来的某个时刻，当 RPC 调用完成时，在槽函数中处理结果。整个过程是纯异步、事件驱动的，完美融入了 Qt 的体系。
+下面的是调用过程的示意图:
+3. Server Streaming (服务端流)处理流式数据也变得异常简单。调用流式 RPC 方法会返回一个 QGrpcServerStream 对象。
+void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#123;  // 调用流式 RPC，返回一个 QGrpcServerStream 指针  std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);  const auto *streamPtr = stream.get();    // 连接 finished 信号，处理流结束事件      QObject::connect(streamPtr, &amp;QGrpcServerStream::finished, this,          [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;              if (status.isOk())                  qDebug(&quot;Client (ServerStreaming) finished&quot;);              else                  qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;          &#125;);            // 连接 messageReceived 信号，处理每一条从服务端推送来的消息！      QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, this, [streamPtr] &#123;          if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())              qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;      &#125;);  &#125;
+
+我们无需编写 while 循环读取响应数据了，取而代之的是连接 messageReceived信号。每当服务端推送一条新消息，这个信号就会被发射一次，我们的槽函数就会被调用一次。这正是我们梦寐以求的、真正的事件驱动的流式数据处理方式！
+个人思考：Qt gRPC 封装的优雅之处Qt的接口设计和使用方式确实有很多可取之处,Qt gRPC 模块的封装，堪称教科书级别的“框架集成”：
+
+使用风格的统一： 将grpc的调用过程统一成信号槽的方式与Qt的控件使用完全一致。
+原生信号槽的胜利： 整个 gRPC 的生命周期——发起调用、收到消息、调用结束——都被映射成了 Qt 的信号。这使得 gRPC的异步事件能像按钮点击、鼠标移动一样，被无缝地集成到 Qt 的事件循环中。
+使用更加简单： 开发者不再需要关心线程问题，只需关注业务逻辑。Qt 将这一切都隐藏在了QGrpcCallReply 和 QGrpcServerStream 对象的背后，提供了极其简洁和符合直觉的 API。
+
+总结与展望本文，我们探索了 Qt 官方提供的 Qt Grpc 模块，见证了它如何将 gRPC 的强大功能与 Qt 优雅的信号槽机制完美结合。通过使用QGrpcCallReply 和 QGrpcServerStream，我们以一种纯异步、事件驱动的方式，轻松地实现了 Unary 和 Streaming RPC，彻底解决了在 GUI应用中进行网络通信的核心痛点。
+这无疑是 Qt C++ 开发者的一大福音。它极大地降低了在桌面和移动应用中使用 gRPC 的门槛，让我们能更专注于创造富有价值的应用本身。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:04.grpc异步回调接口的使用</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们实现的服务端模型都有一个共同的特点：它们是同步的。无论是 Unary RPC 还是流式 RPC，我们的服务端实现在 RPC 处理函数中都会阻塞，直到该次请求处理完成。这意味着，为了同时服务多个客户端，gRPC 的同步服务器不得不在其内部的线程池中为每一个并发请求分配一个线程。这种“一个请求一个线程”的模式，在并发量不高时简单有效。但试想一下，当成千上万的客户端同时涌入时，服务器的线程资源会被迅速耗尽，系统将不堪重负。
+一个真正的高性能服务，必须具备“一人多能”的本领——用少量的核心线程，处理成千上万的并发请求。要做到这一点，我们必须拥抱异步编程。
+本文，我们将深入 gRPC C++ 最核心、也是官方最新推荐的异步服务模型——Callback API（回调式 API）。它也被称为“Reactor 模式”，因为它与我们熟悉的 muduo 等网络库的事件驱动思想如出一辙。我们将通过实践，构建一个真正意义上的高性能 gRPC 异步服务。
+
+
+异步服务的核心理念：事件、队列与回调在深入代码之前，我们必须理解 gRPC 异步模型的三个核心概念：
+
+事件驱动 (Event-Driven): 服务器不再为每个请求阻塞等待，而是以非阻塞的方式发起所有操作（如接收请求、读写数据、发送响应）。它只关心“事件”的发生，比如“一个新的 RPC 请求到来了”、“数据发送完成了”。
+完成队列 (grpc::ServerCompletionQueue): 这是 gRPC C++ 异步编程的心脏。所有异步操作的“完成事件”最终都会被放入这个队列中。我们的工作线程只需要从这个队列里取出已完成的事件进行处理即可。
+回调 (Callback): 对于每一个完成的事件，我们应该执行什么操作？这就是通过回调函数来定义的。
+
+幸运的是，从 gRPC v1.60 版本开始，官方引入了全新的 Callback API，极大地简化了异步服务的编写。我们不再需要手动管理复杂的完成队列和“标签”，而是可以通过实现一系列的回调函数来响应事件。
+第一步：重新认识服务实现在 Callback API 模式下，我们的服务实现类依然继承自 gRPC 生成的 Service 基类，但有一个关键区别：我们不再直接重写 RPC 方法本身，而是重写一个对应的 Request + RPC 方法名 的方法。
+这个方法的作用，不再是处理业务逻辑，而是创建一个“反应堆 (Reactor)”对象，并将其返回给 gRPC 框架。
+我们以一个简单的 Unary RPC 为例：
+// server.cc (新的单次 RPC 服务实现)  #**include** &lt;iostream&gt;  #**include** &lt;memory&gt;  #**include** &lt;string&gt;  #**include** &lt;thread&gt;  #**include** &lt;chrono&gt;#**include** &lt;grpcpp/grpcpp.h&gt;  #**include** &quot;controller.grpc.pb.h&quot; // 假设这是你 gRPC 生成的头文件// 1. 我们需要为每个 RPC 方法创建一个 Reactor 类  //    这个类继承自 gRPC 提供的 ServerUnaryReactor  class GreeterReactor : public grpc::ServerUnaryReactor &#123;  public:  // 构造函数接收请求和响应对象  GreeterReactor(const controller::GetVersionRequest* request, controller::GetVersionResponse* response)  : request_(request), response_(response) &#123;        // 在这里可以开始处理业务逻辑          std::cout &lt;&lt; &quot;Reactor created. Processing GetVersion request...&quot; &lt;&lt; std::endl;          std::string version_str = &quot;Async Core Service v2.0.0&quot;;          response_-&gt;set_version(version_str);        // 当业务逻辑处理完毕，调用 Finish() 告诉 gRPC 框架可以发送响应了          Finish(grpc::Status::OK);      &#125;    // 2. 当整个 RPC 调用（包括响应发送）彻底完成时，gRPC 会调用这个方法      void OnDone() override &#123;          std::cout &lt;&lt; &quot;Reactor is done. Deleting self.&quot; &lt;&lt; std::endl;          // 在这里，我们可以安全地释放资源，比如删除自身          delete this;      &#125;    // 你也可以实现其他回调，如 OnCancel 或 OnSendInitialMetadataDone      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnCancel&quot; &lt;&lt; std::endl;      &#125;    void OnSendInitialMetadataDone(bool ok) override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnSendInitialMetadataDone: &quot; &lt;&lt; (ok ? &quot;Success&quot; : &quot;Failed&quot;) &lt;&lt; std::endl;      &#125;private:  const controller::GetVersionRequest* request_;  controller::GetVersionResponse* response_;  &#125;;class ControllerServiceImpl final : public controller::Controller::CallbackService &#123;  public:  // 3. 注意！我们不再重写 GetVersion，而是重写返回 ServerUnaryReactor* 的 GetVersion 方法  //    （对于 CallbackService，它直接对应 RPC 方法名）。  grpc::ServerUnaryReactor* GetVersion(grpc::CallbackServerContext* context,  const controller::GetVersionRequest* request,  controller::GetVersionResponse* response) override &#123;  // 这个方法的核心职责就是：创建一个新的 Reactor 实例，然后返回它  // gRPC 框架会接管这个 Reactor 的生命周期  return new GreeterReactor(request, response);  &#125;  &#125;;
+
+
+第二步：理解新的异步工作流这个基于 Reactor 的新模型，其工作流程是这样的：
+
+注册服务： 我们将 ControllerServiceImpl 的一个实例注册到 ServerBuilder 中。
+等待请求： gRPC 框架的 I&#x2F;O 线程在后台监听新请求。
+创建 Reactor： 当一个 GetVersion 请求到来时，gRPC 框架会自动调用我们实现的 ControllerServiceImpl::GetVersion 方法。
+返回 Reactor： 我们在这个方法里 new 一个 GreeterReactor 对象并返回。我们只负责创建，不负责销毁。
+业务处理与响应： 在 GreeterReactor 的构造函数中，我们处理业务逻辑，填充 response，然后调用 Finish(Status::OK)。这个 Finish 调用是非阻塞的，它只是告诉 gRPC 框架：“我的活儿干完了，你可以把响应发出去了。”
+完成与销毁： 当 gRPC 框架真正将响应发送完毕，并完成了所有清理工作后，它会调用 GreeterReactor::OnDone()。我们在这个回调函数中，安全地 delete this，完成 Reactor 对象的生命周期闭环。
+
+
+扩展：如何实现异步的流式服务？Reactor 模式对于流式 RPC 同样强大。让我们看看如何用它来实现一个服务端流式 RPC —— GetRealtimeLogs。
+// [新增] Reactor 类，用于处理一个 GetRealtimeLogs 请求的生命周期  class LogStreamReactor : public grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt; &#123;  public:  // 构造函数接收请求，并立即开始发送第一条日志  LogStreamReactor(const controllerStream::GetLogsRequest* request)  : request_(*request) // 保存请求的副本（如果需要的话）  &#123;  std::cout &lt;&lt; &quot;Client subscribed for logs (Async Reactor).&quot; &lt;&lt; std::endl;  // 启动第一次写入  SendLog();  &#125;    // 当流完成时（无论成功、失败或取消），此方法被调用      void OnDone() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: OnDone called. Cleaning up.&quot; &lt;&lt; std::endl;          // 在这里释放所有与此 Reactor 相关的资源          delete this;      &#125;    // 当客户端取消流时，此方法被调用      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: Client cancelled the request.&quot; &lt;&lt; std::endl;          // OnCancel 之后通常会调用 OnDone，所以主要清理逻辑放在 OnDone      &#125;    // 当上一次的 StartWrite() 操作完成时，此方法被调用      void OnWriteDone(bool ok) override &#123;          // &#x27;ok&#x27; 为 false 表示写入失败（例如，连接断开）          if (!ok) &#123;              std::cout &lt;&lt; &quot;LogStreamReactor: Failed to write to stream. Connection might be broken.&quot; &lt;&lt; std::endl;              // 不需要手动调用 Finish，当 OnWriteDone 返回后，gRPC 会自动处理清理              // 最终会调用 OnDone              return;          &#125;        // 检查是否还有更多日志要发送          if (log_counter_ &lt;= 10) &#123;              // 如果上一次写入成功，就继续发送下一条              SendLog();          &#125; else &#123;              // 所有日志都已发送完毕              std::cout &lt;&lt; &quot;LogStreamReactor: Finished sending all logs.&quot; &lt;&lt; std::endl;              // 发送一个 OK 状态来正常关闭流              Finish(grpc::Status::OK);          &#125;      &#125;private:  void SendLog() &#123;  // 准备下一条日志  log_entry_.set_timestamp(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));  log_entry_.set_level(&quot;INFO&quot;);  log_entry_.set_message(&quot;This is async log message number &quot; + std::to_string(log_counter_));        log_counter_++;        // 模拟日志生成的延迟          // 重要提示：在异步模型中，长时间的 sleep 会阻塞处理其他事件的线程！          // 在真实应用中，这里应该是快速的非阻塞操作。          // 为了演示，我们仍然使用 sleep，但要意识到它的影响。          std::this_thread::sleep_for(std::chrono::seconds(1));        // 发起异步写入操作。我们传递 log_entry_ 的地址。          // gRPC 会在 OnWriteDone 被调用之前保证这个地址是有效的。          StartWrite(&amp;log_entry_);      &#125;    const controllerStream::GetLogsRequest request_;      controllerStream::LogEntry log_entry_; // 重用 LogEntry 对象以避免重复分配内存      int log_counter_ = 1;  &#125;;class ControllerStreamServiceImpl final : public controllerStream::Controller::CallbackService &#123;  // 注意：服务类继承自 ...::CallbackService 而不是 ...::Service    // 实现 GetRealtimeLogs 方法      // 它不再返回 Status，而是返回一个 ServerWriteReactor*      grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt;* GetRealtimeLogs(          grpc::CallbackServerContext* context,          const controllerStream::GetLogsRequest* request) override &#123;        // 创建一个新的 Reactor 来处理这个请求          // gRPC 框架将拥有这个指针的所有权，并在 OnDone 中由我们自己 delete          return new LogStreamReactor(request);      &#125;  &#125;;
+
+第三步：启动异步服务器最令人惊喜的是，启动一个异步服务器的主函数部分，与同步服务器几乎一模一样，甚至更简单。我们不再需要自己管理线程池。
+C++
+/ server_main.cc  void RunServer() &#123;  std::string server_address(&quot;0.0.0.0:50051&quot;);  // 这里根据你的服务类型选择正确的实现类，例如 ControllerServiceImpl 或 ControllerStreamServiceImpl  ControllerServiceImpl service;    grpc::ServerBuilder builder;      builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());    // 注册回调服务（异步模式）      builder.RegisterService(&amp;service);    std::unique_ptr&lt;grpc::Server&gt; server(builder.BuildAndStart());      std::cout &lt;&lt; &quot;Async Reactor Server listening on &quot; &lt;&lt; server_address &lt;&lt; std::endl;    server-&gt;Wait(); // 阻塞主线程，等待服务器关闭  &#125;int main(int argc, char** argv) &#123;  RunServer();  return 0;  &#125;
+
+gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事件分发的所有复杂工作。我们只需要提供一个个小巧、独立的 Reactor 对象来处理具体的业务逻辑即可。
+
+个人思考：新旧异步模型的对比与 Reactor 的优雅如果你之前了解过 gRPC 旧的、基于 CompletionQueue 和 void* tag 的异步 API，你会发现这个新的 Callback API (Reactor 模式) 是一个巨大的进步：
+
+告别手动状态管理： 在旧模型中，我们需要在一个庞大的 switch(tag) 语句中手动管理一次 RPC 的不同阶段（CREATE, PROCESS, FINISH），非常容易出错。现在，这些状态被封装在了 Reactor 对象内部，逻辑更清晰。
+无需手动管理 CompletionQueue： 我们不再需要编写 while(cq_-&gt;Next()) 这样的事件循环，gRPC 框架为我们代劳了。
+更符合现代 C++ 的回调思想： 这种“注册回调，等待框架调用”的模式，与 muduo 的事件处理、Qt 的信号槽都非常相似，更符合现代 C++ 开发者的直觉。
+
+
+总结与展望本文，我们迈出了从“能用”到“高性能”的关键一步。通过学习和实践 gRPC 最新的 Callback API (Reactor 模式)，我们构建了一个真正意义上的异步服务端。
+我们深入理解了如何通过实现 ServerUnaryReactor 和 ServerWriteReactor，将业务逻辑与 gRPC 的事件循环解耦，从而让我们的服务能够用少量的线程处理海量的并发请求。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:05.服务端与客户端的连接</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
+    <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
+这引出了一个最根本的问题，也是本文将要探究的核心：
+一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
+我们将像科学家一样，首先提出一个猜想，然后深入源码和网络协议的细节，去寻找证据来证明或修正它。
+我的猜想如下：gRPC 的一一对应机制，是一个编译时和运行时协同工作的结果。
+
+编译时 - 生成“身份证”： protoc 工具在生成代码时，会为每一个 RPC 方法创建一个全局唯一的“身份证”（一个字符串签名）。
+运行时 - 递送“身份证”： 客户端在发起调用时，会将这个“身份证”放入网络请求的某个标准位置（比如 HTTP&#x2F;2 的请求头），连同序列化好的参数一起发送出去。
+服务端 - 验证“身份证”： 服务端在启动时就建立了一个“身份证 -&gt; 处理函数”的路由表。收到请求后，只需读取“身份证”，就能快速找到对应的处理函数。
+
+本文，我们就将带着这个猜想，通过分析生成代码和Wireshark 抓包，完整地走一遍 RPC 的全链路之旅。
+
+第一站：编译时的约定 —— Stub 中隐藏的“身份证”一切的起点都在客户端。我们从 protoc 生成的 Stub 类入手，寻找“身份证”是如何被制造出来的。
+&#x2F;&#x2F; 客户端代码grpc::Status status &#x3D; stub_-&gt;GetVersion(context, request, &amp;response);
+当我们查看生成的 controller.grpc.pb.cc 文件时，证据立刻就出现了：
+controller.grpc.pb.cc (生成代码摘录)
+// 证据 1：定义了一个全局唯一的“方法名身份证”  static const char* Controller_method_names[] = &#123;  &quot;/controller.Controller/GetVersion&quot;,  &#125;;// ...// 证据 2：Stub 的 GetVersion 方法实现  ::grpc::Status Controller::Stub::GetVersion(...) &#123;  // 将“身份证”和所有参数，打包交给一个更底层的通用函数  return ::grpc::internal::BlockingUnaryCall&lt;...&gt;(channel_.get(), rpcmethod_GetVersion_, ...);  &#125;
+
+源码剖析：
+
+方法名字符串： protoc 明确地为我们的 GetVersion RPC 生成了一个全局唯一的字符串标识符 “&#x2F;controller.Controller&#x2F;GetVersion”。这完美印证了我们猜想的第一步——“身份证”是在编译时被创建的。
+BlockingUnaryCall： 用户的调用最终被委托给了这个内部函数。Stub 的作用，就是为这个通用函数准备好所有必要的参数，其中最重要的就是 rpcmethod_GetVersion_，这是一个封装了上述“身份证”字符串的对象。
+
+至此，我们已经证明了，每一次 RPC 调用在 C++ 代码层面，都与一个唯一的方法签名字符串绑定在了一起。但这个字符串是如何跨越网络的呢？
+第二站：网络上的“信封” —— Wireshark 抓包分析理论和源码分析固然重要，但网络抓包的结果才是“铁证”。我使用 Wireshark 捕获了一次客户端调用 GetVersion 的网络流量，结果完全印证了我们的猜想。
+一次 gRPC 调用在网络上表现为一次 HTTP&#x2F;2 的请求-响应交换。在请求的 HEADERS 帧中，我们发现了决定性的证据：
+Wireshark 抓包结果 (概念示意)
+Hypertext Transfer Protocol 2  Stream: HEADERS, Stream ID: 1, Length 87  :method: POST  :scheme: http  :path: /controller.Controller/GetVersion  &lt;-- 铁证如山！  :authority: localhost:50051  content-type: application/grpc  ...
+
+
+抓包分析：
+
+:path 伪头： 我们在 Stub 源码中找到的那个“身份证”字符串 “&#x2F;controller.Controller&#x2F;GetVersion”，被原封不动地放在了 HTTP&#x2F;2 的 :path 伪头中。
+这就是 gRPC 的“信封”！ 它清晰地告诉了网络上的任何接收方：“这封信是寄给 &#x2F;controller.Controller&#x2F;GetVersion 这个处理单元的”。
+
+同样，在响应的 HEADERS 帧中，我们也能看到 gRPC 的状态码，而在 DATA 帧中，则是 Protobuf 序列化后的响应体。
+小结： Wireshark 的抓包结果，完美地连接了我们的代码分析和网络现实。它证明了 gRPC 的“寻址”机制，就是通过将编译时生成的唯一方法签名，作为运行时 HTTP&#x2F;2 请求的 :path 来实现的。
+第三站：服务端的“中央调度室”现在，请求已经带着清晰的“信封”抵达服务端。服务端是如何根据这个地址，找到正确的处理函数的呢？答案的起点，在于 Service 的构造函数。
+controller.grpc.pb.cc (生成代码摘录)
+Controller::Service::Service() &#123;  // 在构造时，就调用 AddMethod  AddMethod(new ::grpc::internal::RpcServiceMethod(  Controller_method_names[0], // Key: 还是那个唯一的“身份证”  ...,  new ::grpc::internal::RpcMethodHandler&lt;...&gt;(...))); // Value: 处理器  &#125;
+
+源码剖析：
+
+AddMethod： Service 基类在构造时，就为每个 RPC 方法调用 AddMethod。这个函数的核心作用，就是将方法签名字符串 (Key) 和一个知道如何调用具体实现的处理器 Handler (Value) 绑定在一起。
+
+当我们调用 ServerBuilder::RegisterService(&amp;service) 时，这些 Key-Value 对会被收集起来，并通过底层的 grpc_server_register_method 函数，正式注册到 grpc-core 内部的一个方法路由表中。从逻辑上推断，这个路由表必然是一个哈希表，以保证 O(1) 的查找效率。
+至此，服务端的“中央调度室”就构建完成了。 当一个网络请求到来时：
+
+grpc-core 的 I&#x2F;O 线程接收到 HTTP&#x2F;2 请求，解析出 :path 头，得到 Key。
+以这个 Key 在内部的哈希路由表中进行查找，得到 Value (对应的 Handler)。
+这个 Handler 随后会反序列化请求的 Protobuf 数据，并最终调用我们自己重写的 ControllerServiceImpl::GetVersion C++ 成员函数。
+
+结论：从猜想到证据的闭环通过这次“代码生成分析”和“网络抓包”相结合的探索，我们为开篇提出的核心问题，找到了一个完整且证据确凿的答案：
+gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RPC 调用与网络请求的一一对应：
+
+编译时契约： protoc 为每个 RPC 方法生成一个全局唯一的方法签名字符串。
+运行时传输： 客户端将此签名作为 HTTP&#x2F;2 的 :path，连同 Protobuf 数据一起发送。
+服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
+
+正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:06.rpc的大问题思考</title>
+    <url>/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:06.rpc%E7%9A%84%E5%A4%A7%E9%97%AE%E9%A2%98%E6%80%9D%E8%80%83/</url>
+    <content><![CDATA[前言在之前的源码剖析文章中，我们深入了 gRPC 的一些具体实现。
+但随着探索的深入，我时常感到一种“盲人摸象”式的困惑——我们触摸到了大象的腿、鼻子、耳朵，但大象的全貌究竟是怎样的？如果只是追逐源码的细枝末节，很容易迷失在复杂的调用链中。
+我决定或一种方式，像笛卡尔在沉思中探求“我思故我在”那样，让我们暂时忽略所有 RPC 框架的具体实现，回到最根本的出发点，用第一性原理去思考：如果让我们自己从零开始设计一个 RPC 框架，必然要解决哪些问题？
+那些必然要解决的问题，或者说自己思考到的问题，就是现阶段自己可以学习与掌握的问题,也就是RPC中的大问题。
+本文，就是我对自己这些思考的总结。之后我的行动也将从这些能力出发，探索框架如何实现这些能力。
+
+思考过程：从网络编程推导 RPC 的必然形态
+起点： RPC 是进程间通信，其底层是网络编程。那么，一次 RPC 调用，本质上就是一次网络请求；函数的返回值，就是网络响应。
+翻译： 为了让远端的服务器能执行本地函数调用，客户端必须将“调用”这个行为，翻译成一种能在网络上传输的数据格式。同理，服务端也需要将“执行结果”翻译回来。
+管理： 为了模拟本地函数调用的体验，客户端需要管理所有发出去的请求，确保响应能准确地返回给对应的调用者。
+效率： 为了应对海量的并发请求，服务端必须设计一套高效的网络 I&#x2F;O 处理模型。
+健壮性： 网络是不可靠的。因此，一个合格的 RPC 框架必须处理各种网络异常。
+
+基于此，我们可以推断出 RPC 框架的核心功能。
+一、 RPC 框架的核心职责：客户端与服务端的“契约”一个 RPC 框架，首先要明确定义通信双方各自需要完成的任务。
+客户端的核心任务：
+请求的构建与封装：
+根据用户调用的方法，构造一个标准的网络请求。这个请求必须清晰地包含两部分：
+“信封”（元数据&#x2F;请求头）： 用来告诉服务端“我要调用哪个方法”、“这次通话的超时时间是多久”等控制信息。
+“信件”（数据&#x2F;请求体）： 将用户传入的 C++ 函数参数，通过序列化，转换成二进制字节流。
+
+
+
+
+请求的生命周期管理：
+发出请求后，需要像一个“任务管理器”一样，追踪每一个请求的生命周期。
+必须将处理网络异常的能力（如超时、重试、取消），无缝地集成到看似简单的函数调用中。
+
+
+响应的处理：
+接收网络响应后，能准确地找到这个响应属于哪个请求。
+将响应的二进制数据反序列化，转换成用户代码可以理解的 C++ 对象。
+
+
+
+服务端的核心任务：
+服务的注册与管理：
+在启动时，必须提供一种机制，让开发者能将业务逻辑（服务）注册到框架中。
+内部必须维护一个高效的“路由表”，能够根据请求“信封”中的方法标识，快速找到对应的处理函数。
+
+
+请求与响应的关联：
+收到一个请求后，必须为其分配一个唯一的上下文，确保处理完成后，能将正确的响应准确无误地发回给对应的客户端。
+
+
+高效的 I&#x2F;O 处理：
+这是高性能服务器的灵魂。必须采用高效的网络 I&#x2F;O 模型（如基于 epoll 的 Reactor 模式），用少量线程处理海量并发连接。
+
+
+异常情况的处理：
+能够优雅地处理客户端的取消操作，及时释放资源。
+能够处理自身的超时和内部错误，并向客户端返回明确的错误状态。
+
+
+
+二、 RPC 的本质：网络编程的“三位一体”总结来说，RPC 框架就是网络编程的进一步抽象和封装。它将繁琐的网络细节隐藏起来，让开发者能像调用本地函数一样进行远程通信。这个封装主要体现在三个方面：
+
+协议 (Protocol) - 通信的“语言”
+这是客户端与服务端之间最重要的契约。它定义了“信封”和“信件”的格式。
+方法签名（如 gRPC 的 &#x2F;package.Service&#x2F;Method）就是这个语言中的“动词”，它规定了要执行什么操作。
+
+
+序列化 (Serialization) - 数据的“标准化”
+这是将内存中千奇百怪的 C++ 对象，转换为可以在网络上传输的、统一格式的二进制流的过程。
+Protobuf, JSON, FlatBuffers 等就是不同的序列化方案。
+
+
+高级网络处理 (Advanced Networking) - 健壮性的“保障”
+一个 RPC 框架的价值，很大程度上体现在它如何处理那些棘手的网络编程问题。
+超时、重试、取消、负载均衡、流量控制等进阶功能，都是对底层网络问题的上层封装和策略实现。
+
+
+
+三、 我的行动指南：带着问题探索源码基于上述的思考，我为自己接下来的源码探索之旅，列出了几个核心问题。这些问题，以及不同框架对它们的解答，也将是我学习的重点。
+
+问题 1：如何保证每个请求的唯一标识？
+问题 2：如何保证请求在网络上的安全？
+问题 3：如何保证查找请求（路由）的高效性？
+问题 4：重试与超时机制是如何无缝衔接到函数调用中的？
+问题 5：同步与异步处理的底层机制是怎样的？
+问题 6：如何做好高并发下的线程安全？
+
+四、结语这，就是我的探索地图。希望它也能为你带来一些启发，如果有什么错误或者不足，希望也能在评论区指出。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:01.一个线程一个Eventloop</title>
+    <url>/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:01.%E4%B8%80%E4%B8%AA%E7%BA%BF%E7%A8%8B%E4%B8%80%E4%B8%AAEventloop/</url>
+    <content><![CDATA[前言：再探 muduo，一次与过去的对话记得自己刚开始学 C++ 的时候，刚学会语法，学完 Linux 系统编程，也是在知乎上搜各种回答，以什么样的方式提升自己的 C++ 编程水平，看什么书让自己的编程水平突飞猛进，那些书让你的 C++ 水平顿悟的感觉等等问题。后来也是搜索到了一个回答是看 muduo 网络库，当时尝试去看，很惭愧，完全看不进去，看《Linux 多线程服务器编程》这本书也是，看了和没看一样。
+现在工作了一段时间了，积累了一些经验，突然之间又在刷知乎的时候看到了这个问题，并且刷到了 muduo 这个库，想着趁这个机会再看看，看自己是不是能看懂了，也算是对过去的自己的一个交代吧。
+
+muduo 的设计哲学：基于对象与事件驱动一个自己能够做主的开源程序，体现的大多是作者本身在软件设计上的理念。陈硕大佬在《Linux 多线程服务器编程》这本书中，清晰地表达了他的几个核心观点：
+
+核心事件： 网络连接中的几个重要事件：建立新连接、关闭连接、收到消息、消息发送完成（所谓的“三个半事件”）。  
+线程模型： 一个好的网络库的模型应该是“一个线程一个事件循环 (One Loop Per Thread)”。  
+设计风格： muduo 是**基于对象的 (Object-Based)**，而不是面向对象的 (Object-Oriented)，并表达了对面向对象中虚函数与继承滥用的不满。
+
+我们的 muduo 源码剖析系列文章，就将围绕陈硕大佬是如何在 muduo 这个库中实现这些核心观点的来展开。
+而本篇文章，我们将着重分析第一个核心观点——“一个线程一个 EventLoop” 是如何实现的，以及第二个关键问题——EventLoop 自身的操作（特别是跨线程提交任务）是如何保证在其所属的线程中执行的。
+从 echo 示例说起：muduo 的直观用法在深入源码之前，我们先看一个 muduo 最简单的 echo 示例，了解其基本用法：
+#include &lt;muduo/net/TcpServer.h&gt;  #include &lt;muduo/net/EventLoop.h&gt;  #include &lt;muduo/base/Logging.h&gt;  #include &lt;unistd.h&gt;  #include &lt;functional&gt;class EchoServer  &#123;   public:    EchoServer(muduo::net::EventLoop* loop,               const muduo::net::InetAddress&amp; listenAddr)      : server_(loop, listenAddr, &quot;EchoServer&quot;)    &#123;      server_.setConnectionCallback(          std::bind(&amp;EchoServer::onConnection, this, std::placeholders::_1));      server_.setMessageCallback(          std::bind(&amp;EchoServer::onMessage, this,                    std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));    &#125;  void start()    &#123;      server_.start();    &#125; private:    void onConnection(const muduo::net::TcpConnectionPtr&amp; conn)    &#123;      LOG_INFO &lt;&lt; &quot;EchoServer - &quot; &lt;&lt; conn-&gt;peerAddress().toIpPort() &lt;&lt; &quot; -&gt; &quot;               &lt;&lt; conn-&gt;localAddress().toIpPort() &lt;&lt; &quot; is &quot;               &lt;&lt; (conn-&gt;connected() ? &quot;UP&quot; : &quot;DOWN&quot;);    &#125;  void onMessage(const muduo::net::TcpConnectionPtr&amp; conn,                   muduo::net::Buffer* buf,                   muduo::Timestamp time)    &#123;      muduo::string msg(buf-&gt;retrieveAllAsString());      LOG_INFO &lt;&lt; conn-&gt;name() &lt;&lt; &quot; echo &quot; &lt;&lt; msg.size() &lt;&lt; &quot; bytes, &quot;               &lt;&lt; &quot;data received at &quot; &lt;&lt; time.toString();      conn-&gt;send(msg);    &#125;  muduo::net::TcpServer server_;  &#125;;int main()  &#123;    LOG_INFO &lt;&lt; &quot;pid = &quot; &lt;&lt; getpid();    muduo::net::EventLoop loop; // 1. 创建主 EventLoop    muduo::net::InetAddress listenAddr(2007);    EchoServer server(&amp;loop, listenAddr); // 2. 创建 EchoServer (内部包含 TcpServer)    server.start(); // 3. 启动服务器 (内部会启动 I/O 线程池和 Acceptor)    loop.loop(); // 4. 启动主 EventLoop 的事件循环  &#125;
+
+
+可以看到，使用 muduo 确实很简单：创建一个主 EventLoop，用它和监听地址构造 TcpServer（通过组合），设置好连接和消息处理的回调函数，然后启动 TcpServer，最后启动主 EventLoop 的循环。
+多个 EventLoop 的启动与线程绑定那么，TcpServer 是如何实现 “One Loop Per Thread” 并启动多个 EventLoop 的呢？关键在于 TcpServer::start() 方法和其内部的 EventLoopThreadPool。
+1. TcpServer::start() - 启动引擎void TcpServer::start()  &#123;    if (started_.getAndSet(1) == 0) // 通过原子操作保证只启动一次    &#123;      threadPool_-&gt;start(threadInitCallback_); // 1. 启动 EventLoopThreadPool    assert(!acceptor_-&gt;listenning());      // 2. 将 Acceptor::listen 任务提交到主 EventLoop 执行      loop_-&gt;runInLoop(          std::bind(&amp;Acceptor::listen, get_pointer(acceptor_)));    &#125;  &#125;
+
+TcpServer::start() 主要做了两件事：启动 EventLoopThreadPool 和启动 Acceptor 的监听。我们先关注第一件。
+2. EventLoopThreadPool::start() - 创建并启动 I&#x2F;O 线程EventLoopThreadPool 负责管理一组 I&#x2F;O 线程，每个线程运行一个 EventLoop。
+void EventLoopThreadPool::start(const ThreadInitCallback&amp; cb)  &#123;    assert(!started_);    baseLoop_-&gt;assertInLoopThread(); // 确保在主 EventLoop 线程中调用  started_ = true;  for (int i = 0; i &lt; numThreads_; ++i) // 根据配置的线程数循环    &#123;      char buf[name_.size() + 32];      snprintf(buf, sizeof buf, &quot;%s%d&quot;, name_.c_str(), i);      // 创建 EventLoopThread 对象      EventLoopThread* t = new EventLoopThread(cb, buf);      threads_.push_back(std::unique_ptr&lt;EventLoopThread&gt;(t));      // 启动线程并获取 EventLoop 指针，存入 loops_ 向量      loops_.push_back(t-&gt;startLoop());    &#125;    if (numThreads_ == 0 &amp;&amp; cb)    &#123;      cb(baseLoop_);    &#125;  &#125;
+
+这里可以看到，线程池会根据用户通过 TcpServer::setThreadNum() 设置的线程数（如果没设置，默认为 0，即所有 I&#x2F;O 都在主 EventLoop 中），创建相应数量的 EventLoopThread 对象，并调用 startLoop() 获取 EventLoop 指针。
+3. EventLoopThread - “One Loop Per Thread” 的实现者EventLoopThread 是实现 “One Loop Per Thread” 的核心。它在构造时会创建一个 muduo::Thread 对象，并将自己的 threadFunc 作为线程入口函数。
+EventLoopThread::EventLoopThread(const ThreadInitCallback&amp; cb,                                   const string&amp; name)    : loop_(NULL),      exiting_(false),      thread_(std::bind(&amp;EventLoopThread::threadFunc, this), name), // 创建线程对象      mutex_(),      cond_(mutex_),      callback_(cb)  &#123;  &#125;
+
+startLoop() 方法负责启动这个线程，并阻塞等待新线程中的 EventLoop 创建完成。
+EventLoop* EventLoopThread::startLoop()  &#123;    assert(!thread_.started());    thread_.start(); // 启动新线程，执行 threadFunc  EventLoop* loop = NULL;    &#123;      MutexLockGuard lock(mutex_);      while (loop_ == NULL) // 使用条件变量等待 loop_ 被赋值      &#123;        cond_.wait();      &#125;      loop = loop_; // 获取 EventLoop 指针    &#125;  return loop;  &#125;
+
+新线程启动后，会执行 threadFunc：
+void EventLoopThread::threadFunc()  &#123;    EventLoop loop; // 1. 在新线程的栈上创建 EventLoop 对象  if (callback_) // 2. 执行线程初始化回调    &#123;      callback_(&amp;loop);    &#125;  &#123;      MutexLockGuard lock(mutex_);      loop_ = &amp;loop; // 3. 将 EventLoop 指针赋值给成员变量      cond_.notify(); // 4. 通知 startLoop() 已创建完毕    &#125;  loop.loop(); // 5. 启动事件循环，阻塞在此        MutexLockGuard lock(mutex_); // loop 退出后清理    loop_ = NULL;  &#125;
+
+EventLoop 的构造函数中会检查 thread_local EventLoop* t_loopInThisThread 变量，如果该线程已有 EventLoop，则会 LOG_FATAL 退出，从而保证了每个线程只有一个 EventLoop。
+4. 启动流程总结与时序图总结一下，启动多个事件循环的流程是：
+
+用户（可选）调用 TcpServer::setThreadNum() 设置 I&#x2F;O 线程数。  
+用户调用 TcpServer::start()。  
+TcpServer 调用 EventLoopThreadPool::start()。  
+EventLoopThreadPool 循环创建 EventLoopThread 对象。  
+每个 EventLoopThread 对象调用 startLoop()。  
+startLoop() 启动一个新线程。  
+新线程执行 threadFunc()，在自己的栈上创建 EventLoop 对象，并通过条件变量通知 startLoop()。  
+startLoop() 返回 EventLoop 指针给 EventLoopThreadPool。  
+新线程执行 EventLoop::loop()，进入事件循环。
+
+下面是这个过程的时序图：
+
+runInLoop：确保任务在正确的 EventLoop 中执行理解了 EventLoop 如何与线程绑定后，我们来看第二个关键问题：muduo 如何保证对 EventLoop 及其管理的对象的操作，都在其所属的线程中执行？核心在于 EventLoop::runInLoop 和 EventLoop::queueInLoop。
+runInLoop 的逻辑很清晰：如果当前线程就是 EventLoop 所在的线程，则直接执行回调函数 cb；否则，将 cb 交给 queueInLoop 处理。
+void EventLoop::runInLoop(Functor cb)  &#123;    if (isInLoopThread()) // 判断是否在当前 EventLoop 线程    &#123;      cb(); // 是，则直接执行    &#125;    else    &#123;      queueInLoop(std::move(cb)); // 不是，则入队    &#125;  &#125;
+
+queueInLoop 负责将任务放入 pendingFunctors_ 队列，并唤醒目标 EventLoop 线程（如果它正在阻塞等待）。
+void EventLoop::queueInLoop(Functor cb)  &#123;    &#123;      MutexLockGuard lock(mutex_); // 加锁保护 pendingFunctors_      pendingFunctors_.push_back(std::move(cb));    &#125;  // 如果调用者不是 EventLoop 线程，或者 EventLoop 线程正在处理任务队列则需要唤醒    if (!isInLoopThread() || callingPendingFunctors_)    &#123;      wakeup();    &#125;  &#125;
+
+唤醒操作通过向 EventLoop 内部的 wakeupFd_ (一个 eventfd) 写入一个字节来实现。这个 wakeupFd_ 已经被封装成一个 Channel 并注册到了 Poller 中，监听读事件。
+EventLoop::EventLoop()    :  ...      wakeupFd_(createEventfd()), // 创建 eventfd      wakeupChannel_(new Channel(this, wakeupFd_)), // 创建 Channel       ...  &#123;     ...    wakeupChannel_-&gt;setReadCallback(        std::bind(&amp;EventLoop::handleRead, this)); // 设置读回调    wakeupChannel_-&gt;enableReading(); // 启用读事件监听  &#125;
+void EventLoop::wakeup()  &#123;    uint64_t one = 1;    // 向 wakeupFd_ 写入 1 个字节，触发可读事件    ssize_t n = sockets::write(wakeupFd_, &amp;one, sizeof one);    if (n != sizeof one)    &#123;      LOG_ERROR &lt;&lt; &quot;EventLoop::wakeup() writes &quot; &lt;&lt; n &lt;&lt; &quot; bytes instead of 8&quot;;    &#125;  &#125;void EventLoop::handleRead() // wakeupChannel_ 的读回调  &#123;    uint64_t one = 1;    // 读取 wakeupFd_ 的数据，清空事件通知    ssize_t n = sockets::read(wakeupFd_, &amp;one, sizeof one);    if (n != sizeof one)    &#123;      LOG_ERROR &lt;&lt; &quot;EventLoop::handleRead() reads &quot; &lt;&lt; n &lt;&lt; &quot; bytes instead of 8&quot;;    &#125;  &#125;
+
+当 Poller::poll() 因为 wakeupFd_ 可读而返回后，EventLoop::loop() 会处理 wakeupChannel_ 的 handleRead 事件，之后会调用 doPendingFunctors() 来执行队列中的所有任务。
+void EventLoop::loop()  &#123;    // ...    while (!quit_)    &#123;      activeChannels_.clear();      pollReturnTime_ = poller_-&gt;poll(kPollTimeMs, &amp;activeChannels_); // 等待事件      // ... 处理 I/O 事件 ...      eventHandling_ = true;      for (Channel* channel : activeChannels_)      &#123;        currentActiveChannel_ = channel;        currentActiveChannel_-&gt;handleEvent(pollReturnTime_);      &#125;      currentActiveChannel_ = NULL;      eventHandling_ = false;      doPendingFunctors(); // 处理队列中的任务    &#125;    // ...  &#125;void EventLoop::doPendingFunctors()  &#123;    std::vector&lt;Functor&gt; functors;    callingPendingFunctors_ = true; // 标记正在处理任务  &#123;      MutexLockGuard lock(mutex_);      functors.swap(pendingFunctors_); // 将任务队列交换出来，减小临界区    &#125;  for (const Functor&amp; functor : functors) // 执行所有任务    &#123;      functor();    &#125;    callingPendingFunctors_ = false; // 标记处理完毕  &#125;
+
+
+这样，muduo 就通过 runInLoop &#x2F; queueInLoop 结合 eventfd 唤醒机制，巧妙地实现了跨线程任务提交，并严格保证了所有操作都在其所属的 EventLoop 线程中执行，完美诠释了陈硕大佬的设计思想。
+下面是这个过程的时序图：
+
+后记文学家用文字表达自己的思想，程序开发人员用程序表达自己对软件设计的思想。我始终坚信，程序开发人员，应该坚信自己的程序是表达自己想法的工作，我们是 艺术家 而不是单纯的码农，我们在自己能够做主的程序里，应该去体现自己的思想。
+在这个系列的文章中，我们不是要去争论对与错，不是要去争论程序设计面向对象的优缺点，到底是该基于对象还是面向对象。我们可以有自己的偏好，认同某些观点，我们要做的是从开源代码中学习这个思想。无论我们是认同一个观点还是学习一个观点，我们都应该深入学习一个观点。
+通过对 muduo 启动流程和跨线程调用机制的分析，我们得以一窥其“One Loop Per Thread”模型实现的精妙之处。这只是 muduo 设计魅力的冰山一角，在接下来的文章中，我们将继续探索其事件处理、连接管理等核心机制。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:02.事件的处理</title>
+    <url>/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:02.%E4%BA%8B%E4%BB%B6%E7%9A%84%E5%A4%84%E7%90%86/</url>
+    <content><![CDATA[前言在上一篇文章《muduo 源码剖析（一）：深入 ‘One Loop Per Thread’ 与 EventLoop 的实现》中，我们分析了 muduo 如何通过 EventLoopThreadPool 和 EventLoopThread 实现 “One Loop Per Thread” 的并发模型，以及 EventLoop 如何通过 eventfd 机制支持跨线程的任务提交。这些是 muduo 事件驱动框架的基石。
+本文我们将聚焦于网络编程的核心——TCP 连接，以及陈硕大佬提出的“三个半事件”中的核心部分：新连接的建立与分发、连接上数据的接收与发送、以及连接的关闭与资源回收。我们将深入探讨在 muduo 中，这些事件是如何被优雅地融入其基于对象的事件驱动框架中的。
+
+EventLoop::loop()：事件处理的核心驱动在深入具体事件之前，我们首先需要理解 EventLoop 的主循环 loop() 是如何驱动事件处理的。其核心逻辑非常直观：
+
+调用 Poller::poll() (底层通常是 epoll_wait) 等待 I&#x2F;O 事件的发生，或者等待被 wakeupFd_ 唤醒。
+获取到活跃的 Channel 列表 (activeChannels_)。
+遍历 activeChannels_，对每个 Channel 调用其 handleEvent() 方法。
+执行所有通过 runInLoop 或 queueInLoop 提交的待处理任务 (doPendingFunctors())。
+
+void EventLoop::loop()  &#123;  assert(!looping_);  assertInLoopThread();  looping_ = true;  quit_ = false;  // FIXME: what if someone calls quit() before loop() ?  LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; start looping&quot;;while (!quit_)  &#123;  activeChannels_.clear();  // 1. 等待事件发生  pollReturnTime_ = poller_-&gt;poll(kPollTimeMs, &amp;activeChannels_);  ++iteration_;  if (Logger::logLevel() &lt;= Logger::TRACE)  &#123;  printActiveChannels();  &#125;  eventHandling_ = true;  // 2. 处理活跃 Channel 的事件  for (Channel* channel : activeChannels_)  &#123;  currentActiveChannel_ = channel;  currentActiveChannel_-&gt;handleEvent(pollReturnTime_);  &#125;  currentActiveChannel_ = NULL;  eventHandling_ = false;  // 3. 执行 EventLoop 内部任务队列中的任务  doPendingFunctors();  &#125;LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; stop looping&quot;;  looping_ = false;  &#125;  
+
+Poller (以 EPollPoller 为例) 的 poll() 方法负责调用 epoll_wait，并将返回的就绪事件填充到 activeChannels 列表中。
+// EPollPoller.cc  Timestamp EPollPoller::poll(int timeoutMs, ChannelList* activeChannels)  &#123;  LOG_TRACE &lt;&lt; &quot;fd total count &quot; &lt;&lt; channels_.size();  int numEvents = ::epoll_wait(epollfd_,  &amp;*events_.begin(), // events_ 是 epoll_event 数组  static_cast&lt;int&gt;(events_.size()),  timeoutMs);  int savedErrno = errno;  Timestamp now(Timestamp::now());  if (numEvents &gt; 0)  &#123;  LOG_TRACE &lt;&lt; numEvents &lt;&lt; &quot; events happened&quot;;  fillActiveChannels(numEvents, activeChannels); // 将就绪事件转换为 Channel  if (implicit_cast&lt;size_t&gt;(numEvents) == events_.size()) // 如果 epoll_event 数组满了，则扩容  &#123;  events_.resize(events_.size()*2);  &#125;  &#125;  else if (numEvents == 0)  &#123;  LOG_TRACE &lt;&lt; &quot;nothing happened&quot;;  &#125;  else // 出错处理  &#123;  if (savedErrno != EINTR)  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;EPollPoller::poll()&quot;;  &#125;  &#125;  return now;  &#125;void EPollPoller::fillActiveChannels(int numEvents,  ChannelList* activeChannels) const  &#123;  assert(implicit_cast&lt;size_t&gt;(numEvents) &lt;= events_.size());  for (int i = 0; i &lt; numEvents; ++i)  &#123;  // 注册时将 Channel* 存放在 epoll_event 的 data.ptr 中  Channel* channel = static_cast&lt;Channel*&gt;(events_[i].data.ptr);  // ... (省略 NDEBUG 下的断言检查) ...  channel-&gt;set_revents(events_[i].events); // 设置 Channel 实际发生的事件  activeChannels-&gt;push_back(channel);  &#125;  &#125;
+
+当 EventLoop 获取到活跃的 Channel 后，会调用 Channel::handleEvent()。这个方法是事件分发的枢纽，它根据 Channel 上实际发生的事件类型 (revents_)，调用相应的回调函数。
+// Channel.cc  void Channel::handleEvent(Timestamp receiveTime)  &#123;  std::shared_ptr&lt;void&gt; guard;  if (tied_) // 如果 Channel 与某个对象（通常是 TcpConnection）绑定了生命周期  &#123;  guard = tie_.lock(); // 尝试获取对象的 shared_ptr  if (guard) // 对象仍然存活  &#123;  handleEventWithGuard(receiveTime);  &#125;  // 如果 guard 为空，说明对象已销毁，Channel 不再处理事件  &#125;  else // 未绑定生命周期  &#123;  handleEventWithGuard(receiveTime);  &#125;  &#125;void Channel::handleEventWithGuard(Timestamp receiveTime)  &#123;  eventHandling_ = true;  LOG_TRACE &lt;&lt; reventsToString();  // 对端关闭连接 (POLLHUP)，并且没有可读数据 (POLLIN)  if ((revents_ &amp; POLLHUP) &amp;&amp; !(revents_ &amp; POLLIN))  &#123;  if (logHup_)  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLHUP&quot;;  &#125;  if (closeCallback_) closeCallback_(); // 执行关闭回调  &#125;if (revents_ &amp; POLLNVAL) // 无效的请求，通常是 fd 已关闭  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLNVAL&quot;;  &#125;// 错误事件 (POLLERR) 或无效请求 (POLLNVAL)  if (revents_ &amp; (POLLERR | POLLNVAL))  &#123;  if (errorCallback_) errorCallback_(); // 执行错误回调  &#125;  // 可读事件 (POLLIN)、高优先级可读 (POLLPRI)、对端关闭连接且仍有数据可读 (POLLRDHUP)  if (revents_ &amp; (POLLIN | POLLPRI | POLLRDHUP))  &#123;  if (readCallback_) readCallback_(receiveTime); // 执行读回调  &#125;  // 可写事件 (POLLOUT)  if (revents_ &amp; POLLOUT)  &#123;  if (writeCallback_) writeCallback_(); // 执行写回调  &#125;  eventHandling_ = false;  &#125;
+
+下面的就是loop事件循环的时序图:
+
+理解了 EventLoop 的核心驱动逻辑和 Channel 的事件分发机制后，我们就可以具体分析“三个半事件”的处理了。
+事件一：新连接的建立与分发学习过 Linux 网络编程的都知道，服务器接受新连接的基本流程是 socket -&gt; bind -&gt; listen -&gt; accept。muduo 将这个过程优雅地封装在 Acceptor 和 TcpServer 类中。
+1. Acceptor：新连接的接收者TcpServer 在构造时会创建一个 Acceptor 对象，并将其与主 EventLoop 关联。Acceptor 负责创建监听套接字、绑定地址、并设置当有新连接到来时（监听套接字可读）的回调函数为 Acceptor::handleRead。
+// TcpServer.cc (构造函数部分)  TcpServer::TcpServer(EventLoop* loop,  const InetAddress&amp; listenAddr,  const string&amp; nameArg,  Option option)  : loop_(CHECK_NOTNULL(loop)),  acceptor_(new Acceptor(loop, listenAddr, option == kReusePort)),  // ...  &#123;  acceptor_-&gt;setNewConnectionCallback(  std::bind(&amp;TcpServer::newConnection, this, _1, _2));  &#125;// Acceptor.cc (构造函数部分)Acceptor::Acceptor(EventLoop* loop, const InetAddress&amp; listenAddr, bool reuseport): loop_(loop),  acceptSocket_(sockets::createNonblockingOrDie(listenAddr.family())),  acceptChannel_(loop, acceptSocket_.fd()), // 为监听套接字创建 Channel  // ...  &#123;  // ...  acceptSocket_.bindAddress(listenAddr);  acceptChannel_.setReadCallback(  std::bind(&amp;Acceptor::handleRead, this)); // 设置 Channel 的读回调  &#125;  
+
+调用TcpServer::start() 时，会通过 loop_-&gt;runInLoop() 调用 Acceptor::listen()，该方法会调用 listen() 系统调用并使 acceptChannel_ 开始关注读事件。
+// Acceptor.cc  void Acceptor::listen()  &#123;  loop_-&gt;assertInLoopThread();  listenning_ = true;  acceptSocket_.listen();  acceptChannel_.enableReading(); // 将 acceptChannel_ 加入 Poller 监听  &#125;
+
+当新连接到达时，acceptChannel_ 的 handleRead 被触发：
+// Acceptor.cc  void Acceptor::handleRead()  &#123;  loop_-&gt;assertInLoopThread();  InetAddress peerAddr;  int connfd = acceptSocket_.accept(&amp;peerAddr); // 接受新连接  if (connfd &gt;= 0)  &#123;  if (newConnectionCallback_)  &#123;  newConnectionCallback_(connfd, peerAddr); // 调用 TcpServer::newConnection  &#125;  else  &#123;  sockets::close(connfd);  &#125;  &#125;  // ... (错误处理和 EMFILE 处理) ...  &#125;
+
+2. TcpServer::newConnection：连接的分发Acceptor 将新接受的 connfd 和对端地址传递给 TcpServer::newConnection。此方法的核心职责是：
+
+从 EventLoopThreadPool 中通过轮询选择一个 I&#x2F;O EventLoop。
+为新连接创建一个 TcpConnection 对象，并将选择的 I&#x2F;O EventLoop 传递给它。
+设置 TcpConnection 的各种回调（连接状态、消息到达、写完成、关闭）。
+将 TcpConnection::connectEstablished 方法提交到选定的 I&#x2F;O EventLoop 中执行。
+
+// TcpServer.cc  void TcpServer::newConnection(int sockfd, const InetAddress&amp; peerAddr)  &#123;  loop_-&gt;assertInLoopThread(); // 确保在主 EventLoop 中  EventLoop* ioLoop = threadPool_-&gt;getNextLoop(); // 轮询选择 I/O Loop  // ... (生成连接名 connName) ...  TcpConnectionPtr conn(new TcpConnection(ioLoop, // 将 ioLoop 传递给 TcpConnection  connName,  sockfd,  localAddr,  peerAddr));  connections_[connName] = conn; // 保存连接  // ... (设置各种回调) ...  conn-&gt;setCloseCallback(  std::bind(&amp;TcpServer::removeConnection, this, _1));  // 将连接建立的后续操作交给 ioLoop 执行  ioLoop-&gt;runInLoop(std::bind(&amp;TcpConnection::connectEstablished, conn));  &#125;
+
+3. TcpConnection::connectEstablished：连接的最终建立此方法在选定的 I&#x2F;O EventLoop 线程中执行，完成连接的最后步骤：
+// TcpConnection.cc  void TcpConnection::connectEstablished()  &#123;  loop_-&gt;assertInLoopThread(); // 确保在 ioLoop 中  assert(state_ == kConnecting);  setState(kConnected);  channel_-&gt;tie(shared_from_this()); // 绑定生命周期  channel_-&gt;enableReading(); // 开始关注该连接上的读事件  connectionCallback_(shared_from_this()); // 调用用户设置的连接建立回调  &#125;
+
+至此，新连接的建立和分发完成，后续该连接上的所有 I&#x2F;O 事件都将在其被分配到的 I&#x2F;O EventLoop 线程中处理。
+这是建立连接的时序图：
+
+事件二：收到消息 (MessageCallback)当客户端发送数据时，TcpConnection 对应的 channel_ 会触发读事件，进而调用 TcpConnection::handleRead。
+// TcpConnection.cc (构造函数中设置)  channel_-&gt;setReadCallback(  std::bind(&amp;TcpConnection::handleRead, this, _1));// TcpConnection.cc  void TcpConnection::handleRead(Timestamp receiveTime)  &#123;  loop_-&gt;assertInLoopThread();  int savedErrno = 0;  ssize_t n = inputBuffer_.readFd(channel_-&gt;fd(), &amp;savedErrno); // 从 socket 读取数据到 inputBuffer_  if (n &gt; 0)  &#123;  // 调用用户在 TcpServer 中设置的 messageCallback_  messageCallback_(shared_from_this(), &amp;inputBuffer_, receiveTime);  &#125;  else if (n == 0) // 对端关闭  &#123;  handleClose();  &#125;  else // 错误  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleRead&quot;;  handleError(); // 通常也会调用 handleClose  &#125;  &#125;
+
+
+用户通过 TcpServer::setMessageCallback 设置的回调函数会在这里被调用，参数包括 TcpConnectionPtr、存有接收数据的 Buffer* 以及时间戳。用户可以在回调中从 Buffer 中取出数据进行业务处理。
+这是处理读事件的时序图:
+
+事件三：消息发送完成 (WriteCompleteCallback)当用户调用 TcpConnection::send() 发送数据时：
+
+如果当前线程不是连接所属的 ioLoop，则将发送任务 sendInLoop 提交到 ioLoop 执行。
+sendInLoop 会尝试直接 write() 数据到 socket。
+如果数据一次性全部写完，且用户设置了 writeCompleteCallback_，则将其提交到 ioLoop 的任务队列中执行。
+如果数据没有一次性写完（例如内核发送缓冲区满），则将剩余数据存入 outputBuffer_，并使 channel_ 开始关注写事件 (enableWriting())。
+
+
+当 socket 变为可写时，channel_ 的写事件回调 TcpConnection::handleWrite 被触发。
+handleWrite 会继续从 outputBuffer_ 中发送数据。如果所有数据都发送完毕，则取消对写事件的关注 (disableWriting())，并调用 writeCompleteCallback_。
+
+// TcpConnection.cc (sendInLoop 核心逻辑)  void TcpConnection::sendInLoop(const void* data, size_t len)  &#123;  loop_-&gt;assertInLoopThread();  ssize_t nwrote = 0;  size_t remaining = len;  bool faultError = false;  if (state_ == kDisconnected) &#123; /* ... return ... */ &#125;// 如果输出队列为空，尝试直接发送  if (!channel_-&gt;isWriting() &amp;&amp; outputBuffer_.readableBytes() == 0)  &#123;  nwrote = sockets::write(channel_-&gt;fd(), data, len);  if (nwrote &gt;= 0)  &#123;  remaining = len - nwrote;  if (remaining == 0 &amp;&amp; writeCompleteCallback_) // 全部发送完毕  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  &#125;  else // nwrote &lt; 0 (错误)  &#123;  // ... 错误处理 ...  &#125;  &#125;if (!faultError &amp;&amp; remaining &gt; 0) // 如果还有数据未发送  &#123;  // ... (检查高水位回调 HighWaterMarkCallback) ...  outputBuffer_.append(static_cast&lt;const char*&gt;(data)+nwrote, remaining); // 存入输出缓冲区  if (!channel_-&gt;isWriting())  &#123;  channel_-&gt;enableWriting(); // 开始关注写事件  &#125;  &#125;  &#125;// TcpConnection.cc (构造函数中设置)  channel_-&gt;setWriteCallback(  std::bind(&amp;TcpConnection::handleWrite, this));// TcpConnection.cc  void TcpConnection::handleWrite()  &#123;  loop_-&gt;assertInLoopThread();  if (channel_-&gt;isWriting())  &#123;  ssize_t n = sockets::write(channel_-&gt;fd(),  outputBuffer_.peek(),  outputBuffer_.readableBytes());  if (n &gt; 0)  &#123;  outputBuffer_.retrieve(n);  if (outputBuffer_.readableBytes() == 0) // 输出缓冲区已空  &#123;  channel_-&gt;disableWriting(); // 不再关注写事件  if (writeCompleteCallback_)  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  if (state_ == kDisconnecting) // 如果正在关闭连接  &#123;  shutdownInLoop();  &#125;  &#125;  &#125;  else  &#123;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleWrite&quot;;  &#125;  &#125;  else  &#123;  LOG_TRACE &lt;&lt; &quot;Connection fd = &quot; &lt;&lt; channel_-&gt;fd()  &lt;&lt; &quot; is down, no more writing&quot;;  &#125;  &#125;
+
+“消息发送完成”这个“半个事件”是通过 WriteCompleteCallback 来体现的，它在输出缓冲区的数据全部成功写入内核后被调用。
+因为写数据是用户关注的，如果一次性写完成就不必关心了，写不完就先放到buffer中，等到可写的时候，处理下写事件，将数据再次发送，发送完就不必关注了，这样也可以避免busyloop了
+这是上述过程的时序图
+
+事件四：连接关闭连接关闭的触发点有多种：对端关闭（handleRead 读到 EOF）、本地主动关闭（用户调用 TcpConnection::shutdown()）、或发生错误（handleError） 。这些路径通常都会汇聚到 TcpConnection::handleClose()。
+TcpConnection 在构造时设置了其 channel_ 的关闭回调为 handleClose。
+// TcpConnection.cc (构造函数中设置)  channel_-&gt;setCloseCallback(  std::bind(&amp;TcpConnection::handleClose, this));  
+
+handleClose() 的核心逻辑：  
+
+断言在正确的 ioLoop 中执行。  
+将连接状态设为 kDisconnected。  
+调用 channel_-&gt;disableAll()，使该 Channel 不再关注任何事件。  
+调用用户设置的 connectionCallback_（此时连接状态已变为 kDisconnected）。  
+调用 closeCallback_（在 TcpServer::newConnection 中被绑定到 TcpServer::removeConnection）。
+
+// TcpConnection.cc  void TcpConnection::handleClose()  &#123;  loop_-&gt;assertInLoopThread();  LOG_TRACE &lt;&lt; &quot;fd = &quot; &lt;&lt; channel_-&gt;fd() &lt;&lt; &quot; state = &quot; &lt;&lt; stateToString();  assert(state_ == kConnected || state_ == kDisconnecting);  setState(kDisconnected);  channel_-&gt;disableAll(); // 如果是那种建立过连接的文件描述符，在这一步就会被从poller移除了TcpConnectionPtr guardThis(shared_from_this()); // 确保回调期间对象存活  connectionCallback_(guardThis);  closeCallback_(guardThis); // 调用 TcpServer::removeConnection  &#125;  
+TcpServer::removeConnection 会将实际的移除操作（从 connections_ map 中删除）提交到 TcpServer 的主 EventLoop 中执行（removeConnectionInLoop），以保证线程安全。之后，它会将最终的销毁操作 TcpConnection::connectDestroyed 提交回该连接所属的 I&#x2F;O EventLoop 中执行。
+// TcpServer.cc  void TcpServer::removeConnection(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;runInLoop(std::bind(&amp;TcpServer::removeConnectionInLoop, this, conn));  &#125;void TcpServer::removeConnectionInLoop(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;assertInLoopThread();  LOG_INFO &lt;&lt; &quot;TcpServer::removeConnectionInLoop [&quot; &lt;&lt; name_  &lt;&lt; &quot;] - connection &quot; &lt;&lt; conn-&gt;name();  connections_.erase(conn-&gt;name()); // 从 TcpServer 管理的 map 中移除  EventLoop* ioLoop = conn-&gt;getLoop();  // 将最后的清理工作交给连接所属的 ioLoop  ioLoop-&gt;queueInLoop(  std::bind(&amp;TcpConnection::connectDestroyed, conn));  &#125;  
+TcpConnection::connectDestroyed 负责将 Channel 从其 EventLoop 的 Poller 中移除。
+// TcpConnection.cc  void TcpConnection::connectDestroyed()  &#123;  loop_-&gt;assertInLoopThread();  if (state_ == kConnected) // 如果之前是连接状态，则先更新状态并调用回调  &#123;  setState(kDisconnected);  channel_-&gt;disableAll();  connectionCallback_(shared_from_this());  &#125;  channel_-&gt;remove(); // 从 Poller 中移除 Channel  &#125;// Channel.cc  void Channel::remove()  &#123;  assert(isNoneEvent());  addedToLoop_ = false;  loop_-&gt;removeChannel(this); // 通知 EventLoop 从 Poller 中移除  &#125;
+
+EventLoop::removeChannel 会调用 Poller::removeChannel，最终通过 epoll_ctl(EPOLL_CTL_DEL, …) 将文件描述符从 epoll 实例中移除。
+这是关闭连接的时序图:
+当 TcpConnectionPtr 的最后一个 shared_ptr 引用（通常是在 connectDestroyed 的 std::bind 对象析构时）消失后，TcpConnection 对象及其拥有的 Socket（会在析构时关闭 fd）和 Channel 对象会被自动析构，完成资源的彻底回收。
+这一套精心设计的流程，严格遵守了“对象生命周期管理”和“线程封闭”的原则，确保了连接关闭的正确性和资源的有效释放。
+总结通过对 muduo 中新连接建立、数据收发、连接关闭这“三个半事件”处理流程的分析，我们可以看到陈硕大佬是如何将这些网络编程中的核心操作，优雅地融入其基于对象的事件驱动框架中的。
+
+事件的统一处理入口： EventLoop::loop() 是所有事件处理的起点。
+Channel 作为事件分发的核心： 它封装了文件描述符和相关的事件回调。
+职责明确的类设计： Acceptor 专注于接受新连接，TcpServer 负责管理和分发连接，TcpConnection 负责处理单个连接的生命周期和业务逻辑。
+线程安全的保证： 通过 “One Loop Per Thread” 和 runInLoop&#x2F;queueInLoop 机制，确保了所有对象的操作都在其所属的线程中执行。
+回调机制的广泛应用： 将具体的业务逻辑与框架逻辑解耦，提高了灵活性和可扩展性。
+
+通过这些操作，在遵循陈硕大佬的 基于对象 的理念的前提下，完成了对“三个半事件”的处理。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:04.Buffer设计分析</title>
+    <url>/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
+在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
+
+假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
+如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
+在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
+在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
+
+这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
+在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
+本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
+
+muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
++——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
+
+prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
+readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
+writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
+
+这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
+核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
+class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
+
+
+buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
+readerIndex_: size_t 类型，标记可读数据的起始位置。
+writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
+
+通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
+size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
+
+基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
+void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
+
+核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
+2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
+void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
+
+在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
+空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
+
+内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
+外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
+
+void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
+
+这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
+高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
+ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
+
+readFd 的设计有几个显著优点：  
+
+减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
+避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
+避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
+栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
+
+其他实用特性
+网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
+头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
+查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
+
+总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
+其核心设计启示包括：
+
+空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
+减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
+设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
+接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
+
+理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:03.定时器的实现</title>
+    <url>/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/</url>
+    <content><![CDATA[前言在muduo源码剖析的前两篇文章中，我们深入探讨了 muduo 的核心并发模型——“One Loop Per Thread” 的实现，以及 TCP连接从建立、数据收发到关闭的完整生命周期管理。
+这些内容实际上已经对陈硕大佬在网络库上的设计设计思想体现的很清晰了。但是仅有这些还是不够的， 除了处理网络 I&#x2F;O事件，一个完备的网络库还需要处理时间相关的事件。例如，在固定的时间点执行某个任务（runAt）、在一段延迟之后执行任务（runAfter），或者以固定的时间间隔重复执行任务（runEvery）。这些都离不开一个高效且精准的定时器机制。
+正如陈硕大佬在《Linux多线程服务端编程》一书中所强调的，muduo 的一个重要设计选择是利用 timerfd_create 这个 Linux系统调用，将时间事件也转化为文件描述符事件，从而能够被 EventLoop 的 Poller (通常是 epoll) 统一管理和调度。
+本文，我们将聚焦于 muduo::net::TimerQueue 类，深入剖析其如何巧妙地利用 timerfd 实现了一个高效、线程安全的定时器队列，并与EventLoop 的事件驱动模型完美融合。
+
+从 Printer 示例看 TimerQueue 的应用在深入源码之前，我们先来看一个 muduo 提供的简单示例，它展示了如何使用 EventLoop 提供的定时器接口：
+#include &lt;muduo/net/EventLoop.h&gt;  #include &lt;muduo/base/Timestamp.h&gt; // 虽然示例中没直接用，但 runAfter 内部会用  #include &lt;muduo/base/Logging.h&gt;   // 虽然示例中没直接用，但 TimerQueue 内部会用  #include &lt;iostream&gt;  #include &lt;functional&gt;class Printer : muduo::noncopyable  &#123;  public:  Printer(muduo::net::EventLoop* loop)  : loop_(loop),  count_(0)  &#123;  // 注意：对于这种周期性任务，loop-&gt;runEvery() 是更好的选择。  // 这里使用 runAfter 来演示其基本用法和递归调用自身实现重复。  loop_-&gt;runAfter(1.0, std::bind(&amp;Printer::print, this)); // 1秒后执行 print  &#125;~Printer()  &#123;  std::cout &lt;&lt; &quot;Final count is &quot; &lt;&lt; count_ &lt;&lt; &quot;n&quot;;  &#125;void print()  &#123;  if (count_ &lt; 5)  &#123;  std::cout &lt;&lt; count_ &lt;&lt; &quot;n&quot;;  ++count_;// 再次调度自己，1秒后执行  loop_-&gt;runAfter(1.0, std::bind(&amp;Printer::print, this));  &#125;  else  &#123;      loop_-&gt;quit(); // 打印5次后退出 EventLoop  &#125;  &#125;private:  muduo::net::EventLoop* loop_;  int count_;  &#125;;//int main() &#123; ... EventLoop loop; Printer printer(&amp;loop); loop.loop(); ... &#125;
+
+这个 Printer 类通过 EventLoop::runAfter 接口，实现了每隔 1 秒打印一次计数，共打印 5 次后退出 EventLoop 的功能。EventLoop 提供的 runAt, runAfter, runEvery 以及 cancel 定时器接口，其底层实现都委托给了 TimerQueue 对象。
+TimerQueue 的核心职责与设计概览TimerQueue 的核心职责是管理一系列的定时器 (Timer 对象)，并在它们到期时执行其回调函数。其整体设计思路如下：
+
+timerfd 作为时间事件的统一入口：
+在 TimerQueue 构造时，会通过 timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) 创建一个timerfd。CLOCK_MONOTONIC 保证了时间是单调递增的，不受系统时间修改的影响。
+这个 timerfd 被封装成一个 Channel 对象 (timerfdChannel_)，并注册到其所属的 EventLoop 中，监听其可读事件。
+
+
+按到期时间排序的定时器列表：
+TimerQueue 内部使用 std::set&lt;std::pair&lt;Timestamp, Timer*&gt;&gt; (即 TimerList timers_) 来存储所有活动的定时器。std::set会自动根据 Timestamp (到期时间) 和 Timer* (指针地址，用于时间相同时保证唯一性) 进行排序，使得 timers_.begin()始终指向最早到期的那个定时器。
+
+
+动态设置 timerfd 的超时：
+每当添加新的定时器或有定时器到期后，TimerQueue 会检查 timers_ 列表中最早到期的定时器的时间戳。
+然后，它会调用 timerfd_settime 系统调用，将 timerfd_ 的下一次超时时间设置为这个最早到期时间点。
+
+
+事件驱动的定时器处理：
+当 timerfd_ 因设置的超时时间到达而变为可读时，EventLoop 的 Poller 会检测到这个事件，并通过 timerfdChannel_调用其注册的读回调函数，即 TimerQueue::handleRead。
+TimerQueue::handleRead 负责：
+读取 timerfd_ 以清除事件通知。
+从 timers_ 中找出所有已经到期的定时器。
+执行这些到期定时器的回调函数。
+对于需要重复执行的定时器，重新计算其下一次到期时间并将其插回 timers_。
+根据 timers_ 中新的最早到期时间，重新设置 timerfd_。
+
+
+
+
+
+关键数据结构与成员TimerQueue 内部使用了几个关键的数据结构来管理定时器：
+class TimerQueue : noncopyable  &#123;  public:  // ... (构造与析构) ...  private:  // Entry 定义为一个 pair，包含到期时间戳和 Timer 指针  typedef std::pair&lt;Timestamp, Timer*&gt; Entry;  // TimerList 使用 std::set 存储 Entry，利用 set 的自动排序特性  typedef std::set&lt;Entry&gt; TimerList;// ActiveTimer 用于在取消时快速查找 Timer，通过 Timer* 和其序列号唯一标识  typedef std::pair&lt;Timer*, int64_t&gt; ActiveTimer;  typedef std::set&lt;ActiveTimer&gt; ActiveTimerSet;EventLoop* loop_;          // 所属的 EventLoop  const int timerfd_;        // timerfd_create() 返回的文件描述符  Channel timerfdChannel_;   // 用于将 timerfd_ 纳入 EventLoop 管理的 Channel  TimerList timers_;         // 按到期时间排序的定时器列表// for cancel()  ActiveTimerSet activeTimers_;      // 存储所有活跃的 Timer，用于高效取消  bool callingExpiredTimers_;      // 标记是否正在调用已到期定时器的回调  ActiveTimerSet cancelingTimers_; // 存储在调用已到期定时器回调期间，请求取消的定时器  &#125;;
+
+
+loop_: 指向所属的 EventLoop 对象。
+timerfd_: 通过 detail::createTimerfd() 创建的文件描述符。
+timerfdChannel_: 将 timerfd_ 封装成一个 Channel，其读回调设置为 TimerQueue::handleRead。
+timers_ (TimerList): 一个 std::set&lt;std::pair&lt;Timestamp, Timer*&gt;&gt;，按到期时间升序存储定时器。timers_.begin()始终指向最早到期的定时器。
+activeTimers_ (ActiveTimerSet): 一个 std::set&lt;std::pair&lt;Timer*, int64_t&gt;&gt;，用于通过 Timer*和其序列号快速取消定时器。timers_ 和 activeTimers_ 中的 Timer* 应该是一一对应的，它们的 size() 应该始终相等。
+callingExpiredTimers_: 布尔标记，指示当前是否正在执行已到期定时器的回调。
+cancelingTimers_ (ActiveTimerSet): 用于处理在执行回调期间发生的取消请求。
+
+TimerQueue 的初始化TimerQueue 在构造时，会创建 timerfd_，并初始化 timerfdChannel_，将其注册到 EventLoop 中。
+// TimerQueue.ccTimerQueue::TimerQueue(EventLoop* loop): loop_(loop),  timerfd_(detail::createTimerfd()), // 调用辅助函数创建 timerfd  timerfdChannel_(loop, timerfd_),   // 创建 Channel，并与 loop_ 关联  timers_(),  callingExpiredTimers_(false)  &#123;  timerfdChannel_.setReadCallback(  std::bind(&amp;TimerQueue::handleRead, this)); // 设置读回调  // 即使没有定时器，也使能读事件。  // timerfd 的实际超时是通过 timerfd_settime 设置的。  // 如果没有活动的定时器，timerfd_settime 会将其超时设为一个不会触发的状态  // (例如，it_value 设为0，表示 disarm) 或一个极大的未来时间。  // muduo 的做法是，如果 nextExpire 无效，则不调用 resetTimerfd。  timerfdChannel_.enableReading();  &#125;// muduo/net/TimerQueue.cc (detail 命名空间内)  int createTimerfd()  &#123;  int timerfd = ::timerfd_create(CLOCK_MONOTONIC,  TFD_NONBLOCK | TFD_CLOEXEC);  if (timerfd &lt; 0)  &#123;  LOG_SYSFATAL &lt;&lt; &quot;Failed in timerfd_create&quot;;  &#125;  return timerfd;  &#125;
+
+添加定时器：EventLoop 接口与 TimerQueue 实现用户通常通过 EventLoop 提供的接口（runAt, runAfter, runEvery）来添加定时器。这些接口最终都会调用到 TimerQueue::addTimer。
+// EventLoop.cc  TimerId EventLoop::runAt(Timestamp time, TimerCallback cb)  &#123;  return timerQueue_-&gt;addTimer(std::move(cb), time, 0.0); // interval 为 0 表示非重复  &#125;TimerId EventLoop::runAfter(double delay, TimerCallback cb)  &#123;  Timestamp time(addTime(Timestamp::now(), delay)); // 计算绝对到期时间  return runAt(time, std::move(cb));  &#125;TimerId EventLoop::runEvery(double interval, TimerCallback cb)  &#123;  Timestamp time(addTime(Timestamp::now(), interval)); // 首次到期时间  return timerQueue_-&gt;addTimer(std::move(cb), time, interval); // interval &gt; 0 表示重复  &#125;  
+
+TimerQueue::addTimer 方法由于可能被其他线程调用，它会将实际的添加操作 addTimerInLoop 通过 loop_-&gt;runInLoop() 提交到TimerQueue 所属的 EventLoop 线程中执行，以保证线程安全。
+// TimerQueue.cc  TimerId TimerQueue::addTimer(TimerCallback cb,  Timestamp when,  double interval)  &#123;  Timer* timer = new Timer(std::move(cb), when, interval); // 创建 Timer 对象  loop_-&gt;runInLoop( // 保证在 loop_ 线程中执行  std::bind(&amp;TimerQueue::addTimerInLoop, this, timer));  return TimerId(timer, timer-&gt;sequence()); // 返回 TimerId 用于取消  &#125;void TimerQueue::addTimerInLoop(Timer* timer)  &#123;  loop_-&gt;assertInLoopThread(); // 确保在正确的线程  bool earliestChanged = insert(timer); // 将 Timer 插入内部列表if (earliestChanged) // 如果新插入的定时器成为了最早到期的  &#123;  // 重置 timerfd 的超时时间为这个新定时器的到期时间  detail::resetTimerfd(timerfd_, timer-&gt;expiration());  &#125;  &#125;  
+
+insert(Timer* timer) 方法负责将 Timer 对象同时插入到 timers_ (按时间排序) 和 activeTimers_ (用于取消) 两个std::set 中，并返回新插入的定时器是否改变了“最早到期时间”。
+// TimerQueue.cc  bool TimerQueue::insert(Timer* timer)  &#123;  loop_-&gt;assertInLoopThread();  assert(timers_.size() == activeTimers_.size());  bool earliestChanged = false;  Timestamp when = timer-&gt;expiration();  TimerList::iterator it = timers_.begin();  // 如果 timers_ 为空，或者新定时器的到期时间早于当前最早的定时器  if (it == timers_.end() || when &lt; it-&gt;first)  &#123;  earliestChanged = true;  &#125;timers_.insert(Entry(when, timer));  activeTimers_.insert(ActiveTimer(timer, timer-&gt;sequence()));assert(timers_.size() == activeTimers_.size());  return earliestChanged;  &#125;
+
+如果 earliestChanged 为 true，则需要调用 detail::resetTimerfd 来更新 timerfd_ 的超时设置。detail::resetTimerfd 内部调用timerfd_settime，并将 newValue.it_value 设置为从当前时间到目标到期时间的相对时间。
+// muduo/net/TimerQueue.cc (detail 命名空间内)  void resetTimerfd(int timerfd, Timestamp expiration)  &#123;  struct itimerspec newValue;  memZero(&amp;newValue, sizeof newValue);  newValue.it_value = howMuchTimeFromNow(expiration); // 计算相对超时时间  int ret = ::timerfd_settime(timerfd, 0, &amp;newValue, NULL); // 0 表示相对时间，不关心 oldValue  if (ret)  &#123;  LOG_SYSERR &lt;&lt; &quot;timerfd_settime()&quot;;  &#125;  &#125;struct timespec howMuchTimeFromNow(Timestamp when)  &#123;  int64_t microseconds = when.microSecondsSinceEpoch()  - Timestamp::now().microSecondsSinceEpoch();  if (microseconds &lt; 100) // 最小超时设为 100 微秒，避免过于频繁或立即触发  &#123;  microseconds = 100;  &#125;  struct timespec ts;  ts.tv_sec = static_cast&lt;time_t&gt;(  microseconds / Timestamp::kMicroSecondsPerSecond);  ts.tv_nsec = static_long_cast( // 使用 muduo 的类型安全转换  (microseconds % Timestamp::kMicroSecondsPerSecond) * 1000);  return ts;  &#125;
+
+处理定时器到期：TimerQueue::handleRead当 timerfd_ 因设置的超时时间到达而变为可读时，EventLoop 会调用 timerfdChannel_ 的读回调，即 TimerQueue::handleRead。
+// TimerQueue.cc  void TimerQueue::handleRead()  &#123;  loop_-&gt;assertInLoopThread();  Timestamp now(Timestamp::now());  detail::readTimerfd(timerfd_, now); // 1. 读取 timerfd，清空事件，避免重复触发// 2. 获取所有在 &#x27;now&#x27; 时刻之前或同时到期的定时器  std::vector&lt;Entry&gt; expired = getExpired(now);callingExpiredTimers_ = true; // 标记正在调用回调  cancelingTimers_.clear();    // 清空上次调用期间的取消列表// 3. 遍历所有到期的定时器并执行其回调  for (const Entry&amp; it : expired)  &#123;  it.second-&gt;run(); // Timer::run() 会调用用户设置的 TimerCallback  &#125;  callingExpiredTimers_ = false; // 标记回调调用结束// 4. 重置重复的定时器，并设置 timerfd 的下一次超时时间  reset(expired, now);  &#125;
+
+detail::readTimerfd 简单地读取 timerfd 中的 uint64_t 值（表示自上次成功读取以来发生的超时次数），主要是为了清除 timerfd的可读状态。
+getExpired(Timestamp now) 方法负责从 timers_ 和 activeTimers_ 中找出并移除所有在 now 时刻之前（包括 now）到期的定时器。
+// TimerQueue.cc  std::vector&lt;TimerQueue::Entry&gt; TimerQueue::getExpired(Timestamp now)  &#123;  assert(timers_.size() == activeTimers_.size());  std::vector&lt;Entry&gt; expired;  // 构造一个哨兵 Entry，其时间戳为 now，Timer* 为一个不可能的地址 (UINTPTR_MAX)  // std::set::lower_bound 会找到第一个不小于 sentry 的元素  // 由于 pair 的比较是先比较 first 再比较 second，  // UINTPTR_MAX 确保了在时间戳相同时，sentry 比任何有效的 Timer* 都大。  // 因此，end 将指向第一个到期时间严格大于 now 的定时器，或者 timers_.end()。  Entry sentry(now, reinterpret_cast&lt;Timer*&gt;(UINTPTR_MAX));  TimerList::iterator end = timers_.lower_bound(sentry);  assert(end == timers_.end() || now &lt; end-&gt;first);// 将 [timers_.begin(), end) 范围内的元素（即所有已到期的）拷贝到 expired 向量  std::copy(timers_.begin(), end, std::back_inserter(expired));  // 从 timers_ 中移除这些已到期的元素  timers_.erase(timers_.begin(), end);// 同时从 activeTimers_ 中移除这些已到期的元素  for (const Entry&amp; it : expired)  &#123;  ActiveTimer timer(it.second, it.second-&gt;sequence());  size_t n = activeTimers_.erase(timer);  assert(n == 1); (void)n;  &#125;assert(timers_.size() == activeTimers_.size());  return expired;  &#125;
+
+下面是定时器到期处理的时序图,展示了 timerfd 触发后，TimerQueue 如何处理到期定时器的完整流程：
+
+重置与重新调度：TimerQueue::reset在处理完一批到期的定时器后，reset 方法负责：
+
+对于那些是重复执行 (it.second-&gt;repeat()) 且在回调执行期间未被 cancelingTimers_ 标记为取消的定时器，调用 Timer::restart(now) 更新其下一次到期时间，并将其重新调用 insert() 方法插入到 timers_ 和 activeTimers_ 中。
+对于非重复的或已被取消的定时器，则 delete it.second 释放 Timer 对象内存。
+根据 timers_ 中新的最早到期时间（如果列表不为空），调用 detail::resetTimerfd 重新设置 timerfd_ 的下一次超时。
+
+// TimerQueue.cc  void TimerQueue::reset(const std::vector&lt;Entry&gt;&amp; expired, Timestamp now)  &#123;  Timestamp nextExpire;for (const Entry&amp; it : expired)  &#123;  ActiveTimer timer(it.second, it.second-&gt;sequence());  // 如果是重复定时器，并且在回调执行期间没有被加入到 cancelingTimers_ 列表  if (it.second-&gt;repeat()  &amp;&amp; cancelingTimers_.find(timer) == cancelingTimers_.end())  &#123;  it.second-&gt;restart(now); // 更新下次到期时间  insert(it.second);       // 重新插入队列 (insert 会处理 earliestChanged)  &#125;  else // 非重复或已被取消  &#123;  // 作者在此处留下了 // FIXME: no delete please 的注释，  // 暗示未来可能考虑使用对象池 (free list) 来复用 Timer 对象，  // 以减少频繁 new 和 delete 带来的开销和内存碎片。  delete it.second;   &#125;  &#125;if (!timers_.empty()) // 如果还有未到期的定时器  &#123;  nextExpire = timers_.begin()-&gt;second-&gt;expiration(); // 获取下一个最早到期时间  &#125;if (nextExpire.valid()) // 如果存在下一个有效到期时间  &#123;  resetTimerfd(timerfd_, nextExpire); // 重置 timerfd  &#125;  &#125;
+
+取消定时器：TimerQueue::cancel 与 cancelInLoop用户通过 EventLoop::cancel(TimerId) 来取消定时器，该方法最终调用 TimerQueue::cancel。与 addTimer 类似，cancel 也会将实际的取消操作cancelInLoop 提交到 loop_ 线程执行。
+// EventLoop.cc  void EventLoop::cancel(TimerId timerId)  &#123;  return timerQueue_-&gt;cancel(timerId);  &#125;// TimerQueue.cc  void TimerQueue::cancel(TimerId timerId)  &#123;  loop_-&gt;runInLoop(  std::bind(&amp;TimerQueue::cancelInLoop, this, timerId));  &#125;void TimerQueue::cancelInLoop(TimerId timerId)  &#123;  loop_-&gt;assertInLoopThread();  assert(timers_.size() == activeTimers_.size());// 使用 TimerId 中的 Timer* 和 sequence_ 构造 ActiveTimer 用于查找  ActiveTimer timer(timerId.timer_, timerId.sequence_);  ActiveTimerSet::iterator it = activeTimers_.find(timer);if (it != activeTimers_.end()) // 如果在 activeTimers_ 中找到了该定时器  &#123;  // 从 timers_ 中移除对应的 Entry  // 注意：timers_ 的 key 是 pair&lt;Timestamp, Timer*&gt;，需要用其到期时间和指针来构造  size_t n = timers_.erase(Entry(it-&gt;first-&gt;expiration(), it-&gt;first));  assert(n == 1); (void)n; // 应该能精确找到并删除一个  delete it-&gt;first; // 释放 Timer 对象内存  activeTimers_.erase(it); // 从 activeTimers_ 中移除  &#125;  else if (callingExpiredTimers_) // 如果没找到，且当前正在执行回调  &#123;  // 这意味着要取消的定时器可能是一个刚刚到期并在被处理的重复定时器。  // 将其加入 cancelingTimers_ 集合。  // reset() 方法在重新插入重复定时器前会检查这个 cancelingTimers_ 集合，  // 如果在其中，则不会重新插入，从而达到取消的目的。  cancelingTimers_.insert(timer);  &#125;  assert(timers_.size() == activeTimers_.size());  &#125;
+
+这种处理方式确保了即使在定时器回调执行期间尝试取消该（重复的）定时器，也能正确处理。
+下面是取消操作的时序图,展示了通过 EventLoop::cancel 取消定时器的流程，包括线程安全处理和回调期间的取消逻辑:
+
+Timer类与重复执行Timer 类封装了定时器的基本信息：回调函数、到期时间、重复间隔、是否重复以及一个唯一的序列号。
+// Timer.h (部分)  class Timer : noncopyable  &#123;  public:  Timer(TimerCallback cb, Timestamp when, double interval)  : callback_(std::move(cb)),  expiration_(when),  interval_(interval),  repeat_(interval &gt; 0.0), // interval &gt; 0.0 表示是重复定时器  sequence_(s_numCreated_.incrementAndGet()) // 原子生成的唯一序列号  &#123; &#125;void run() const // 执行回调  &#123;  callback_();  &#125;Timestamp expiration() const  &#123; return expiration_; &#125;  bool repeat() const &#123; return repeat_; &#125;  int64_t sequence() const &#123; return sequence_; &#125;void restart(Timestamp now) // 重新计算下次到期时间 (用于重复定时器)  &#123;  assert(repeat_);  expiration_ = addTime(now, interval_);  &#125;// ...  private:  const TimerCallback callback_;  Timestamp expiration_;  const double interval_;  const bool repeat_;  const int64_t sequence_; // 用于唯一标识 Timer 实例，配合 Timer* 使用static AtomicInt64 s_numCreated_; // 用于生成 sequence_  &#125;;
+
+runEvery 接口在添加定时器时，会将 interval 参数设置为大于 0 的值，从而 Timer 对象的 repeat_ 成员为 true。在 TimerQueue::reset 方法中，如果一个定时器的 repeat() 为 true 且未被取消，就会调用 restart() 更新其 expiration_ 并重新插入队列。
+下面是添加重复执行任务的时序图,包括 Timer 对象的创建和 timerfd 的超时设置:
+
+总结muduo::net::TimerQueue 通过精巧的设计，实现了高效且与 EventLoop事件驱动模型完美集成的定时器管理机制：
+
+timerfd 的妙用： 将时间事件转化为文件描述符事件，统一由 Poller 处理，使得定时器事件的处理与网络I&#x2F;O 事件的处理路径一致。
+std::set 管理定时器： 利用 std::set&lt;std::pair&lt;Timestamp, Timer*&gt;&gt;自动按到期时间排序的特性，使得获取最早到期定时器 (timers_.begin()) 和查找指定范围的到期定时器 (lower_bound) 非常高效。
+双集合管理 (timers_ 和 activeTimers_)： timers_ 用于按时间排序和获取到期任务，activeTimers_ (以 Timer*和序列号为键) 用于高效地取消定时器。通过断言 timers_.size() &#x3D;&#x3D; activeTimers_.size() 保证两者的一致性。
+线程安全： 所有对 TimerQueue 内部状态的修改都通过 loop_-&gt;runInLoop() 保证在其所属的 EventLoop 线程中执行，确保了线程安全。
+处理回调期间的取消： 通过 callingExpiredTimers_ 标志和 cancelingTimers_集合，优雅地处理了在执行定时器回调期间，这些定时器（特别是重复定时器）又被用户请求取消的复杂情况。
+资源管理： Timer 对象通过 new 创建，并在不再需要时（非重复到期、或被取消、或 TimerQueue 析构时）通过 delete释放。
+
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:05.基于对象与面向对象的设计</title>
+    <url>/2025/08/26/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:05.%E5%9F%BA%E4%BA%8E%E5%AF%B9%E8%B1%A1%E4%B8%8E%E9%9D%A2%E5%90%91%E5%AF%B9%E8%B1%A1%E7%9A%84%E8%AE%BE%E8%AE%A1/</url>
+    <content><![CDATA[前言：在前几篇文章中，我们依次剖析了：
+
+EventLoop 的单线程事件循环模型（One Loop Per Thread）
+TcpConnection 的连接生命周期与“三个半事件”机制
+TimerQueue 在事件驱动框架下的使用
+Buffer 模块在高性能数据处理中的角色
+
+至此，我们已经基本掌握了陈硕大佬在《Linux 多线程服务端编程》中提出的网络编程核心思想及其在 muduo 中的具象实现。
+在这篇文章中，我们不再分析具体功能的实现细节，而是谈一谈陈硕大佬对 C++ 进行开发的一个理念：muduo 并未采用传统的“面向对象”编程风格，而是秉持“基于对象”的理念进行系统设计。
+我们要具体分析这两者在使用上，功能实现上的区别。使用场景对比：基于对象 vs 面向对象我们首先回顾 muduo 中的一个经典的 EchoServer 示例：
+class EchoServer &#123;public:  EchoServer(muduo::net::EventLoop* loop, const muduo::net::InetAddress&amp; listenAddr)    : server_(loop, listenAddr, &quot;EchoServer&quot;) &#123;    server_.setConnectionCallback(      std::bind(&amp;EchoServer::onConnection, this, std::placeholders::_1));    server_.setMessageCallback(      std::bind(&amp;EchoServer::onMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));  &#125;  void start() &#123; server_.start(); &#125;private:  void onConnection(const muduo::net::TcpConnectionPtr&amp; conn);  void onMessage(const muduo::net::TcpConnectionPtr&amp; conn, muduo::net::Buffer* buf, muduo::Timestamp time);  muduo::net::TcpServer server_;&#125;;
+
+陈硕大佬并未提供一个 TcpConnectionListener 的抽象接口让用户去继承实现 onConnect &#x2F; onMessage，而是允许用户通过组合对象、注册回调函数的方式，将自己的逻辑注入库中。
+对比：常见的面向对象的网络库实现如果有 C# 和 Java 的开发经验，可能非常熟悉下面的模式：
+class SocketEventListener &#123;public:  virtual void handleRead() = 0;  virtual void handleClose() = 0;&#125;;class MyConnection : public SocketEventListener &#123;public:  void handleRead() override &#123;    // handle logic  &#125;  void handleClose() override &#123;    // clean up  &#125;&#125;;
+
+这种做法的本意是具体约束行为，让使用者去处理一个网络连接的完整生命周期，但也带来以下问题：
+
+实现门槛高：即便只是写个简单 demo，也需实现多个空函数
+接口变更代价大：增加一个虚函数会影响所有子类
+无法真正约束开发者的设计质量: 很多使用者只是简单的打下日志
+
+
+基于对象的设计：以 Channel 为例在 muduo 中，Channel 是绑定文件描述符与事件处理器的核心组件。其应用遍布各个模块：
+服务端监听class Acceptor : noncopyable &#123;  EventLoop* loop_;  Socket acceptSocket_;  Channel acceptChannel_;  NewConnectionCallback newConnectionCallback_;  bool listenning_;  int idleFd_;&#125;;
+
+客户端连接处理class TcpConnection : noncopyable, public std::enable_shared_from_this&lt;TcpConnection&gt; &#123;  std::unique_ptr&lt;Socket&gt; socket_;  std::unique_ptr&lt;Channel&gt; channel_;  const InetAddress localAddr_;  const InetAddress peerAddr_;  ConnectionCallback connectionCallback_;  MessageCallback messageCallback_;  WriteCompleteCallback writeCompleteCallback_;  HighWaterMarkCallback highWaterMarkCallback_;  CloseCallback closeCallback_;  size_t highWaterMark_;  Buffer inputBuffer_;  Buffer outputBuffer_;  std::any context_;&#125;;
+
+唤醒机制class EventLoop : noncopyable &#123;  int wakeupFd_;  std::unique_ptr&lt;Channel&gt; wakeupChannel_;  std::any context_;  ChannelList activeChannels_;  Channel* currentActiveChannel_;  mutable MutexLock mutex_;  std::vector&lt;Functor&gt; pendingFunctors_;&#125;;
+
+定时器class TimerQueue : noncopyable &#123;  const int timerfd_;  Channel timerfdChannel_;  TimerList timers_;  ActiveTimerSet activeTimers_;  bool callingExpiredTimers_;   ActiveTimerSet cancelingTimers_;&#125;;
+
+Channel 的统一处理方式channel-&gt;setReadCallback(std::bind(&amp;TcpConnection::handleRead, this));channel-&gt;setWriteCallback(std::bind(&amp;TcpConnection::handleWrite, this));
+
+这就是“基于对象”的关键点：不搞子类体系，而用统一类 + 函数注入来处理多样行为。
+
+回调机制的优越性：组合优于继承muduo 的核心组件几乎都是：具体类 + 回调注入
+
+TcpServer 组合 Acceptor、EventLoopThreadPool、用户回调
+TcpConnection 内部注册回调响应事件
+Channel 统一管理事件分发
+
+类图示意：
+
+组合优于继承，行为通过注入，而非继承重写。
+TcpConnection::TcpConnection(...) &#123;  channel_-&gt;setReadCallback(std::bind(&amp;TcpConnection::handleRead, this));&#125;
+
+对比传统 OOP：
+class BaseHandler &#123;  virtual void onRead() = 0;&#125;;class MyHandler : public BaseHandler &#123;  void onRead() override &#123; ... &#125;&#125;;
+
+muduo 的方式降低抽象复杂度，提升扩展灵活性。
+
+生命周期管理：RAII + 智能指针 + tie()陈硕大佬强调：C++ 的最大优势是确定性析构。muduo 的生命周期管理机制如下：
+
+所有 socket 封装于 RAII 类
+TcpConnection 使用 shared_ptr + enable_shared_from_this
+Channel::tie() 实现弱引用锁定，防止悬垂指针
+
+void TcpConnection::connectEstablished() &#123;  channel_-&gt;tie(shared_from_this());&#125;
+
+事件处理过程：
+void Channel::handleEvent(...) &#123;  std::shared_ptr&lt;void&gt; guard;  if (tied_) &#123;    guard = tie_.lock();    if (guard) handleEventWithGuard(...);  &#125; else &#123;    handleEventWithGuard(...);  &#125;&#125;
+
+时序图：
+
+保障了：
+
+对象析构后无悬垂调用
+生命周期由 shared_ptr 统一管理，清晰可控
+
+
+尾声：从 muduo 中我们应该学些什么？对面向对象的一点思考关于面向对象的争议其实一直很大，批评也很多，但是面向对象这种思想既然可以存在，并且依然得到哪么多人的拥护，肯定有可取之处。
+咱们先关心从muduo源码中我们应该学点什么知识。
+muduo 告诉我们：
+
+RAII + 智能指针是 C++ 的精髓
+无虚函数，回调更灵活
+强调组合，提升模块化与可维护性
+
+我对使用面向对象想法是：
+
+“让行业大佬设计接口，让普通开发者以简单朴实的方式逐步演进。”
+
+普通开发者：
+
+从组合和回调入手，快速实现业务逻辑
+在需求稳定后，再抽象出通用接口
+通过测试保证软件质量
+
+这种自顶向下的设计方式，其实很适合那些具有非常丰富行业经验的人去设计出一套接口来。因为他们实际上知道了，这套接口就是足够好的抽象。像普通的开发人员，就做到简单，朴实就好了。
+最后：设计应服务于目标，而非固守范式。
+作为程序员，应该具备多种设计手法，并在适当时刻选择最合适的方式。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:01.异步机制解析</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
+    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
+
+spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
+跨平台： 支持windows,linux,android等多个平台
+功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
+阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
+
+从demo出发：追踪日志消息的产生，处理和输出路径
+梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
+分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
+可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
+
+以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
+注：本文分析的源码为spdlog的v1.15.1版本
+spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
+我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
+日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
+日志生产
+logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
+log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
+在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
+在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
+
+日志消费
+线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
+在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
+spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
+以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
+上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
+
+可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
+强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
+spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
+//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
+线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
+spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
+thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
+
+主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
+formatter：格式化日志消息的基类
+sink: 日志输出的基类
+spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
+mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
+template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
+通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
+一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:03.实现自定义压缩sink</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/</url>
+    <content><![CDATA[引言spdlog 是一个功能强大且高度可扩展的 C++ 日志库，其模块化设计允许开发者通过自定义 sink 实现灵活的日志输出。在前两篇文章中，我们分析了 spdlog 的异步日志机制以及 daily_file_sink 和 rotating_file_sink 的实现。本文将聚焦于 如何在 spdlog 中实现自定义 sink，以 compressed_file_sink 为例，详细讲解如何利用 zlib 库实现日志压缩功能，减少磁盘空间占用。
+通过本文，你将学会：
+
+spdlog 中自定义 sink 的实现步骤。
+compressed_file_sink 如何通过 zlib 实现日志压缩。
+自定义 sink 的关键设计要点和注意事项。
+
+注：本文分析的源码基于 spdlog v1.15.1 和提供的 compressed_file_sink 实现。
+
+spdlog 中自定义 sink 的实现方法spdlog 的 sink 机制是其扩展性的核心。所有 sink 都继承自 base_sink 模板类，通过实现两个关键虚函数 sink_it_ 和 flush_，即可定义日志的输出逻辑。以下是实现自定义 sink 的通用步骤：
+
+继承 base_sink：创建一个新类，继承 base_sink&lt;Mutex&gt;，选择合适的互斥锁（如 std::mutex 用于多线程，null_mutex 用于单线程）。
+**实现 sink_it_**：定义日志消息的处理逻辑，如格式化、加工或输出到目标（如文件、网络）。
+**实现 flush_**：确保缓冲区数据被刷新到目标，完成输出。
+管理资源：在构造函数中初始化资源（如文件句柄、缓冲区），在析构函数中清理。
+提供工厂函数：为多线程和单线程模式定义便捷的创建函数（如 compressed_file_logger_mt/st）。
+
+compressed_file_sink 遵循上述步骤，通过集成 zlib 库实现了压缩日志的输出，下面我们以其为案例进行深入分析。
+compressed_file_sink 实现解析compressed_file_sink 是一个自定义 sink，通过缓冲日志消息、利用 zlib 压缩数据并写入文件，实现高效的日志存储。以下从 demo 入手，逐步剖析其实现原理。
+使用 demo以下是一个简单的 compressed_file_sink 使用示例：
+#include &quot;spdlog/spdlog.h&quot;#include &quot;compressed_file_sink.h&quot;void compressed_file_example() &#123;    auto compressed_logger = spdlog::compressed_file_logger_mt(&quot;compressed_logger&quot;, &quot;logs/compressed_log.z&quot;, 8192, Z_DEFAULT_COMPRESSION);    compressed_logger-&gt;info(&quot;This is a compressed log message.&quot;);    compressed_logger-&gt;flush();&#125;
+在这个 demo 中，我们创建了一个多线程的压缩日志 logger，日志消息通过 compressed_file_sink 压缩后写入 logs/compressed_log.z 文件。
+日志消息流转与压缩实现以 info(&quot;This is a compressed log message.&quot;) 为例，分析日志消息的处理流程，重点讲解压缩逻辑。
+日志生产
+调用 info 方法：
+用户调用 logger-&gt;info，触发模板函数，最终调用 base_sink 的 log 方法，执行 sink_it_ 虚函数。
+在 compressed_file_sink::sink_it_ 中，日志消息被格式化并追加到内部缓冲区。
+
+
+
+void sink_it_(const details::log_msg &amp;msg) override &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    buffer_.append(formatted.data(), formatted.data() + formatted.size());    if (buffer_.size() &gt;= buffer_capacity_) &#123;        compress_and_write_();    &#125;&#125;
+
+缓冲管理：
+格式化后的日志消息存储在 buffer_（类型为 memory_buf_t）。
+当 buffer_ 大小达到 buffer_capacity_（默认 8192 字节）时，调用 compress_and_write_ 进行压缩和写入。
+
+
+
+日志压缩与写入compress_and_write_ 是压缩功能的核心，结合 zlib 库完成数据压缩并写入文件。以下是其实现步骤：
+
+初始化 zlib 输入：
+将 buffer_ 的数据传递给 zlib 压缩流 strm_，设置输入指针（next_in）和长度（avail_in）。
+
+
+
+strm_.avail_in = static_cast&lt;uInt&gt;(buffer_.size());strm_.next_in = reinterpret_cast&lt;Bytef *&gt;(const_cast&lt;char *&gt;(buffer_.data()));
+
+
+逐步压缩（Z_NO_FLUSH）：
+使用 deflate 函数以 Z_NO_FLUSH 模式分步处理输入数据，输出到临时缓冲区 compress_buffer_（类型为 std::vector&lt;unsigned char&gt;）。
+循环调用 deflate 直到所有输入数据被消耗，收集压缩输出到 compressed_output。
+
+
+
+do &#123;    strm_.avail_out = static_cast&lt;uInt&gt;(compress_buffer_.size());    strm_.next_out = compress_buffer_.data();    deflate_ret = deflate(&amp;strm_, Z_NO_FLUSH);    size_t have = compress_buffer_.size() - strm_.avail_out;    if (have &gt; 0) &#123;        compressed_output.insert(compressed_output.end(), compress_buffer_.data(), compress_buffer_.data() + have);    &#125;&#125; while (strm_.avail_out == 0 &amp;&amp; strm_.avail_in &gt; 0);
+
+
+结束压缩（Z_FINISH）：
+使用 Z_FINISH 模式完成当前压缩块，生成完整的压缩数据。
+继续调用 deflate 直到返回 Z_STREAM_END，确保所有输出被收集。
+
+
+
+do &#123;    strm_.avail_out = static_cast&lt;uInt&gt;(compress_buffer_.size());    strm_.next_out = compress_buffer_.data();    finish_ret = deflate(&amp;strm_, Z_FINISH);    size_t have = compress_buffer_.size() - strm_.avail_out;    if (have &gt; 0) &#123;        compressed_output.insert(compressed_output.end(), compress_buffer_.data(), compress_buffer_.data() + have);    &#125;&#125; while (finish_ret != Z_STREAM_END);
+
+
+写入文件：
+压缩数据存储在 compressed_output 中。
+首先写入 4 字节的压缩块长度（uint32_t），便于解压时解析。
+然后写入压缩数据，使用 file_helper_.write 完成文件 IO。
+
+
+
+uint32_t compressed_size = static_cast&lt;uint32_t&gt;(compressed_output.size());if (compressed_size &gt; 0) &#123;    memory_buf_t size_buf;    size_buf.append(reinterpret_cast&lt;const char *&gt;(&amp;compressed_size),                     reinterpret_cast&lt;const char *&gt;(&amp;compressed_size) + sizeof(compressed_size));    file_helper_.write(size_buf);    memory_buf_t data_buf;    data_buf.append(reinterpret_cast&lt;const char *&gt;(compressed_output.data()),                     reinterpret_cast&lt;const char *&gt;(compressed_output.data()) + compressed_output.size());    file_helper_.write(data_buf);&#125;
+
+
+重置与清理：
+通过 deflateReset 重置 zlib 流，为下一块压缩准备。
+清空 buffer_，等待新的日志消息。
+
+
+
+deflateReset(&amp;strm_);buffer_.clear();
+
+刷新与资源管理
+刷新缓冲区：
+用户调用 logger-&gt;flush() 触发 flush_ 方法，调用 compress_and_write_ 压缩剩余数据，并通过 file_helper_.flush() 确保写入磁盘。
+
+
+
+void flush_() override &#123;    compress_and_write_();    file_helper_.flush();&#125;
+
+资源初始化与清理：
+构造函数：初始化 zlib 流（deflateInit）、打开文件（file_helper_.open）、预分配缓冲区（buffer_ 和 compress_buffer_）。
+析构函数：刷新缓冲区、释放 zlib 资源（deflateEnd），file_helper_ 自动关闭文件。
+
+
+
+explicit compressed_file_sink(const filename_t &amp;filename, size_t buffer_capacity = 8192,                              int compression_level = Z_DEFAULT_COMPRESSION) &#123;    strm_.zalloc = Z_NULL;    strm_.zfree = Z_NULL;    strm_.opaque = Z_NULL;    int ret = deflateInit(&amp;strm_, compression_level_);    if (ret != Z_OK) throw spdlog_ex(&quot;Failed to initialize zlib deflate&quot;, ret);    file_helper_.open(filename_, false);    buffer_.reserve(buffer_capacity_);    compress_buffer_.resize(buffer_capacity_);&#125;~compressed_file_sink() override &#123;    try &#123;        std::lock_guard&lt;Mutex&gt; lock(base_sink&lt;Mutex&gt;::mutex_);        flush_();        deflateEnd(&amp;strm_);    &#125; catch (...) &#123;&#125;&#125;
+关键类与设计类层次结构compressed_file_sink 的设计充分利用了 spdlog 的模块化架构，以下是关键类关系：
+
+base_sink：提供日志格式化和线程安全的基础功能，定义 sink_it_ 和 flush_ 接口。
+compressed_file_sink：继承 base_sink，实现压缩逻辑，管理 zlib 流和缓冲区。
+file_helper：封装文件操作，负责打开、写入和刷新。
+formatter：格式化日志消息。
+
+类图如下：
+总结通过分析 compressed_file_sink，我们深入理解了 spdlog 中自定义 sink 的实现方法。compressed_file_sink 利用 zlib 库，通过缓冲、分块压缩和长度前缀的机制，实现了高效的日志压缩功能。
+未来可探索以下方向：
+
+结合 daily_file_sink，实现按天分割的压缩日志。
+尝试其他压缩库（如 zstd），提升压缩速度或比率。
+
+希望本文能为你提供清晰的自定义 sink 实现指南！如需进一步探讨或优化建议，欢迎随时交流。
+#附：完整压缩源码和压缩日志读取器
+#pragma once#include &lt;spdlog/common.h&gt;#include &lt;spdlog/sinks/base_sink.h&gt;#include &lt;spdlog/details/file_helper.h&gt;#include &lt;spdlog/details/null_mutex.h&gt;#include &lt;spdlog/details/synchronous_factory.h&gt;#include &lt;spdlog/fmt/fmt.h&gt;#include &lt;zlib.h&gt;#include &lt;string&gt;#include &lt;mutex&gt;namespace spdlog&#123;    namespace sinks    &#123;        // 自定义压缩文件 Sink (使用 file_helper)        template&lt;typename Mutex&gt;        class compressed_file_sink : public base_sink&lt;Mutex&gt;        &#123;        public:            // 构造函数            explicit compressed_file_sink(const filename_t &amp;filename, size_t buffer_capacity = 8192,                                          int compression_level = Z_DEFAULT_COMPRESSION)                : filename_(filename), buffer_capacity_(buffer_capacity), compression_level_(compression_level)            &#123;                // 初始化 zlib 压缩流                strm_.zalloc = Z_NULL;                strm_.zfree = Z_NULL;                strm_.opaque = Z_NULL;                int ret = deflateInit(&amp;strm_, compression_level_);                if (ret != Z_OK)                &#123;                    throw spdlog_ex(&quot;Failed to initialize zlib deflate&quot;, ret);                &#125;                // 使用 file_helper 打开文件 (false 表示不截断，实现追加效果)                try                &#123;                    file_helper_.open(filename_, false);                &#125; catch (const spdlog_ex &amp;ex)                &#123;                    deflateEnd(&amp;strm_); // 清理 zlib 资源                    throw ex; // 重新抛出文件打开异常                &#125;                // 预分配缓冲区 (使用 spdlog::memory_buf_t)                buffer_.reserve(buffer_capacity_);                compress_buffer_.resize(buffer_capacity_); // 初始压缩缓冲区大小 (保持 vector&lt;unsigned char&gt; 以便与 zlib C API 交互)            &#125;            // 析构函数：确保所有缓冲数据被压缩和写入            ~compressed_file_sink() override            &#123;                try                &#123;                    // 获取锁以安全地刷新                    std::lock_guard&lt;Mutex&gt; lock(base_sink&lt;Mutex&gt;::mutex_);                    flush_(); // 刷新剩余缓冲区                    deflateEnd(&amp;strm_); // 清理 zlib 资源                    // file_helper 会在析构时自动关闭文件，无需显式调用 close()                &#125; catch (...)                &#123;                    // 析构函数中不应抛出异常                &#125;            &#125;            compressed_file_sink(const compressed_file_sink &amp;) = delete;            compressed_file_sink &amp;operator=(const compressed_file_sink &amp;) = delete;        protected:            // 核心日志记录方法            void sink_it_(const details::log_msg &amp;msg) override            &#123;                memory_buf_t formatted;                base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);                // 将格式化后的消息追加到内部缓冲区 buffer_                buffer_.append(formatted.data(), formatted.data() + formatted.size());                // 如果缓冲区达到阈值，则压缩并写入文件                if (buffer_.size() &gt;= buffer_capacity_)                &#123;                    compress_and_write_();                &#125;            &#125;            // 强制刷新缓冲区            void flush_() override            &#123;                compress_and_write_();                file_helper_.flush(); // 刷新 file_helper 的缓冲区            &#125;        private:            // private:            void compress_and_write_()            &#123;                if (buffer_.size() == 0)                &#123;                    return;                &#125;                strm_.avail_in = static_cast&lt;uInt&gt;(buffer_.size());                strm_.next_in = reinterpret_cast&lt;Bytef *&gt;(const_cast&lt;char *&gt;(buffer_.data()));                std::vector&lt;unsigned char&gt; compressed_output;                int deflate_ret = Z_OK;                // 缓冲区用于 deflate 的单次输出                // 调整大小以更好地适应可能的压缩输出，可以根据需要调整                if (compress_buffer_.size() &lt; buffer_.size() / 2)                &#123;                    compress_buffer_.resize(buffer_.size() / 2 + 128); // 简单策略：至少是输入一半+一些头部                &#125;                // ---- Step 1: 使用 Z_NO_FLUSH 消耗所有输入 ----                do                &#123;                    strm_.avail_out = static_cast&lt;uInt&gt;(compress_buffer_.size());                    strm_.next_out = compress_buffer_.data();                    deflate_ret = deflate(&amp;strm_, Z_NO_FLUSH); // 先处理输入，不清空内部状态                    if (deflate_ret != Z_OK &amp;&amp; deflate_ret != Z_BUF_ERROR)                    &#123;                        // Z_STREAM_END 不应该在这里发生                        throw spdlog_ex(&quot;zlib deflate(Z_NO_FLUSH) failed&quot;, deflate_ret);                    &#125;                    size_t have = compress_buffer_.size() - strm_.avail_out;                    if (have &gt; 0)                    &#123;                        compressed_output.insert(compressed_output.end(), compress_buffer_.data(),                                                 compress_buffer_.data() + have);                    &#125;                    // 继续，直到输出缓冲区不再被填满（表示deflate可以处理更多输入，如果还有的话）                    // 并且还有输入数据需要处理                &#125; while (strm_.avail_out == 0 &amp;&amp; strm_.avail_in &gt; 0);                // 此时，所有输入 (strm.avail_in) 应该已经被消耗，除非发生错误                if (strm_.avail_in != 0 &amp;&amp; deflate_ret != Z_BUF_ERROR)                &#123;                    // 如果还有输入但 deflate 没有要求更多输出空间，这不正常                    throw spdlog_ex(&quot;zlib deflate did not consume all input unexpectedly&quot;);                &#125;                // ---- Step 2: 使用 Z_FINISH 结束当前流（块）并收集所有剩余输出 ----                int finish_ret = Z_OK;                do                &#123;                    strm_.avail_out = static_cast&lt;uInt&gt;(compress_buffer_.size());                    strm_.next_out = compress_buffer_.data();                    finish_ret = deflate(&amp;strm_, Z_FINISH); // 结束当前块/流                    // Z_FINISH 可能会返回 Z_OK 或 Z_BUF_ERROR 多次，直到返回 Z_STREAM_END                    if (finish_ret != Z_OK &amp;&amp; finish_ret != Z_STREAM_END &amp;&amp; finish_ret != Z_BUF_ERROR)                    &#123;                        throw spdlog_ex(&quot;zlib deflate(Z_FINISH) failed&quot;, finish_ret);                    &#125;                    size_t have = compress_buffer_.size() - strm_.avail_out;                    if (have &gt; 0)                    &#123;                        compressed_output.insert(compressed_output.end(), compress_buffer_.data(),                                                 compress_buffer_.data() + have);                    &#125;                    // 继续调用 Z_FINISH 直到它返回 Z_STREAM_END                &#125; while (finish_ret != Z_STREAM_END);                // ---- Step 3: 写入文件 (与之前相同) ----                uint32_t compressed_size = static_cast&lt;uint32_t&gt;(compressed_output.size());                if (compressed_size &gt; 0)                &#123;                    memory_buf_t size_buf;                    size_buf.append(reinterpret_cast&lt;const char *&gt;(&amp;compressed_size),                                    reinterpret_cast&lt;const char *&gt;(&amp;compressed_size) + sizeof(compressed_size));                    file_helper_.write(size_buf);                    memory_buf_t data_buf;                    data_buf.append(reinterpret_cast&lt;const char *&gt;(compressed_output.data()),                                    reinterpret_cast&lt;const char *&gt;(compressed_output.data()) + compressed_output.                                    size());                    file_helper_.write(data_buf);                &#125;                // ---- Step 4: 重置 zlib 流，为下一个独立块做准备 ----                // 因为我们使用了 Z_FINISH，流状态需要完全重置                int reset_ret = deflateReset(&amp;strm_);                if (reset_ret != Z_OK)                &#123;                    throw spdlog_ex(&quot;Failed to reset zlib deflate stream&quot;, reset_ret);                &#125;                // 清空内部缓冲区                buffer_.clear();            &#125;            filename_t filename_; // 日志文件名            details::file_helper file_helper_; // 使用 spdlog 的文件助手            memory_buf_t buffer_; // 未压缩数据的内部缓冲区 (使用 memory_buf_t)            size_t buffer_capacity_; // 内部缓冲区阈值            int compression_level_; // zlib 压缩级别            z_stream strm_; // zlib 压缩流            std::vector&lt;unsigned char&gt; compress_buffer_; // 用于存放压缩数据的临时缓冲区        &#125;;        // 类型别名和工厂函数保持不变        using compressed_file_sink_mt = compressed_file_sink&lt;std::mutex&gt;;        using compressed_file_sink_st = compressed_file_sink&lt;details::null_mutex&gt;;    &#125; // namespace sinks    template&lt;typename Factory = spdlog::synchronous_factory&gt;    inline std::shared_ptr&lt;logger&gt; compressed_file_logger_mt(const std::string &amp;logger_name, const filename_t &amp;filename,                                                             size_t buffer_capacity = 8192,                                                             int compression_level = Z_DEFAULT_COMPRESSION)    &#123;        return Factory::template create&lt;sinks::compressed_file_sink_mt&gt;(logger_name, filename, buffer_capacity,                                                                        compression_level);    &#125;    template&lt;typename Factory = spdlog::synchronous_factory&gt;    inline std::shared_ptr&lt;logger&gt; compressed_file_logger_st(const std::string &amp;logger_name, const filename_t &amp;filename,                                                             size_t buffer_capacity = 8192,                                                             int compression_level = Z_DEFAULT_COMPRESSION)    &#123;        return Factory::template create&lt;sinks::compressed_file_sink_st&gt;(logger_name, filename, buffer_capacity,                                                                        compression_level);    &#125;&#125; // namespace spdlog
+
+#include &lt;iostream&gt;#include &lt;fstream&gt;#include &lt;vector&gt;#include &lt;string&gt;#include &lt;zlib.h&gt;#include &lt;cstdint&gt; // for uint32_t#include &lt;stdexcept&gt; // for runtime_error// 解压缓冲区大小const size_t DECOMPRESS_BUFFER_SIZE = 16384; // 16 KBint main(int argc, char *argv[])&#123;    if (argc != 3)    &#123;        std::cerr &lt;&lt; &quot;用法: &quot; &lt;&lt; argv[0] &lt;&lt; &quot; &lt;compressed_log_file&gt;&quot; &lt;&lt; &quot; &lt;decompression_log_file&gt;&quot; &lt;&lt; std::endl;        return 1;    &#125;    const char *filename = argv[1];    const char *decompressed_filename = argv[2];    std::ifstream infile(filename, std::ios::binary);    std::ofstream outfile(decompressed_filename, std::ios::binary);    if (!infile.is_open())    &#123;        std::cerr &lt;&lt; &quot;错误: 无法打开文件 &quot; &lt;&lt; filename &lt;&lt; std::endl;        return 1;    &#125;    // 初始化 zlib 解压流    z_stream strm;    strm.zalloc = Z_NULL;    strm.zfree = Z_NULL;    strm.opaque = Z_NULL;    strm.avail_in = 0;    strm.next_in = Z_NULL;    int ret = inflateInit(&amp;strm);    if (ret != Z_OK)    &#123;        std::cerr &lt;&lt; &quot;错误: 初始化 zlib inflate 失败, code: &quot; &lt;&lt; ret &lt;&lt; std::endl;        return 1;    &#125;    std::vector&lt;unsigned char&gt; compressed_buffer;    std::vector&lt;unsigned char&gt; decompress_buffer(DECOMPRESS_BUFFER_SIZE);    uint32_t compressed_block_size = 0;    try    &#123;        // 循环读取文件中的压缩块        while (infile.read(reinterpret_cast&lt;char *&gt;(&amp;compressed_block_size), sizeof(compressed_block_size)))        &#123;            if (compressed_block_size == 0)            &#123;                // 可能是空块写入（虽然我们的sink实现不会写0长度块），跳过                continue;            &#125;            // 读取指定大小的压缩数据            compressed_buffer.resize(compressed_block_size);            if (!infile.read(reinterpret_cast&lt;char *&gt;(compressed_buffer.data()), compressed_block_size))            &#123;                std::cerr &lt;&lt; &quot;错误: 读取压缩数据块时文件提前结束或发生错误。&quot; &lt;&lt; std::endl;                // 根据需要决定是退出还是尝试继续处理已读取部分                break; // 或者 return 1;            &#125;            strm.avail_in = compressed_block_size;            strm.next_in = compressed_buffer.data();            // 循环解压当前块            do            &#123;                strm.avail_out = static_cast&lt;uInt&gt;(decompress_buffer.size());                strm.next_out = decompress_buffer.data();                ret = inflate(&amp;strm, Z_NO_FLUSH); // 使用 Z_NO_FLUSH 进行正常解压                switch (ret)                &#123;                    case Z_NEED_DICT:                    case Z_DATA_ERROR:                    case Z_MEM_ERROR:                        inflateEnd(&amp;strm);                        throw std::runtime_error(std::string(&quot;zlib inflate 错误: &quot;) + strm.msg);                    case Z_STREAM_ERROR:                        inflateEnd(&amp;strm);                        throw std::runtime_error(&quot;zlib inflate 错误: 无效的流状态&quot;);                &#125;                // 计算解压出的数据量                size_t have = decompress_buffer.size() - strm.avail_out;                if (have &gt; 0)                &#123;                    // 将解压后的数据写入标准输出                    std::cout.write(reinterpret_cast&lt;const char *&gt;(decompress_buffer.data()), have);                    outfile.write(reinterpret_cast&lt;const char *&gt;(decompress_buffer.data()), have);                &#125;                // 如果输出缓冲区满了，inflate 需要再次被调用来处理剩余的输入            &#125; while (strm.avail_out == 0); // 继续解压直到输出缓冲区不再被填满            // 检查当前块是否解压完毕            if (strm.avail_in != 0)            &#123;                // Z_SYNC_FLUSH 写入的块，解压时 inflate 可能在块结束时返回 Z_OK 而不是 Z_STREAM_END                // 只要输入被消耗完 (avail_in == 0) 就认为一个块处理完了                // 如果输入没消耗完但 inflate 又没返回错误，可能逻辑有问题                // 对于 Z_SYNC_FLUSH, 我们期望 avail_in 最终为 0                inflateEnd(&amp;strm);                throw std::runtime_error(&quot;解压错误: 输入数据未完全消耗完但解压停止&quot;);            &#125;            // inflateReset(&amp;strm); // 不需要 reset，因为每次都读新块并设置 avail_in/next_in            // inflateInit 应该为每个独立块工作            // 修正：对于流式解压，应该持续使用同一个 strm，并在块之间可能需要 inflateSync            // 或者更简单的，如果块是独立压缩的（如我们的例子，虽然用了 Z_SYNC_FLUSH 但逻辑上独立）            // 可以在处理完一个块后调用 inflateReset            ret = inflateReset(&amp;strm);            if (ret != Z_OK)            &#123;                inflateEnd(&amp;strm);                throw std::runtime_error(&quot;zlib inflateReset 失败&quot;);            &#125;        &#125; // end while read block size        // 检查是否因为读取错误而退出循环        if (!infile.eof() &amp;&amp; infile.fail())        &#123;            std::cerr &lt;&lt; &quot;错误: 读取文件时发生 I/O 错误。&quot; &lt;&lt; std::endl;            outfile.close();        &#125;    &#125; catch (const std::exception &amp;e)    &#123;        std::cerr &lt;&lt; &quot;运行时错误: &quot; &lt;&lt; e.what() &lt;&lt; std::endl;        inflateEnd(&amp;strm); // 确保清理        outfile.close();        return 1;    &#125;    // 清理 zlib 资源    inflateEnd(&amp;strm);    std::cout.flush(); // 确保所有输出都被写入    outfile.close();    return 0;&#125;
+
+
+
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:02.sink分析</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。
+
+daily_file_sink在每天特定的时间点创建新的日志文件
+基础配置在使用daily_file_sink的时候，有几个重要的构造函数的参数
+rotation_hour:分割的小时
+rotation_minute：分割的分钟
+truncate:是否截断文件
+max_files：最大的文件数目，设定为0的时候不限制文件个数，否则保留设置的max_files文件个数
+实现原理daily_file_sink是通过被动触发日志文件的分割的，当用户写入日志的时候，daily_file_sink会通过日志消息的时间和计算的需要转轮的时间判断是否需要将日志输出到新的文件中，并通过一个环形队列管理这些日志文件，当文件数量超过设定数目的时候，删除旧的文件。
+计算分割时间点log_clock::time_point next_rotation_tp_() &#123;        auto now = log_clock::now(); //获取当前时间        tm date = now_tm(now);                //使用配置的时间作为轮转日志的时间        date.tm_hour = rotation_h_;         date.tm_min = rotation_m_;        date.tm_sec = 0;        auto rotation_time = log_clock::from_time_t(std::mktime(&amp;date));        //当前时间还未到计算出的轮转时间        if (rotation_time &gt; now) &#123;            return rotation_time;        &#125;        //当前时间超过了设定的轮转时间，直接换到下一点时间点作为轮转时间        return &#123;rotation_time + std::chrono::hours(24)&#125;;    &#125;
+每次sink初始化或者发生日志轮转的时候，就会调用这个函数计算下一次轮转日志的时间点。这个函数会使用用户配置的rotation_h_和rotation_m_，如果这个时间点过去了，就会那么就是明天的同一时间轮转。比如，下午16点启动日志，但是设定是每天6点分割，那么下一次轮转的时间就是第二天的6点，本次不会分割。
+文件管理daily_file_sink通过max_files参数限制保留的旧日志文件的个数,并且通过filenames_q_队列维护这些文件，在初始化阶段使用init_filenames_q_去填充这个队列
+void init_filenames_q_() &#123;        using details::os::path_exists;        //环形队列存储文件名        filenames_q_ = details::circular_q&lt;filename_t&gt;(static_cast&lt;size_t&gt;(max_files_));        std::vector&lt;filename_t&gt; filenames;        auto now = log_clock::now();                //按照时间倒序查找现有的日志文件        while (filenames.size() &lt; max_files_) &#123;            //按照时间计算文件名            auto filename = FileNameCalc::calc_filename(base_filename_, now_tm(now));                        //当前文件不存在，立刻停止            if (!path_exists(filename)) &#123;                break;            &#125;            filenames.emplace_back(filename);            now -= std::chrono::hours(24);        &#125;        // 将找到的文件名按反向顺序（最旧的在前）添加到队列中        // 这确保了当队列满时，最旧的文件名位于队列前端，准备被删除。        for (auto iter = filenames.rbegin(); iter != filenames.rend(); ++iter) &#123;            filenames_q_.push_back(std::move(*iter));        &#125;    &#125;
+这个初始化过程巧妙地查找了前几天的现有日志文件，并将它们添加到队列中，使得找到的最旧的文件位于队列的前面，以便在队列满时首先被移除。
+写入与转轮当写入的时候，会根据日志消息的时间判断是否需要轮转，并且根据时间生成新的文件名，生成新的日志文件，写入日志消息，并且清理旧文件
+void sink_it_(const details::log_msg &amp;msg) override &#123;       //根据日志时间进行判断是否需要转轮       auto time = msg.time;       bool should_rotate = time &gt;= rotation_tp_;       if (should_rotate) &#123;           auto filename = FileNameCalc::calc_filename(base_filename_, now_tm(time));                      //打开新文件，重新计算轮转时间           file_helper_.open(filename, truncate_);           rotation_tp_ = next_rotation_tp_();       &#125;       memory_buf_t formatted;       base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);       file_helper_.write(formatted);       // 轮转之后，并且max_files_&gt;0，清理老文件       if (should_rotate &amp;&amp; max_files_ &gt; 0) &#123;           delete_old_();       &#125;   &#125;
+
+void delete_old_() &#123;        using details::os::filename_to_str;        using details::os::remove_if_exists;        filename_t current_file = file_helper_.filename();        //队列满了，进行操作，删除最老的的文件        if (filenames_q_.full()) &#123;            auto old_filename = std::move(filenames_q_.front());            filenames_q_.pop_front(); //从队列中删除最老的            bool ok = remove_if_exists(old_filename) == 0; //从磁盘删除            if (!ok) &#123;                filenames_q_.push_back(std::move(current_file));                throw_spdlog_ex(&quot;Failed removing daily file &quot; + filename_to_str(old_filename),                                errno);            &#125;        &#125;        //当前的最新文件加入队列        filenames_q_.push_back(std::move(current_file));    &#125;
+
+本质上，daily_file_sink 确保日志按天分隔，在指定时间启动新文件，并可选地清理超过设定天数的旧文件。
+rotating_file_sink日志文档达到固定的大小后，输出生成新的日志文件
+基础配置max_size：文件最大的字节数
+max_files：最大的文件个数，0的时候，一直只有一个文件存在
+实现原理通过日志的写入被动触发日志文件的转轮，当原文件的大小和要写入的字节大小总和超过设定值的时候触发日志的轮转，生成新文件，并通过将日志文件重名维持文件个数
+初始化创建日志的时候，rotating_file_sink会打开基础的文件，它计算初始大小，并且如果 rotate_on_open 为 true 且文件不为空，可以选择立即执行一次轮转。
+template &lt;typename Mutex&gt;rotating_file_sink&lt;Mutex&gt;::rotating_file_sink(    filename_t base_filename,    std::size_t max_size,    std::size_t max_files,    bool rotate_on_open,    const file_event_handlers &amp;event_handlers)    : base_filename_(std::move(base_filename)),      max_size_(max_size),      max_files_(max_files),      file_helper_&#123;event_handlers&#125; &#123;            //配置参数的检查    if (max_size == 0) &#123;        throw_spdlog_ex(&quot;rotating sink constructor: max_size arg cannot be zero&quot;);    &#125;    if (max_files &gt; 200000) &#123;        throw_spdlog_ex(&quot;rotating sink constructor: max_files arg cannot exceed 200000&quot;);    &#125;        //为0的时候是原名打开日志文件    file_helper_.open(calc_filename(base_filename_, 0));    current_size_ = file_helper_.size();         //打开的时候如果配置true并且文件大小不为0，开始轮转    if (rotate_on_open &amp;&amp; current_size_ &gt; 0) &#123;        rotate_();        current_size_ = 0;    &#125;&#125;
+文件重命名日志的轮转逻辑的核心在rotate_函数中，主要是处理重命名逻辑，根据max_files_参数维持备份文件比如是3,日志文件的原始名是log.txt，会存在log.txt日志文件和log.1.txt,log.2.txt,log.3.txt等备份文件
+// 示例: base_filename=&quot;log.txt&quot;, max_files=3// 轮转顺序:// 1. 删除 log.3.txt (如果存在) --&gt; 实际是第2步重命名时覆盖，或者rename前删除// 2. 将 log.2.txt 重命名为 log.3.txt// 3. 将 log.1.txt 重命名为 log.2.txt// 4. 将 log.txt 重命名为 log.1.txt// 5. 重新打开 log.txt (截断) 以写入新日志template &lt;typename Mutex&gt;void rotating_file_sink&lt;Mutex&gt;::rotate_() &#123;    using details::os::filename_to_str;    using details::os::path_exists;    file_helper_.close(); // 首先关闭当前日志文件    // 从最旧的备份文件索引开始，向下迭代到当前文件 (索引 0)    for (auto i = max_files_; i &gt; 0; --i) &#123;        filename_t src = calc_filename(base_filename_, i - 1); // 例如 log.1.txt (当 i=2), log.txt (当 i=1)        if (!path_exists(src)) &#123;            continue; // 如果源文件不存在，则跳过        &#125;        filename_t target = calc_filename(base_filename_, i); // 例如 log.2.txt (当 i=2), log.1.txt (当 i=1)        // 将 src 重命名为 target。如果 target 已存在，会先删除它。        if (!rename_file_(src, target)) &#123;            // 处理重命名失败 (重试逻辑并抛出异常)            // ... (错误处理如提供的代码所示) ...            file_helper_.reopen(true); // 即使重命名失败，也要截断日志文件以防超出限制！            current_size_ = 0;            throw_spdlog_ex(&quot;rotating_file_sink: failed renaming &quot; + filename_to_str(src) + &quot; to &quot; + filename_to_str(target), errno);        &#125;    &#125;    // 重新打开基础日志文件，并进行截断，以便重新开始写入    file_helper_.reopen(true);&#125;
+轮转是向后工作的：最旧的文件 (base_filename.max_files.ext) 被删除， 然后 base_filename.(max_files-1).ext 被重命名为 base_filename.max_files.ext，依此类推，直到当前的 base_filename.ext 被重命名为 base_filename.1.ext 。最后，base_filename.ext 被重新打开为一个空文件。
+写入与轮转当日志消息准备写入的时候，会首先格式化日志消息，然后计算新大小，检查是否应该进行轮转。需要轮转时flush文件然后轮转日志文件。完成之后写入日志消息。
+template &lt;typename Mutex&gt;void rotating_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    auto new_size = current_size_ + formatted.size();    if (new_size &gt; max_size_) &#123;        file_helper_.flush();        // 仅当文件非空时才轮转，避免对空文件的轮转        if (file_helper_.size() &gt; 0) &#123;             rotate_();            new_size = formatted.size(); // 新文件的大小就是这条消息的大小        &#125;    &#125;    file_helper_.write(formatted);    current_size_ = new_size;&#125;
+此 sink 确保单个日志文件不会超过特定大小，通过保留分布在多个文件中的最新日志数据的滚动窗口来管理磁盘空间。
+差异对比
+
+
+特性
+daily_file_sink
+rotating_file_sink
+
+
+
+触发条件
+固定时间点（如每日 00:00）
+文件大小达到 max_size 时触发
+
+
+文件名规则
+按时间生成（如 app-2023-09-15.log）
+基础名 + 序号（如 app.log.1）
+
+
+旧文件处理
+删除超过 max_files 天数的文件
+重命名后循环覆盖（保留固定数量备份）
+
+
+时间关联性
+强（按时间归档）
+弱（按空间需求处理）
+
+
+核心功能
+时间驱动的日志归档
+磁盘空间控制
+
+
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:04.format格式化引擎分析</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:04.format%E6%A0%BC%E5%BC%8F%E5%8C%96%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[引言在本系列的前三篇文章中，我们依次探讨了 spdlog 的核心异步日志机制、两种常用的内建文件 Sink（daily_file_sink 和 rotating_file_sink），以及如何通过实现自定义 Sink（以 compressed_file_sink 为例）来扩展其功能。至此，我们已经对日志消息的产生、处理、流转以及最终输出有了较为深入的理解。
+现在我们开始剖析spdlog日志中的最后一个组件 formmatter。
+spdlog 提供了强大的日志格式化功能，允许用户通过模式字符串 (pattern string) 精确控制日志输出的每一个细节，例如时间戳、日志级别、线程 ID、源代码位置以及日志消息本身。这一核心功能主要由 pattern_formatter 类负责。
+本文将聚焦于 spdlog 的**核心格式化引擎 pattern_formatter**，剖析其如何将用户定义的模式字符串解析、编译，并最终应用于日志消息，生成格式化的输出。通过本文，你将理解：
+
+pattern_formatter 的两阶段工作机制：“编译”与“执行”。
+模式字符串是如何被解析成一系列格式化单元 (flag_formatter) 的。
+spdlog 如何支持丰富的内置格式标志（如 %Y, %m, %l, %v 等）。
+spdlog 格式化引擎的扩展性：如何实现并注册自定义的格式标志。
+
+注：本文分析的源码基于 spdlog v1.15.1。
+
+pattern_formatter 工作原理：编译与执行pattern_formatter 的核心思路是将格式化的过程分为两个阶段：
+
+编译阶段 (Compilation Phase): 在创建 pattern_formatter 对象或设置新的模式字符串时执行。它会解析模式字符串，将其转换(或称“编译”)成一个内部的、由多个小型格式化单元 (flag_formatter 对象) 组成的序列。
+执行阶段 (Execution&#x2F;Formatting Phase): 在每次需要格式化一条具体的日志消息 (log_msg) 时执行。它会按顺序执行“编译”阶段生成好的格式化单元序列，每个单元负责输出模式字符串中的一部分内容，最终拼接成完整的格式化日志。
+
+下面我们详细分析这两个阶段。
+编译阶段：解析模式串编译阶段的目标是将用户提供的模式字符串（如 &quot;%Y-%m-%d %H:%M:%S.%e [%l] %v&quot;）转换成一个 std::vector&lt;std::unique_ptr&lt;flag_formatter&gt;&gt; 对象（即 formatters_ 成员变量）。这个过程由 pattern_formatter::compile_pattern_ 私有方法完成。
+其主要逻辑如下：
+
+遍历模式串: 从头到尾逐个字符地扫描模式字符串。void pattern_formatter::compile_pattern_(const std::string &amp;pattern) &#123;    auto end = pattern.end();    std::unique_ptr&lt;details::aggregate_formatter&gt; user_chars;    formatters_.clear();    //遍历整个模式字符串    for (auto it = pattern.begin(); it != end; ++it) &#123;        ......    &#125;    if (user_chars)     &#123;        formatters_.push_back(std::move(user_chars));    &#125;&#125;
+处理普通字符: 如果当前字符不是 %，则将其视为普通文本。
+创建一个 details::aggregate_formatter 实例（如果尚不存在）。
+调用 aggregate_formatter::add_ch() 方法将该普通字符追加到其内部字符串 str_ 中。
+连续的普通字符会被追加到同一个 aggregate_formatter 实例。void pattern_formatter::compile_pattern_(const std::string &amp;pattern) &#123;    ......    for (auto it = pattern.begin(); it != end; ++it) &#123;        if (*it == &#x27;%&#x27;) &#123;           ......        &#125; else  //处理普通字符        &#123;            if (!user_chars) &#123;                user_chars = details::make_unique&lt;details::aggregate_formatter&gt;();            &#125;            user_chars-&gt;add_ch(*it);        &#125;    &#125;    if (user_chars)      &#123;        formatters_.push_back(std::move(user_chars));    &#125;&#125;
+
+
+处理模式标志 (%): 如果当前字符是 %：
+首先，如果之前存在收集普通字符的 aggregate_formatter 实例，则将其添加到 formatters_ 列表中。
+然后，尝试解析 % 后面的填充与对齐说明（padding spec），由 handle_padspec_ 完成。
+接着，读取 % 后面的标志字符 (flag character)，例如 l, t, v, Y 等。
+调用 handle_flag_ 方法处理这个标志字符和解析出的填充信息。void pattern_formatter::compile_pattern_(const std::string &amp;pattern) &#123;    auto end = pattern.end();    std::unique_ptr&lt;details::aggregate_formatter&gt; user_chars;    formatters_.clear();    for (auto it = pattern.begin(); it != end; ++it) &#123;        //处理模式字符        if (*it == &#x27;%&#x27;) &#123;            if (user_chars)  //先将之前的普通字符对象加入进去            &#123;                formatters_.push_back(std::move(user_chars));            &#125;            auto padding = handle_padspec_(++it, end);            if (it != end) &#123;                if (padding.enabled()) &#123;                    handle_flag_&lt;details::scoped_padder&gt;(*it, padding);                &#125; else &#123;                    handle_flag_&lt;details::null_scoped_padder&gt;(*it, padding);                &#125;            &#125; else &#123;                break;            &#125;        &#125; else             ......        &#125;    &#125;    if (user_chars)      &#123;        formatters_.push_back(std::move(user_chars));    &#125;&#125;
+
+
+handle_flag_ 的逻辑:
+检查自定义标志: 首先在 custom_handlers_ (一个存储用户自定义标志处理器的 map) 中查找该标志字符。
+如果找到，说明用户注册了针对该字符的自定义格式化器。创建一个该自定义格式化器的克隆实例，设置好填充信息，并将其添加到 formatters_ 列表中。注意：用户自定义标志的优先级高于内置标志。
+
+
+处理内置标志: 如果不是自定义标志，则进入一个巨大的 switch 语句，根据标志字符匹配对应的内置 flag_formatter 子类。
+例如，case &#39;l&#39; 会创建一个 details::level_formatter 实例；case &#39;v&#39; 会创建一个 details::v_formatter 实例；各种时间相关的标志（Y, m, d, H, M, S, e, f, F 等）会创建对应的 X_formatter 实例。
+根据是否需要填充，会选择性地使用 details::scoped_padder 或 details::null_scoped_padder 作为模板参数。
+创建好对应的 formatter 实例后，将其添加到 formatters_ 列表中。
+
+
+处理未知标志: 如果标志字符既不是自定义的，也不在内置 switch 语句中，spdlog 默认会将其视为普通文本（连同前面的 % 一起）添加到 aggregate_formatter 中。
+
+
+
+template &lt;typename Padder&gt;SPDLOG_INLINE void pattern_formatter::handle_flag_(char flag, details::padding_info padding) &#123;    //处理自定义的模式字符，遇到直接退出，overrider原本定义的模式字符    auto it = custom_handlers_.find(flag);    if (it != custom_handlers_.end()) &#123;        auto custom_handler = it-&gt;second-&gt;clone();        custom_handler-&gt;set_padding_info(padding);        formatters_.push_back(std::move(custom_handler));        return;    &#125;    switch (flag) &#123;        case (&#x27;+&#x27;):              formatters_.push_back(details::make_unique&lt;details::full_formatter&gt;(padding));            need_localtime_ = true;            break;        case &#x27;n&#x27;:              formatters_.push_back(details::make_unique&lt;details::name_formatter&lt;Padder&gt;&gt;(padding));            break;        case &#x27;l&#x27;:              formatters_.push_back(details::make_unique&lt;details::level_formatter&lt;Padder&gt;&gt;(padding));            break;        ......        default:              auto unknown_flag = details::make_unique&lt;details::aggregate_formatter&gt;();            if (!padding.truncate_) &#123;                unknown_flag-&gt;add_ch(&#x27;%&#x27;);                unknown_flag-&gt;add_ch(flag);                formatters_.push_back((std::move(unknown_flag)));            &#125;                    else &#123;                padding.truncate_ = false;                formatters_.push_back(                    details::make_unique&lt;details::source_funcname_formatter&lt;Padder&gt;&gt;(padding));                unknown_flag-&gt;add_ch(flag);                formatters_.push_back((std::move(unknown_flag)));            &#125;            break;    &#125;&#125;
+
+结束处理: 遍历完整个模式字符串后，如果最后还有未添加的 aggregate_formatter 实例（表示模式串以普通字符结尾），则将其添加到 formatters_ 列表末尾。
+
+void pattern_formatter::compile_pattern_(const std::string &amp;pattern) &#123;    ......    //末尾的普通字符要保持    if (user_chars)      &#123;        formatters_.push_back(std::move(user_chars));    &#125;&#125;
+经过这个编译阶段，模式字符串就被有效地转换成了一个由 flag_formatter 对象组成的、有序的“格式化指令列表” formatters_。
+执行阶段：格式化日志消息当调用 pattern_formatter::format(const details::log_msg &amp;msg, memory_buf_t &amp;dest) 方法来格式化一条具体的日志消息时，执行阶段开始。
+这个过程相对简单：
+
+遍历 formatters_ 列表: 按顺序迭代编译阶段生成的 formatters_ 向量中的每一个 std::unique_ptr&lt;flag_formatter&gt;。
+调用 format 方法: 对每一个 flag_formatter 对象，调用其**虚函数 format(const details::log_msg &amp;msg, const std::tm &amp;tm_time, memory_buf_t &amp;dest)**。
+spdlog 会预先计算好日志消息的时间戳对应的 std::tm 结构（如果模式中包含时间相关标志），并传递给 format 方法。
+每个具体的 flag_formatter 子类会实现自己的 format 方法，根据其职责从 msg 或 tm_time 中提取所需信息（如日志级别、线程 ID、格式化的时间部分、日志消息文本等），进行必要的处理和填充，并使用 fmt_helper 中的函数将结果追加 (append) 到传入的目标缓冲区 dest 中。
+
+
+完成格式化: 当 formatters_ 列表中的所有对象都执行完其 format 方法后，dest 缓冲区中就包含了根据原始模式字符串生成的、完整的、格式化好的日志输出。
+
+void pattern_formatter::format(const details::log_msg &amp;msg, memory_buf_t &amp;dest) &#123;    ......    for (auto &amp;f : formatters_) &#123;        f-&gt;format(msg, cached_tm_, dest);    &#125;    details::fmt_helper::append_string_view(eol_, dest);&#125;
+关键类与设计pattern_formatter 的设计体现了良好的面向对象思想：
+
+flag_formatter (基类): 定义了所有格式化单元的统一接口（主要是 format 虚函数），是实现多态的基础。
+aggregate_formatter (子类): 处理模式串中的普通文本部分。
+众多具体的 X_formatter (子类): 如 level_formatter, v_formatter, Y_formatter, H_formatter 等，每个类负责处理一个特定的 % 格式标志，实现了单一职责原则。
+pattern_formatter (协调者): 负责解析模式串（编译过程），管理 flag_formatter 对象列表，并在需要时按顺序调用它们（执行过程）。
+
+这种设计可以看作是策略模式 (Strategy Pattern) 的应用：每个 % 标志对应一种格式化策略，由一个具体的 flag_formatter 子类实现。pattern_formatter 在编译时根据模式串选择并组合这些策略，在执行时应用它们。同时，formatters_ 列表也体现了组合模式 (Composite Pattern) 的思想，将简单的格式化单元组合成复杂的格式化逻辑。
+扩展性：自定义格式标志spdlog 的格式化引擎不仅功能丰富，还具有良好的扩展性，允许用户添加自己定义的格式标志。
+实现步骤如下：
+
+创建自定义 Formatter 类: 创建一个新类，继承自 spdlog::custom_flag_formatter。
+实现 format 方法: 在新类中重写 format 方法，实现自定义的格式化逻辑。你可以从 log_msg 对象获取信息，进行处理，并将结果追加到 dest 缓冲区。
+实现 clone 方法: 实现一个 clone 方法，用于在编译阶段创建自定义 formatter 的实例。通常是返回 std::make_unique&lt;YourCustomFormatter&gt;(*this)。
+注册自定义标志: 获取 pattern_formatter 对象（或者通过 spdlog::set_formatter 设置一个新的），调用其 add_flag&lt;YourCustomFormatter&gt;(flag_char) 方法，将你的自定义 formatter 类与一个未被使用的字符（作为新的标志字符）关联起来。
+
+spdlog中的github上的示例
+#include &quot;spdlog/pattern_formatter.h&quot;class my_formatter_flag : public spdlog::custom_flag_formatter&#123;public:    void format(const spdlog::details::log_msg &amp;, const std::tm &amp;, spdlog::memory_buf_t &amp;dest) override    &#123;        std::string some_txt = &quot;custom-flag&quot;;        dest.append(some_txt.data(), some_txt.data() + some_txt.size());    &#125;    std::unique_ptr&lt;custom_flag_formatter&gt; clone() const override    &#123;        return spdlog::details::make_unique&lt;my_formatter_flag&gt;();    &#125;&#125;;void custom_flags_example()&#123;        auto formatter = std::make_unique&lt;spdlog::pattern_formatter&gt;();    formatter-&gt;add_flag&lt;my_formatter_flag&gt;(&#x27;*&#x27;).set_pattern(&quot;[%n] [%*] [%^%l%$] %v&quot;);    spdlog::set_formatter(std::move(formatter));&#125;
+
+完成注册后，pattern_formatter 在编译阶段遇到你指定的 flag_char 时，就会优先创建并使用你的 YourCustomFormatter 实例。如前所述，自定义标志的优先级高于内置标志，这意味着你可以用自定义实现覆盖掉 spdlog 的默认行为（但不建议覆盖常用标志，最好选择未使用或特殊的字符）。
+总结spdlog 的 pattern_formatter 通过巧妙的“编译-执行”两阶段机制，将用户定义的模式字符串高效地转换并应用于日志消息。其核心在于将模式串解析为一系列 flag_formatter 对象，每个对象负责处理模式的一部分。这种基于策略模式和组合模式的设计不仅实现了丰富的功能，还通过 custom_flag_formatter 提供了优秀的扩展性。
+至此，我们已经完成了对 spdlog 核心组件——异步机制、内建 sink、自定义 sink 扩展以及核心格式化引擎 pattern_formatter 的剖析。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:05.spdlog性能优化尝试</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:05.spdlog%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%B0%9D%E8%AF%95/</url>
+    <content><![CDATA[引言在本系列的前四篇文章中，我们对 spdlog 的异步机制、文件 Sink、自定义 Sink 扩展以及核心格式化引擎 pattern_formatter 进行了深入剖析。通过这些分析，我们对 spdlog 的设计哲学和实现细节有了全面的理解。spdlog 以其丰富的功能和相对不错的性能得到了广泛应用，但其默认的异步日志模型（基于共享的 MPMC 阻塞队列）在高并发、多生产者场景下，队列的锁竞争可能成为性能瓶颈。
+受到 nanolog 等高性能日志库关于利用 thread_local 减少前端竞争思想的启发，本文将详细阐述一种对 spdlog 异步日志机制的改进方案。核心思路是将原有的“多生产者-单消费者 (MPSC)”模型，演进为“多个独立的单生产者-单消费者 (SPSC) 模型集合 + 后端统一合并处理”的架构，旨在显著降低生产者线程间的锁竞争，并利用最小堆保证全局日志的时间顺序，以期获得性能上的提升。
+通过本文，你将了解到：
+
+该改进方案的设计思想与架构。
+如何利用 thread_local 为每个生产者线程创建独立的 SPSC 队列。
+后端消费者线程如何发现、管理这些动态创建的队列。
+如何通过最小堆（优先级队列）对来自不同 SPSC 队列的日志消息进行时间戳排序，以保证全局顺序。
+关键组件（如 details::thread_pool_local、spsc_blocking_queue）的设计与核心实现。
+以及笔者通过实验验证此方案相较于原版 spdlog 带来的性能提升。
+
+注：本文的改进方案基于对 spdlog v1.15.1 的理解和修改实践。
+
+核心改进思路：从 MPMC 到 “thread_local SPSC 集合 + 最小堆合并”spdlog 默认的异步模型中，所有生产者（业务线程）共享一个中央的 mpmc_blocking_queue。在高并发写入时，对该队列的互斥锁（std::mutex）的竞争会成为影响前端（业务线程）性能的瓶颈。
+我们的改进思路旨在通过以下方式优化这一模型：
+
+前端无锁化 (或极低锁)： 为每一个首次进行日志记录的生产者线程，通过 thread_local 动态创建一个专属于该线程的、轻量级的 SPSC (Single-Producer, Single-Consumer) 阻塞队列。日志消息直接写入这个线程局部队列。由于每个队列只有一个生产者（即线程自身），写入操作可以降低锁的开销。
+后端集中处理与排序： 单个后台消费者线程负责从所有这些 thread_local SPSC 队列中收集日志消息。
+保证全局顺序： 收集到的日志消息可能来自不同的生产者线程，其时间戳可能是交错的。为了保证最终输出的日志具有全局严格的时间顺序，消费者线程在将消息送往 Sink 之前，会使用一个基于时间戳的最小堆（优先级队列）对这些消息进行排序。
+
+整体架构从原先的：
+
+演变为：
+
+关键组件设计与实现为了实现上述思路，我们需要对 spdlog 的核心异步组件 details::thread_pool 进行改造，并引入新的队列类型。我们将改造后的线程池称为 details::thread_pool_local，新的 logger 实现称为 async_logger_local。
+1. thread_local SPSC 队列的创建与管理
+thread_local q_ptr_local_: 在 details::thread_pool_local 中，我们定义一个 static thread_local 的指向 SPSC 队列的智能指针。using item_type = async_msg_local;using q_type = details::spsc_blocking_queue&lt;item_type&gt;;using q_type_ptr = std::shared_ptr&lt;q_type&gt;;static thread_local q_type_ptr q_ptr_local_;
+按需创建: 当一个生产者线程首次调用日志接口（如 async_logger_local::sink_it_ 内部会调用到 thread_pool_local::post_async_msg_）时，会检查 q_ptr_local_ 是否为空。如果为空，表示该线程尚未拥有自己的 SPSC 队列。
+此时，需要创建一个新的 SPSC 队列实例（std::make_shared&lt;q_type&gt;(queue_capacity)）。
+这个新创建的队列指针不仅赋值给 q_ptr_local_，还需要注册到一个全局的、消费者线程可见的队列池中，例如 q_ptrs_front_（一个 std::vector&lt;q_type_ptr&gt;，需要用锁保护其访问）。
+
+
+前端写入: 生产者线程后续的日志消息都将直接写入其 q_ptr_local_ 指向的线程局部 SPSC 队列。
+
+if (q_ptr_local_ == nullptr)&#123;    std::unique_lock&lt;std::recursive_mutex&gt; lock(que_mutex_); // que_mutex_ 保护 q_ptrs_front_    q_ptr_local_ = std::make_shared&lt;q_type&gt;(INITIAL_QUEUE_CAPACITY); // q_type 是新的SPSC队列类型    q_ptrs_front_.push_back(q_ptr_local_); // 注册到全局队列池&#125;// ... 将消息写入 q_ptr_local_ ...
+
+2. spsc_blocking_queue 的设计为了配合上述模型，需要一个新的队列 spsc_blocking_queue（或类似名称）。
+
+生产者写入 (enqueue):
+由于是单生产者，写入端可以进行高度优化。
+当队列满时，行为由 async_overflow_policy_local 控制，例如阻塞生产者 (block)，或者丢弃消息（overrun_oldest 或 discard_new）。void enqueue(T &amp;&amp;item)&#123;    std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);    pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);    q_.push_back(std::move(item));&#125;
+
+
+消费者读取 (dequeue):
+由于是单消费者（特指从这个特定 SPSC 队列实例读取的消费者，即我们的后端主消费者线程），读取端也可以优化。
+关键特性是支持非阻塞读取。当队列为空时，它应该立即返回一个表示“无数据”的状态，而不是阻塞消费者。这是因为后端消费者需要轮询多个这样的 SPSC 队列。bool dequeue(T &amp;popped_item)&#123;    &#123;        std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);        if (q_.empty())            return false;        popped_item = std::move(q_.front());        q_.pop_front();    &#125;    pop_cv_.notify_one();    return true;&#125;
+
+
+
+3. 后端消费者 (thread_pool_local::worker_loop_) 的工作流程后端消费者线程（在 thread_pool_local 中通常只有一个）的工作循环 worker_loop_ 内部调用 process_msg_，其核心逻辑如下：
+
+发现并接管新的 SPSC 队列:
+
+
+定期检查全局的“前端队列池” q_ptrs_front_（需要加锁访问）。
+如果发现有新注册的 SPSC 队列，将它们从 q_ptrs_front_ 移动到一个“后端工作队列池” q_ptrs_back_（一个仅由消费者线程访问的 std::vector&lt;q_type_ptr&gt;，因此后续对 q_ptrs_back_ 的遍历无需加锁）。清空 q_ptrs_front_ 以便前端可以继续注册。
+
+// in details::thread_pool_local::process_msg_()&#123;    std::unique_lock&lt;std::recursive_mutex&gt; lock(que_mutex_); // 保护 q_ptrs_front_    if (!q_ptrs_front_.empty())    &#123;        for (auto &amp;t : q_ptrs_front_)        &#123;            q_ptrs_back_.emplace_back(t); // 移动或复制指针        &#125;        q_ptrs_front_.clear();    &#125;&#125;
+
+
+从所有 SPSC 队列收集日志到最小堆:
+
+
+遍历 q_ptrs_back_ 中的每一个 SPSC 队列。
+对每个队列，非阻塞地调用其 dequeue 方法，尝试取出日志消息 (async_msg_local)。
+将成功取出的日志消息放入一个基于时间戳的最小堆 msg_q_ (std::priority_queue&lt;std::unique_ptr&lt;async_msg_local&gt;, std::vector&lt;std::unique_ptr&lt;async_msg_local&gt;&gt;, CompareAsyncMsgLocalPtrTimestamp&gt;)。CompareAsyncMsgLocalPtrTimestamp 是一个自定义比较器，确保时间戳最小的消息在堆顶。
+
+// in details::thread_pool_local::process_msg_()for (auto &amp;spsc_q_ptr : q_ptrs_back_)&#123;    async_msg_local incoming_msg;    while (spsc_q_ptr-&gt;dequeue(incoming_msg)) // 非阻塞 dequeue    &#123;        // 假设 incoming_msg 包含时间戳        // LogMsg 包含时间戳 log_msg_obj.time        // async_msg_local 内部的 log_msg_obj.time        msg_q_.push(spdlog::details::make_unique&lt;async_msg_local&gt;(std::move(incoming_msg)));    &#125;&#125;
+
+
+从最小堆中取出并处理日志:
+
+
+检查最小堆 msg_q_ 是否为空。
+如果不为空，从堆顶取出时间戳最早的日志消息。
+根据消息类型 (log, flush, terminate) 进行处理，通常是调用 async_logger_local 实例的 backend_sink_it_ 或 backend_flush_ 方法，将消息传递给实际的 Sinks。
+
+// in details::thread_pool_local::process_msg_()bool processed_any_data = false;while (!msg_q_.empty())&#123;    processed_any_data = true;    auto msg_ptr = std::move(const_cast&lt;std::unique_ptr&lt;async_msg_local&gt;&amp;&gt;(msg_q_.top()));    msg_q_.pop();    switch (msg_ptr-&gt;msg_type)    &#123;        case async_msg_type_local::log:            msg_ptr-&gt;worker_ptr-&gt;backend_sink_it_(*msg_ptr);            break;        case async_msg_type_local::flush:            msg_ptr-&gt;worker_ptr-&gt;backend_flush_();            break;        // ... terminate case ...    &#125;&#125;
+
+
+消费者调度与休眠:
+
+
+如果在一轮完整的收割和处理后（即遍历了所有 SPSC 队列并将最小堆中的消息处理完），没有处理任何数据（所有队列都为空，最小堆也为空），那么消费者线程可以短暂休眠一小段时间（例如几纳秒或几微秒），避免忙等待消耗过多 CPU。
+
+// in details::thread_pool_local::process_msg_()if (!processed_any_data)&#123;    std::this_thread::sleep_for(std::chrono::nanoseconds(MIN_SLEEP_DURATION)); // 例如 1ns&#125;
+
+
+优雅退出:
+
+
+当 thread_pool_local 析构时，会向所有 SPSC 队列（或通过一个特殊的全局信号）发送 terminate 消息。
+worker_loop_ 在收到 terminate 信号或外部 stop_ 标志被设置后，会退出循环前最后一次调用 process_msg_()，以确保所有缓冲区的日志都被处理和刷新。
+
+4. async_logger_local 的改动async_logger_local 的改动相对较小，主要是其构造函数需要接收 std::weak_ptr&lt;details::thread_pool_local&gt;，并且其 sink_it_ 和 flush_ 方法内部调用的 thread_pool_ 的 post_log 和 post_flush 方法是新 thread_pool_local 提供的版本。
+初步性能验证通过本地的初步基准测试，将此改进方案与原版 spdlog (v1.15.1) 在相同的硬件条件下，使用spdlog提供的异步评测示例，测试basic_file_sink在阻塞状态下二者的性能区别。
+结果显示，在多生产者线程（如 4 线程及以上）的场景下，由于前端 thread_local SPSC 队列显著减少了锁竞争，改进方案在日志吞吐量表现出了一定程度的性能提升。
+测试环境
+
+
+组件
+描述
+
+
+
+CPU
+Intel Core i7-13700KF, 16 核, 24 线程, 5.3 GHz (最大 5.4 GHz)
+
+
+缓存
+L3 30 MiB
+
+
+内存
+32GB DDR4
+
+
+存储
+Samsung SSD 980 PRO 2TB (NVMe)
+
+
+操作系统
+atzlinux 12 (Ubuntu-based), 内核 6.8.0-58
+
+
+编译器
+GCC 11.4.0, -O3 优化
+
+
+系统负载
+平均负载 0.71-0.97 (低负载)
+
+
+测试条件
+队列大小：8192。
+生产者线程数：1、2、4、8。
+测试方法：10 次运行取平均值，输出到文件 Sink。
+指标：吞吐量（条&#x2F;秒）。
+
+吞吐量对比
+
+
+生产者线程数
+spdlog 吞吐量 (条&#x2F;秒)
+优化 SPSC 日志库 (条&#x2F;秒)
+提升百分比
+
+
+
+1
+4,240,865
+3,673,841
+-13.37%
+
+
+2
+2,732,199
+3,264,696
++19.49%
+
+
+4
+1,431,440
+3,146,138
++119.82%
+
+
+8
+1,052,129
+3,803,022
++261.47%
+
+
+总结与展望本文提出并实现了一种基于 thread_local SPSC 队列和后端最小堆合并排序的 spdlog 异步日志机制改进方案。通过为每个生产者线程提供独立的、写入端几乎无竞争的队列，并由后端消费者线程统一收集、排序和输出，该方案有效地解决了原 MPMC 队列在高并发下的锁竞争问题，并在保证全局日志时间顺序的前提下，获得了可观的性能提升。
+代码层面的核心改动在于引入了 async_logger_local、details::thread_pool_local 以及一个支持非阻塞消费的 spsc_blocking_queue。thread_pool_local 通过 static thread_local 变量为每个日志线程按需创建队列，并通过一个集中的“前端队列池” (q_ptrs_front_) 进行注册。消费者线程则将这些队列转移到自己的“后端工作队列池” (q_ptrs_back_)，轮询数据放入基于时间戳的最小堆，最后从堆中取出有序日志进行处理。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:06.spdlog中的设计模式</title>
+    <url>/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/</url>
+    <content><![CDATA[前言：从功能到架构，探寻 spdlog 的设计之美在本系列之前的文章中，我们深入剖析了 spdlog 的异步机制、核心组件，并且尝试拓展实现一个压缩sink，还尝试进行了性能优化实践。
+我们理解了 spdlog 在功能和性能上“做了什么”以及“怎么做的”。现在，我们跳出具体实现的细节，从设计模式的角度重新看一下这个库，
+深入探讨 spdlog 是如何巧妙地运用**策略模式 (Strategy)、组合模式 (Composite)、工厂模式 (Factory)、以及单例模式 (Singleton)**，来构建其灵活、高效且用户友好的体系的。
+
+1. 策略模式 (Strategy Pattern)：解耦日志行为的核心策略模式的核心思想是：定义一系列算法，将每一个算法封装起来，并使它们可以相互替换。
+为什么使用策略模式？对于一个日志库而言，其核心任务是记录日志，但日志的“行为”是多变的：
+
+日志消息应该以什么样的**格式 (Format)**呈现？
+日志消息应该被发送到哪个**目的地 (Destination)**？
+
+spdlog 通过策略模式，将 logger 的核心记录逻辑与具体的格式化策略和输出策略完全解耦。
+在 spdlog 中是如何实现的？spdlog 中有两处经典的策略模式应用：Formatter 对 Sink 的策略 和 Sink 对 Logger 的策略。
+a) Formatter：定义日志的“格式化策略”
+spdlog 定义了一个 formatter 接口，所有具体的格式化器都实现这个接口。sink 对象则拥有 (has-a) 一个 formatter 策略。
+&#x2F;&#x2F; spdlog&#x2F;formatter.h  
+class formatter &#123;  public:  virtual ~formatter() = default;  virtual void format(const details::log_msg &amp;msg, memory_buf_t &amp;dest) = 0;  virtual std::unique_ptr&lt;formatter&gt; clone() const = 0;  &#125;;
+每个 sink 对象都持有一个 formatter。当 sink 需要记录日志时，它不关心如何格式化，而是把这个任务委托给它持有的 formatter 策略对象。
+// spdlog/sinks/base_sink.h  template &lt;typename Mutex&gt;  class SPDLOG_API base_sink : public sink &#123;  public:  // ...      void log(const details::log_msg &amp;msg) final override      &#123;          std::lock_guard&lt;Mutex&gt; lock(mutex_);          sink_it_(formatted); // sink_it_ 是子类实现的具体输出逻辑 , 实际调用 formatter_ 的 format 方法，执行格式化策略     &#125;protected:  // 持有一个 formatter 策略      std::unique_ptr&lt;spdlog::formatter&gt; formatter_;      Mutex mutex_;  // ...  &#125;;
+
+b) Sink：定义日志的“输出策略”
+同样地，spdlog 定义了一个 sink 接口，代表不同的输出目的地策略。logger 类则拥有 (has-a) 一个或多个 sink 策略。
+// spdlog/sinks/sink.h  class  sink &#123;  public:      virtual ~sink() = default;      virtual void log(const details::log_msg &amp;msg) = 0;      virtual void flush() = 0;      virtual void set_pattern(const std::string &amp;pattern) = 0;      virtual void set_formatter(std::unique_ptr&lt;spdlog::formatter&gt; sink_formatter) = 0;  // ...  &#125;;  
+
+logger 类中持有一个 sink 的集合。当用户调用 logger-&gt;info(...) 时，logger 将日志消息打包后，委托给它持有的所有 sink 策略对象去处理。
+class SPDLOG_API logger &#123;public:    ......protected:    std::string name_;    std::vector&lt;sink_ptr&gt; sinks_;    spdlog::level_t level_&#123;level::info&#125;;    spdlog::level_t flush_level_&#123;level::off&#125;;    err_handler custom_err_handler_&#123;nullptr&#125;;    details::backtracer tracer_;    &#125;
+
+下面是logger,sink和formatter三个类的类图:
+
+这样做有什么好处？
+高度解耦： logger、sink、formatter 三者职责清晰，logger 不关心输出细节，sink 不关心格式化细节。
+极强的扩展性： 用户可以轻松创建自己的 sink（如写入数据库）和 formatter（如输出为 JSON），并与现有 logger 无缝集成。
+灵活性： 可以在运行时动态地为 sink 更换 formatter，改变日志格式。
+
+2. 组合模式 (Composite Pattern)：统一处理多个目的地组合模式的核心思想是：将对象组合成树形结构以表示“部分-整体”的层次结构，使得用户对单个对象和组合对象的使用具有一致性。
+为什么使用组合模式？我们常常希望一条日志能同时输出到多个地方，比如控制台和文件。组合模式使得 logger 在处理这种情况时无需区分是在跟一个 sink 还是多个 sink 打交道。
+在 spdlog 中是如何实现的？如上节代码所示，spdlog 的 logger 类中持有一个 std::vector 成员 sinks_。当记录日志时，logger::sink_it_() 方法会简单地遍历这个 vector，并对其中的每一个 sink 调用 log() 方法。
+这里的实现完美地体现了组合模式的核心思想——统一对待单个对象和对象集合。对于 logger（客户端）来说，它处理 sinks_ 的逻辑是完全一致的，无论这个 vector 中只有一个 sink 还是有十个。
+spdlog 还提供了一个更经典的组合模式实现——dist_sink，它本身是一个 sink，内部也包含一个 sink 的集合，其 log() 方法就是遍历并调用内部所有 sink 的 log()。
+这样做有什么好处？
+简化客户端代码： logger 的实现变得非常简单，一个循环就解决了向所有目的地输出的问题。
+灵活性： 用户可以自由地向 logger 的 sinks_ 列表添加或移除 sink，动态地改变日志的输出组合。
+
+3. 工厂模式 (Factory Pattern)：简化对象的创建过程在 spdlog 中，工厂模式更多的是以工厂函数 (Factory Function) 结合 模板化的工厂结构体 (Factory Struct) 的形式体现，它提供了一个集中的、简化的方式来创建复杂的、预配置好的 logger 对象。
+为什么使用工厂模式？手动创建一个功能完备的 logger 对象比较繁琐。尤其是异步的logger，还需要去手动创建线程池和设置队列大小。工厂模式将这些复杂的创建逻辑封装起来，向用户提供一个简单、易用的创建接口。
+在 spdlog 中是如何实现的？spdlog 提供了一系列工厂函数，如 basic_logger_mt。这些函数巧妙地利用模板参数来接收一个“工厂”类型，这个工厂类型决定了是创建同步 logger还是异步 logger。
+// 一个异步文件日志的创建示例  void async_example()  &#123;  // 使用 async_factory 作为模板参数，创建异步 logger      auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);  &#125;
+
+// 这是同步工厂的实现  struct synchronous_factory &#123;  template &lt;typename Sink, typename... SinkArgs&gt;  static std::shared_ptr&lt;spdlog::logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;...args) &#123;      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;spdlog::logger&gt;(std::move(logger_name), std::move(sink));      details::registry::instance().initialize_logger(new_logger);      return new_logger;  &#125;  &#125;;
+
+// 这是异步工厂的实现  template&lt;async_overflow_policy OverflowPolicy = async_overflow_policy::block&gt;  struct async_factory_impl  &#123;      template&lt;typename Sink, typename... SinkArgs&gt;      static std::shared_ptr&lt;async_logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;... args)      &#123;      // ... (省略创建和获取全局线程池的逻辑) ...      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;async_logger&gt;(std::move(logger_name), std::move(sink),      std::move(tp), OverflowPolicy);      details::registry::instance().initialize_logger(new_logger);      return new_logger;      &#125;  &#125;;    using async_factory = async_factory_impl&lt;async_overflow_policy::block&gt;;    .......
+
+最终的工厂函数 basic_logger_mt 接收这个工厂类型作为模板参数，并调用其 create 方法。
+template &lt;typename Factory = spdlog::synchronous_factory&gt;  inline std::shared_ptr&lt;logger&gt; basic_logger_mt(const std::string &amp;logger_name,                                                 const filename_t &amp;filename,                                                 bool truncate = false,                                                 const file_event_handlers &amp;event_handlers = &#123;&#125;) &#123;      // 调用传入的 Factory 的静态 create 方法来创建 logger      return Factory::template create&lt;sinks::basic_file_sink_mt&gt;(logger_name, filename, truncate,event_handlers);  &#125;
+
+下面是工厂调用的时序图:
+
+这样做有什么好处？
+极大地简化了用户的使用： 用户可以用一行代码创建一个功能完备的同步或异步 logger。
+高度灵活与解耦： 通过模板参数注入不同的工厂实现，使得创建不同类型 logger 的逻辑得以复用和解耦。
+保证了最佳实践： 工厂函数创建的 logger 通常是经过预配置的、符合最佳实践的实例（例如，_mt 后缀的都是线程安全的）。
+
+通过这种模板方法和手段实现工厂也是C++实现工厂模式的一个优点，避免了重复创建无意义的工厂接口类，而是通过模板去实现静态多态
+4. 单例模式 (Singleton Pattern)：提供全局便捷访问单例模式确保一个类只有一个实例，并提供一个全局访问点。
+为什么使用单例模式？对于许多简单的应用场景，用户不希望手动创建和管理 logger 实例，而是希望有一个像 printf 一样方便的全局日志函数。spdlog 通过单例模式提供了一个全局的 logger 注册表 (registry) 和一个默认的 logger。
+在 spdlog 中是如何实现的？spdlog 提供了全局的日志函数，如 spdlog::info, spdlog::error 等。
+#include &quot;spdlog/spdlog.h&quot;int main()   &#123;      // 直接使用全局函数进行日志记录      spdlog::info(&quot;Welcome to spdlog!&quot;);      spdlog::error(&quot;Some error message with arg: &#123;&#125;&quot;, 1);  &#125;
+
+这些全局函数内部都通过调用 default_logger_raw() 来获取一个默认的 logger 实例。
+   template &lt;typename... Args&gt;  inline void debug(format_string_t&lt;Args...&gt; fmt, Args &amp;&amp;...args) &#123;  // 调用默认 logger 的 debug 方法      default_logger_raw()-&gt;debug(fmt, std::forward&lt;Args&gt;(args)...);  &#125;
+
+而这个默认的 logger 由 spdlog::registry 类管理。registry 类自身就是通过单例模式实现的，它使用 C++11 之后线程安全的“Meyers’ Singleton”模式。
+// spdlog/details/registry.h  class SPDLOG_API registry &#123;  public:  // ...  // 提供一个静态方法 instance() 来获取唯一的实例  static registry &amp;instance();    std::shared_ptr&lt;logger&gt; default_logger();      void set_default_logger(std::shared_ptr&lt;logger&gt; new_default_logger);      void register_logger(std::shared_ptr&lt;logger&gt; new_logger);      // ...  private:      registry(); // 构造函数私有化      ~registry();    std::unordered_map&lt;std::string, std::shared_ptr&lt;logger&gt;&gt; loggers_;      std::shared_ptr&lt;logger&gt; default_logger_;      // ...  &#125;;// spdlog/details/registry.cpp  SPDLOG_INLINE registry &amp;registry::instance() &#123;      // C++11 保证了静态局部变量的初始化是线程安全的      static registry s_instance;      return s_instance;  &#125;
+
+这样做有什么好处？
+便捷性： 为用户提供了极其方便的全局日志接口，大大降低了入门和日常使用的复杂度。
+全局注册与管理： 提供了一个中心化的位置来注册、获取和管理所有命名的 logger，方便统一配置。
+平衡了便利与灵活： spdlog 在提供单例便利的同时，也允许用户创建和管理自己的 logger 实例，不与全局注册表绑定。这种设计非常出色，兼顾了易用性和灵活性，避免了单例模式在大型项目中可能带来的强耦合和测试困难问题。
+
+结论通过对 spdlog 中设计模式的剖析，我们不难发现，这些经典模式并非孤立存在，而是相互协作，共同构成了 spdlog 优雅的架构：
+
+策略模式 提供了核心的灵活性，使得日志的格式化和输出行为可以被轻松替换和扩展。
+组合模式 使得 logger 能够统一、透明地处理单个或多个输出目的地，简化了客户端逻辑。
+工厂模式 (结合模板) 则封装了复杂的对象创建过程，为用户提供了简洁、易用的入口。
+单例模式 为简单的使用场景提供了极大的便利，并提供了一个全局的管理中心。
+
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+</search>

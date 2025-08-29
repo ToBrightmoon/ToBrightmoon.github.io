@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<meta name="theme-color" content="#222">
+<meta name="generator" content="Hexo 7.3.0">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Lora:300,300italic,400,400italic,700,700italic|Roboto:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+<link rel="stylesheet" href="/lib/font-awesome/css/all.min.css">
+
+<script id="hexo-configurations">
+    var NexT = window.NexT || {};
+    var CONFIG = {"hostname":"tobrightmoon.github.io","root":"/","scheme":"Gemini","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"always","padding":20,"offset":12,"onmobile":true},"copycode":{"enable":true,"show_result":true,"style":"mac"},"back2top":{"enable":true,"sidebar":false,"scrollpercent":true},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}},"path":"search.xml"};
+  </script>
+
+  <meta name="description" content="前言：因为最近的个人需要,想要自己多做一点实践，因此我决定 ：开发一个带 GUI 的、用于管理和监控一个外部核心服务 (Core Service) 的跨平台桌面应用。  在我的设想中，这个应用的架构是分层的：UI 层（我选择了 Qt）负责界面展示和用户交互，而 Service 层（我将用 C++ 实现）则负责与那个外部核心服务进行通信，并处理所有复杂的后端逻辑。 很自然，我决定将 UI 和 Ser">
+<meta property="og:type" content="article">
+<meta property="og:title" content="grpc实践之路:01.同步客户端的使用">
+<meta property="og:url" content="https://tobrightmoon.github.io/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/index.html">
+<meta property="og:site_name" content="ToBrightMoon 的个人博客">
+<meta property="og:description" content="前言：因为最近的个人需要,想要自己多做一点实践，因此我决定 ：开发一个带 GUI 的、用于管理和监控一个外部核心服务 (Core Service) 的跨平台桌面应用。  在我的设想中，这个应用的架构是分层的：UI 层（我选择了 Qt）负责界面展示和用户交互，而 Service 层（我将用 C++ 实现）则负责与那个外部核心服务进行通信，并处理所有复杂的后端逻辑。 很自然，我决定将 UI 和 Ser">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://tobrightmoon.github.io/images/version_call.png">
+<meta property="article:published_time" content="2025-08-26T16:00:00.000Z">
+<meta property="article:modified_time" content="2025-08-29T02:18:47.651Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="C++">
+<meta property="article:tag" content="grpc">
+<meta property="article:tag" content="进程间通信">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://tobrightmoon.github.io/images/version_call.png">
+
+<link rel="canonical" href="https://tobrightmoon.github.io/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/">
+
+
+<script id="page-configurations">
+  // https://hexo.io/docs/variables.html
+  CONFIG.page = {
+    sidebar: "",
+    isHome : false,
+    isPost : true,
+    lang   : 'zh-CN'
+  };
+</script>
+
+  <title>grpc实践之路:01.同步客户端的使用 | ToBrightMoon 的个人博客</title>
+  
+
+
+
+
+
+
+  <noscript>
+  <style>
+  .use-motion .brand,
+  .use-motion .menu-item,
+  .sidebar-inner,
+  .use-motion .post-block,
+  .use-motion .pagination,
+  .use-motion .comments,
+  .use-motion .post-header,
+  .use-motion .post-body,
+  .use-motion .collection-header { opacity: initial; }
+
+  .use-motion .site-title,
+  .use-motion .site-subtitle {
+    opacity: initial;
+    top: initial;
+  }
+
+  .use-motion .logo-line-before i { left: initial; }
+  .use-motion .logo-line-after i { right: initial; }
+  </style>
+</noscript>
+
+</head>
+
+<body itemscope itemtype="http://schema.org/WebPage">
+  <div class="container use-motion">
+    <div class="headband"></div>
+
+    <header class="header" itemscope itemtype="http://schema.org/WPHeader">
+      <div class="header-inner"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏">
+      <span class="toggle-line toggle-line-first"></span>
+      <span class="toggle-line toggle-line-middle"></span>
+      <span class="toggle-line toggle-line-last"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <span class="logo-line-before"><i></i></span>
+      <h1 class="site-title">ToBrightMoon 的个人博客</h1>
+      <span class="logo-line-after"><i></i></span>
+    </a>
+      <p class="site-subtitle" itemprop="description">探索代码的奥秘</p>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+
+<nav class="site-nav">
+  <ul id="menu" class="main-menu menu">
+        <li class="menu-item menu-item-home">
+
+    <a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a>
+
+  </li>
+        <li class="menu-item menu-item-tags">
+
+    <a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a>
+
+  </li>
+        <li class="menu-item menu-item-categories">
+
+    <a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a>
+
+  </li>
+        <li class="menu-item menu-item-archives">
+
+    <a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a>
+
+  </li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup">
+        <div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div id="search-result">
+  <div id="no-result">
+    <i class="fa fa-spinner fa-pulse fa-5x fa-fw"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</div>
+    </header>
+
+    
+  <div class="back-to-top">
+    <i class="fa fa-arrow-up"></i>
+    <span>0%</span>
+  </div>
+  <div class="reading-progress-bar"></div>
+
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="content-wrap">
+          
+
+          <div class="content post posts-expand">
+            
+
+    
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h1 class="post-title" itemprop="name headline">
+          grpc实践之路:01.同步客户端的使用
+        </h1>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-27 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-27T00:00:00+08:00">2025-08-27</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E5%8A%A8%E6%89%8B%E5%AE%9E%E8%B7%B5-%E4%B8%89%E6%96%B9%E5%BA%93/" itemprop="url" rel="index"><span itemprop="name">动手实践-三方库</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E5%8A%A8%E6%89%8B%E5%AE%9E%E8%B7%B5-%E4%B8%89%E6%96%B9%E5%BA%93/grpc/" itemprop="url" rel="index"><span itemprop="name">grpc</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+        <h2 id="前言："><a href="#前言：" class="headerlink" title="前言："></a><strong>前言：</strong></h2><p>因为最近的个人需要,想要自己多做一点实践，因此我决定 ：<strong>开发一个带 GUI 的、用于管理和监控一个外部核心服务 (Core Service) 的跨平台桌面应用。</strong> </p>
+<p>在我的设想中，这个应用的架构是分层的：UI 层（我选择了 Qt）负责界面展示和用户交互，而 Service 层（我将用 C++ 实现）则负责与那个外部核心服务进行通信，并处理所有复杂的后端逻辑。</p>
+<p>很自然，我决定将 UI 和 Service 设计成两个独立的进程。这样不仅能让架构更清晰、权责更分明，也能避免任何一端的崩溃影响到另一端。于是，第一个核心问题就摆在了面前：<strong>UI 进程和 Service 进程之间，该如何通信？</strong></p>
+<span id="more"></span>
+<h2 id="思考：我的进程间通信（IPC）技术选型"><a href="#思考：我的进程间通信（IPC）技术选型" class="headerlink" title="思考：我的进程间通信（IPC）技术选型"></a><strong>思考：我的进程间通信（IPC）技术选型</strong></h2><p>常见的 IPC 手段有很多，比如命名管道、共享内存、套接字，或者更高层的 RESTful API。因为我之前在公司的项目中写过 IPC 相关的代码（虽然不是 gRPC），并且我设想的这个“外部核心服务”有<strong>大量实时状态需要流式传输</strong>给 UI，所以我很快将目光锁定在了更现代的 RPC 框架上。</p>
+<p>最终，我选择了 gRPC。理由如下：</p>
+<ol>
+<li><strong>流式传输 (Streaming) 是刚需：</strong> 这是决定性因素。我需要将 Service 层的实时日志和连接状态源源不断地推送到 UI。gRPC 原生支持服务端流和双向流，这完美地解决了我的核心痛点。</li>
+<li><strong>跨语言的未来：</strong> 虽然现在 UI 和 Service 都是 C++ 生态（Qt + C++），但 gRPC 的跨语言特性给了我极大的灵活性。未来，如果我想把 UI 换成其他语言实现，或者想用 Python&#x2F;Go 写一些简单的测试脚本来调用我的 Service，gRPC 都能轻松应对。</li>
+<li><strong>性能与效率：</strong> 基于 HTTP&#x2F;2 和 Protocol Buffers，gRPC 在性能和数据压缩方面都优于传统的 REST+JSON 组合。</li>
+<li><strong>强类型契约：</strong> 通过 .proto 文件定义服务，避免了手写协议和序列化的繁琐与易错。</li>
+</ol>
+<p>这个系列文章，就是我对自己学习和实践 gRPC 过程的笔记与复盘。我计划把如何简单地使用 gRPC 的<strong>同步模式、流模式</strong>，以及<strong>如何与 Qt 框架优雅地集成</strong>都记录下来。后续如果精力允许，可能还会去剖析一些 gRPC 的核心组件内部原理。</p>
+<h2 id="准备工作：gRPC-的安装"><a href="#准备工作：gRPC-的安装" class="headerlink" title="准备工作：gRPC 的安装"></a><strong>准备工作：gRPC 的安装</strong></h2><p>在开始之前，有一个非常重要的建议：<strong>gRPC 的手动编译安装有些麻烦，强烈建议使用 vcpkg 这个包管理器来安装。</strong></p>
+<p>vcpkg 是微软推出的 C++ 包管理器，可以极大地简化第三方库的安装和集成过程。你只需要执行简单的命令，它就会自动帮你下载源码、处理依赖、编译并安装好 gRPC 及其所需的 protobuf, openssl, zlib 等所有依赖项。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 克隆 vcpkg  </span></span><br><span class="line">git <span class="built_in">clone</span> https://github.com/microsoft/vcpkg.git  </span><br><span class="line"><span class="built_in">cd</span> vcpkg</span><br><span class="line"></span><br><span class="line"><span class="comment"># 运行引导脚本  </span></span><br><span class="line">./bootstrap-vcpkg.sh <span class="comment"># Linux / macOS  </span></span><br><span class="line"><span class="comment"># 或者 .bootstrap-vcpkg.bat (Windows)</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 安装 gRPC  </span></span><br><span class="line">./vcpkg install grpc</span><br></pre></td></tr></table></figure>
+
+<p>安装完成后，你可以通过 CMake 的 toolchain 文件非常方便地在你的项目中使用它。<strong>不要自己手动去编译，相信我，这会为你省下大量的时间和精力，让你能专注于 gRPC 本身。</strong></p>
+<h2 id="“Hello-gRPC-”：核心使用流程"><a href="#“Hello-gRPC-”：核心使用流程" class="headerlink" title="“Hello, gRPC!”：核心使用流程"></a><strong>“Hello, gRPC!”：核心使用流程</strong></h2><p>下面，我们来走一遍 gRPC 的核心使用流程，实现一个最简单的客户端-服务端通信。</p>
+<h3 id="第一步：定义“代码合同”-proto-文件"><a href="#第一步：定义“代码合同”-proto-文件" class="headerlink" title="第一步：定义“代码合同” (.proto 文件)"></a><strong>第一步：定义“代码合同” (.proto 文件)</strong></h3><p>gRPC 的一切都始于 .proto 文件，它使用 Protocol Buffers 语法来定义服务接口和消息结构。</p>
+<p>对于我的项目，我先定义一个最简单的服务 Controller，它只有一个“点对点”的 RPC 调用，用于获取核心服务的版本号。</p>
+<p><strong>controller.proto</strong></p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 指定使用 proto3 语法</span></span><br><span class="line">syntax = <span class="string">&quot;proto3&quot;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 定义包名，避免命名冲突</span></span><br><span class="line">package controller;</span><br><span class="line"></span><br><span class="line"><span class="comment">// GetVersion 服务的请求消息</span></span><br><span class="line">message GetVersionRequest &#123;</span><br><span class="line">  <span class="comment">// 消息字段，这里为空，因为获取版本不需要参数</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// GetVersion 服务的响应消息</span></span><br><span class="line">message GetVersionResponse &#123;</span><br><span class="line">  string version = <span class="number">1</span>; <span class="comment">// 1 是字段的唯一编号，不是值</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 定义我们的核心服务</span></span><br><span class="line">service Controller &#123;</span><br><span class="line">  <span class="comment">// 定义一个 Unary RPC (一元 RPC，即点对点调用)</span></span><br><span class="line">  <span class="comment">// 方法名叫 GetVersion，接收 GetVersionRequest，返回 GetVersionResponse</span></span><br><span class="line">  <span class="function">rpc <span class="title">GetVersion</span><span class="params">(GetVersionRequest)</span> <span class="title">returns</span> <span class="params">(GetVersionResponse)</span></span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="第二步：生成代码与文件解析"><a href="#第二步：生成代码与文件解析" class="headerlink" title="第二步：生成代码与文件解析"></a><strong>第二步：生成代码与文件解析</strong></h3><p>定义好 .proto 文件后，我们使用 protoc 编译器和 gRPC C++ 插件来生成 C++ 代码。</p>
+<h1 id="假设你的-proto-文件在-protos-目录下，输出到当前目录"><a href="#假设你的-proto-文件在-protos-目录下，输出到当前目录" class="headerlink" title="假设你的 .proto 文件在 protos 目录下，输出到当前目录"></a>假设你的 .proto 文件在 protos 目录下，输出到当前目录</h1><p>protoc -I&#x3D;.&#x2F;protos –cpp_out&#x3D;.&#x2F;grpc_gen –grpc_out&#x3D;.&#x2F;grpc_gen –plugin&#x3D;protoc-gen-grpc&#x3D;<code>which grpc_cpp_plugin</code> .&#x2F;protos&#x2F;controller.proto</p>
+<p>当你使用vcpkg安装grpc的时候，你会将 <code>protos</code>工具和 <code>protoc-gen-grpc</code>工具一并安装，安装目录一般在 <code>/home/username/.vcpkg/vcpkg/installed/x64-linux/tools</code> 的 <code>protobuf</code>目录和 <code>grpc</code>目录下</p>
+<p>执行后，会生成四个关键文件：</p>
+<ul>
+<li><strong>controller.pb.h &#x2F; controller.pb.cc：</strong> 这两个文件是 <strong>Protocol Buffers</strong> 生成的。它们包含了你在 .proto 中定义的 message（如 GetVersionRequest）所对应的 C++ 类，以及这些类的序列化和反序列化方法。<strong>它们只负责数据的载体。</strong></li>
+<li><strong>controller.grpc.pb.h &#x2F; controller.grpc.pb.cc：</strong> 这两个文件是 <strong>gRPC 插件</strong>生成的。它们包含了你在 .proto 中定义的 service（如 Controller）相关的 C++ 代码。这里面有：<ul>
+<li>一个用于<strong>服务端实现</strong>的抽象基类 (Controller::Service)。</li>
+<li>一个用于<strong>客户端调用</strong>的桩代码类 (Controller::Stub)。</li>
+</ul>
+</li>
+</ul>
+<p>理解这四个文件的分工非常重要，它体现了 gRPC 的分层设计：数据层 (Protobuf) 和通信层 (gRPC) 是分离的。</p>
+<h3 id="第三步：编写服务端"><a href="#第三步：编写服务端" class="headerlink" title="第三步：编写服务端"></a><strong>第三步：编写服务端</strong></h3><p>我们需要创建一个类，继承自生成的 Controller::Service，并重写 .proto 中定义的 GetVersion 虚函数。</p>
+<p><strong>server.cc</strong></p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;iostream&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;memory&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;string&gt;</span></span></span><br><span class="line"></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;grpcpp/grpcpp.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;grpc_gen/controller.grpc.pb.h&quot;</span> <span class="comment">// 引入 gRPC 生成的头文件</span></span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 继承自生成的服务基类</span></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">ControllerServiceImpl</span> <span class="keyword">final</span> : <span class="keyword">public</span> controller::Controller::Service</span><br><span class="line">&#123;</span><br><span class="line">    <span class="comment">// 重写 GetVersion 方法</span></span><br><span class="line">    <span class="function">grpc::Status <span class="title">GetVersion</span><span class="params">(grpc::ServerContext *context,</span></span></span><br><span class="line"><span class="params"><span class="function">                            <span class="type">const</span> controller::GetVersionRequest *request,</span></span></span><br><span class="line"><span class="params"><span class="function">                            controller::GetVersionResponse *response)</span> <span class="keyword">override</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        std::string version_str = <span class="string">&quot;Core Service v1.0.0&quot;</span>;</span><br><span class="line">        std::cout &lt;&lt; <span class="string">&quot;Received GetVersion request. Responding with: &quot;</span> &lt;&lt; version_str &lt;&lt; std::endl;</span><br><span class="line"></span><br><span class="line">        response-&gt;<span class="built_in">set_version</span>(version_str); <span class="comment">// 设置响应消息</span></span><br><span class="line">        <span class="keyword">return</span> grpc::Status::OK; <span class="comment">// 返回 OK 状态</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">RunServer</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="function">std::string <span class="title">server_address</span><span class="params">(<span class="string">&quot;0.0.0.0:50051&quot;</span>)</span></span>;</span><br><span class="line">    ControllerServiceImpl service;</span><br><span class="line"></span><br><span class="line">    grpc::ServerBuilder builder;</span><br><span class="line">    builder.<span class="built_in">AddListeningPort</span>(server_address, grpc::<span class="built_in">InsecureServerCredentials</span>());</span><br><span class="line">    builder.<span class="built_in">RegisterService</span>(&amp;service); <span class="comment">// 注册我们的服务实现</span></span><br><span class="line"></span><br><span class="line">    <span class="function">std::unique_ptr&lt;grpc::Server&gt; <span class="title">server</span><span class="params">(builder.BuildAndStart())</span></span>; <span class="comment">// 构建并启动服务器</span></span><br><span class="line">    std::cout &lt;&lt; <span class="string">&quot;Server listening on &quot;</span> &lt;&lt; server_address &lt;&lt; std::endl;</span><br><span class="line"></span><br><span class="line">    server-&gt;<span class="built_in">Wait</span>(); <span class="comment">// 阻塞等待服务器关闭</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">main</span><span class="params">(<span class="type">int</span> argc, <span class="type">char</span> **argv)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">RunServer</span>();</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br></pre></td></tr></table></figure>
+
+<h3 id="第四步：编写客户端"><a href="#第四步：编写客户端" class="headerlink" title="第四步：编写客户端"></a><strong>第四步：编写客户端</strong></h3><p>客户端通过生成的 Controller::Stub 来调用远程方法，这个过程被封装得就像调用本地函数一样简单。</p>
+<p><strong>client.cc</strong></p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;iostream&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;memory&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;string&gt;</span></span></span><br><span class="line"></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;grpcpp/grpcpp.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;grpc_gen/controller.grpc.pb.h&quot;</span> <span class="comment">// 同样引入</span></span></span><br><span class="line"></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">ControllerClient</span></span><br><span class="line">&#123;</span><br><span class="line"><span class="keyword">public</span>:</span><br><span class="line">    <span class="built_in">ControllerClient</span>(std::shared_ptr&lt;grpc::Channel&gt; channel)</span><br><span class="line">        : <span class="built_in">stub_</span>(controller::Controller::<span class="built_in">NewStub</span>(channel))</span><br><span class="line">    &#123;</span><br><span class="line">    &#125; <span class="comment">// 通过 Channel 创建 Stub</span></span><br><span class="line"></span><br><span class="line">    <span class="function">std::string <span class="title">GetVersion</span><span class="params">()</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        controller::GetVersionRequest request;</span><br><span class="line">        controller::GetVersionResponse response;</span><br><span class="line">        grpc::ClientContext context;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 发起 RPC 调用，就像调用一个本地方法</span></span><br><span class="line">        grpc::Status status = stub_-&gt;<span class="built_in">GetVersion</span>(&amp;context, request, &amp;response);</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (status.<span class="built_in">ok</span>())</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="keyword">return</span> response.<span class="built_in">version</span>();</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">else</span></span><br><span class="line">        &#123;</span><br><span class="line">            std::cout &lt;&lt; status.<span class="built_in">error_code</span>() &lt;&lt; <span class="string">&quot;: &quot;</span> &lt;&lt; status.<span class="built_in">error_message</span>() &lt;&lt; std::endl;</span><br><span class="line">            <span class="keyword">return</span> <span class="string">&quot;RPC failed&quot;</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">private</span>:</span><br><span class="line">    std::unique_ptr&lt;controller::Controller::Stub&gt; stub_;</span><br><span class="line">&#125;;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">main</span><span class="params">(<span class="type">int</span> argc, <span class="type">char</span> **argv)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    std::string target_str = <span class="string">&quot;localhost:50051&quot;</span>;</span><br><span class="line">    <span class="comment">// 创建一个到服务端的 Channel</span></span><br><span class="line">    <span class="function">ControllerClient <span class="title">client</span><span class="params">(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials()))</span></span>;</span><br><span class="line"></span><br><span class="line">    std::string version = client.<span class="built_in">GetVersion</span>();</span><br><span class="line">    std::cout &lt;&lt; <span class="string">&quot;Controller version received: &quot;</span> &lt;&lt; version &lt;&lt; std::endl;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="第五步：运行！"><a href="#第五步：运行！" class="headerlink" title="第五步：运行！"></a><strong>第五步：运行！</strong></h3><p>先启动服务端，再启动客户端，你就能看到客户端成功获取到了服务端返回的版本号信息。一个完整的 RPC 调用就这么简单地完成了！</p>
+<p>下面就是这个服务的简单调用时序图<br><img src="/images/version_call.png" alt="version_call"></p>
+<h2 id="总结与展望"><a href="#总结与展望" class="headerlink" title="总结与展望"></a><strong>总结与展望</strong></h2><p>本文作为 gRPC 系列的开篇，我们从一个真实的个人项目需求出发，探讨了为什么选择 gRPC 作为我们的 IPC 方案。接着，我们通过定义一个简单的 .proto 文件和实现一个完整的“Hello, gRPC!”示例，迈出了实践的第一步。</p>
+<p>我们看到，gRPC 借助 Protocol Buffers 和代码生成，极大地简化了网络通信应用的开发，让我们能更专注于业务逻辑本身。</p>
+<p>当然，我们目前只接触了最简单的 Unary RPC 和同步调用。这只是冰山一角。在接下来的文章中，我们将深入探讨：</p>
+<ul>
+<li><strong>如何利用 gRPC 强大的流式通信能力，实现实时数据推送？</strong></li>
+<li><strong>如何在 GUI 应用（如 Qt）中优雅地使用 gRPC，避免界面卡死？</strong></li>
+<li><strong>服务端和客户端的核心组件是如何工作的？</strong></li>
+</ul>
+<p><strong>最后，有一个强烈的建议：</strong> 本系列文章是我个人的学习笔记和思考，而 gRPC 的官方文档和 GitHub 仓库中的例子是最好的、最权威的学习资料。<strong>官方文档和示例远比我写得好，强烈建议大家去阅读！</strong> 希望我的文章能作为一个有益的补充和不同的视角。</p>
+
+    </div>
+
+    
+    
+    
+
+      <footer class="post-footer">
+          <div class="post-tags">
+              <a href="/tags/C/" rel="tag"># C++</a>
+              <a href="/tags/grpc/" rel="tag"># grpc</a>
+              <a href="/tags/%E8%BF%9B%E7%A8%8B%E9%97%B4%E9%80%9A%E4%BF%A1/" rel="tag"># 进程间通信</a>
+          </div>
+
+        
+
+
+        
+    <div class="post-nav">
+      <div class="post-nav-item">
+    <a href="/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:02.%E6%B5%81%E7%9A%84%E4%BD%BF%E7%94%A8/" rel="prev" title="grpc实践之路:02.流的使用">
+      <i class="fa fa-chevron-left"></i> grpc实践之路:02.流的使用
+    </a></div>
+      <div class="post-nav-item">
+    <a href="/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/" rel="next" title="coredump的那些事:01.coredump的启动">
+      coredump的那些事:01.coredump的启动 <i class="fa fa-chevron-right"></i>
+    </a></div>
+    </div>
+      </footer>
+    
+  </article>
+  
+  
+  
+
+
+
+          </div>
+          
+
+<script>
+  window.addEventListener('tabs:register', () => {
+    let { activeClass } = CONFIG.comments;
+    if (CONFIG.comments.storage) {
+      activeClass = localStorage.getItem('comments_active') || activeClass;
+    }
+    if (activeClass) {
+      let activeTab = document.querySelector(`a[href="#comment-${activeClass}"]`);
+      if (activeTab) {
+        activeTab.click();
+      }
+    }
+  });
+  if (CONFIG.comments.storage) {
+    window.addEventListener('tabs:click', event => {
+      if (!event.target.matches('.tabs-comment .tab-content .tab-pane')) return;
+      let commentClass = event.target.classList[1];
+      localStorage.setItem('comments_active', commentClass);
+    });
+  }
+</script>
+
+        </div>
+          
+  
+  <div class="toggle sidebar-toggle">
+    <span class="toggle-line toggle-line-first"></span>
+    <span class="toggle-line toggle-line-middle"></span>
+    <span class="toggle-line toggle-line-last"></span>
+  </div>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <ul class="sidebar-nav motion-element">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <!--noindex-->
+      <div class="post-toc-wrap sidebar-panel">
+          <div class="post-toc motion-element"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%89%8D%E8%A8%80%EF%BC%9A"><span class="nav-number">1.</span> <span class="nav-text">前言：</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E6%80%9D%E8%80%83%EF%BC%9A%E6%88%91%E7%9A%84%E8%BF%9B%E7%A8%8B%E9%97%B4%E9%80%9A%E4%BF%A1%EF%BC%88IPC%EF%BC%89%E6%8A%80%E6%9C%AF%E9%80%89%E5%9E%8B"><span class="nav-number">2.</span> <span class="nav-text">思考：我的进程间通信（IPC）技术选型</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%87%86%E5%A4%87%E5%B7%A5%E4%BD%9C%EF%BC%9AgRPC-%E7%9A%84%E5%AE%89%E8%A3%85"><span class="nav-number">3.</span> <span class="nav-text">准备工作：gRPC 的安装</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E2%80%9CHello-gRPC-%E2%80%9D%EF%BC%9A%E6%A0%B8%E5%BF%83%E4%BD%BF%E7%94%A8%E6%B5%81%E7%A8%8B"><span class="nav-number">4.</span> <span class="nav-text">“Hello, gRPC!”：核心使用流程</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9A%E5%AE%9A%E4%B9%89%E2%80%9C%E4%BB%A3%E7%A0%81%E5%90%88%E5%90%8C%E2%80%9D-proto-%E6%96%87%E4%BB%B6"><span class="nav-number">4.1.</span> <span class="nav-text">第一步：定义“代码合同” (.proto 文件)</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E7%94%9F%E6%88%90%E4%BB%A3%E7%A0%81%E4%B8%8E%E6%96%87%E4%BB%B6%E8%A7%A3%E6%9E%90"><span class="nav-number">4.2.</span> <span class="nav-text">第二步：生成代码与文件解析</span></a></li></ol></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#%E5%81%87%E8%AE%BE%E4%BD%A0%E7%9A%84-proto-%E6%96%87%E4%BB%B6%E5%9C%A8-protos-%E7%9B%AE%E5%BD%95%E4%B8%8B%EF%BC%8C%E8%BE%93%E5%87%BA%E5%88%B0%E5%BD%93%E5%89%8D%E7%9B%AE%E5%BD%95"><span class="nav-number"></span> <span class="nav-text">假设你的 .proto 文件在 protos 目录下，输出到当前目录</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9A%E7%BC%96%E5%86%99%E6%9C%8D%E5%8A%A1%E7%AB%AF"><span class="nav-number">0.1.</span> <span class="nav-text">第三步：编写服务端</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AC%AC%E5%9B%9B%E6%AD%A5%EF%BC%9A%E7%BC%96%E5%86%99%E5%AE%A2%E6%88%B7%E7%AB%AF"><span class="nav-number">0.2.</span> <span class="nav-text">第四步：编写客户端</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AC%AC%E4%BA%94%E6%AD%A5%EF%BC%9A%E8%BF%90%E8%A1%8C%EF%BC%81"><span class="nav-number">0.3.</span> <span class="nav-text">第五步：运行！</span></a></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E6%80%BB%E7%BB%93%E4%B8%8E%E5%B1%95%E6%9C%9B"><span class="nav-number">1.</span> <span class="nav-text">总结与展望</span></a></li></ol></div>
+      </div>
+      <!--/noindex-->
+
+      <div class="site-overview-wrap sidebar-panel">
+        <div class="site-author motion-element" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="ToBrightMoon"
+      src="/images/avatar.png">
+  <p class="site-author-name" itemprop="name">ToBrightMoon</p>
+  <div class="site-description" itemprop="description">记录我的开发与成长，分享 C++ 和源码分析</div>
+</div>
+<div class="site-state-wrap motion-element">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+          <a href="/archives/">
+        
+          <span class="site-state-item-count">18</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+            <a href="/categories/">
+          
+        <span class="site-state-item-count">7</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+            <a href="/tags/">
+          
+        <span class="site-state-item-count">10</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author motion-element">
+      <span class="links-of-author-item">
+        <a href="https://github.com/ToBrightmoon" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;ToBrightmoon" rel="noopener" target="_blank"><i class="fab fa-github fa-fw"></i></a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="https://www.zhihu.com/people/meng-zhong-ren-5-90" title="知乎 → https:&#x2F;&#x2F;www.zhihu.com&#x2F;people&#x2F;meng-zhong-ren-5-90" rel="noopener" target="_blank"><i class="fa-custom zhihu fa-fw"></i></a>
+      </span>
+  </div>
+
+
+
+      </div>
+
+    </div>
+  </aside>
+  <div id="sidebar-dimmer"></div>
+
+
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        
+
+        
+
+<div class="copyright">
+  
+  &copy; 
+  <span itemprop="copyrightYear">2025</span>
+  <span class="with-love">
+    <i class="fa fa-heart"></i>
+  </span>
+  <span class="author" itemprop="copyrightHolder">ToBrightMoon</span>
+</div>
+  <div class="powered-by">由 <a href="https://hexo.io/" class="theme-link" rel="noopener" target="_blank">Hexo</a> & <a href="https://theme-next.org/" class="theme-link" rel="noopener" target="_blank">NexT.Gemini</a> 强力驱动
+  </div>
+
+        
+
+
+
+
+
+
+
+
+      </div>
+    </footer>
+  </div>
+
+  
+  <script src="/lib/anime.min.js"></script>
+  <script src="/lib/velocity/velocity.min.js"></script>
+  <script src="/lib/velocity/velocity.ui.min.js"></script>
+
+<script src="/js/utils.js"></script>
+
+<script src="/js/motion.js"></script>
+
+
+<script src="/js/schemes/pisces.js"></script>
+
+
+<script src="/js/next-boot.js"></script>
+
+
+
+
+  
+
+
+
+
+  
+<script src="/js/local-search.js"></script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+</body>
+</html>

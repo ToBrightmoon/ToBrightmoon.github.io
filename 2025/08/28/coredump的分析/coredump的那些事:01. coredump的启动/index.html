@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<meta name="theme-color" content="#222">
+<meta name="generator" content="Hexo 7.3.0">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Lora:300,300italic,400,400italic,700,700italic|Roboto:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+<link rel="stylesheet" href="/lib/font-awesome/css/all.min.css">
+
+<script id="hexo-configurations">
+    var NexT = window.NexT || {};
+    var CONFIG = {"hostname":"tobrightmoon.github.io","root":"/","scheme":"Gemini","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"always","padding":20,"offset":12,"onmobile":true},"copycode":{"enable":true,"show_result":true,"style":"mac"},"back2top":{"enable":true,"sidebar":false,"scrollpercent":true},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}},"path":"search.xml"};
+  </script>
+
+  <meta name="description" content="前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候， 一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。 注：本文的一些终端操作均在ub">
+<meta property="og:type" content="article">
+<meta property="og:title" content="coredump的那些事:01.coredump的启动">
+<meta property="og:url" content="https://tobrightmoon.github.io/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/index.html">
+<meta property="og:site_name" content="ToBrightMoon 的个人博客">
+<meta property="og:description" content="前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候， 一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。 注：本文的一些终端操作均在ub">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://zhuanlan.zhihu.com/p/626026606">
+<meta property="article:published_time" content="2025-08-28T16:00:00.000Z">
+<meta property="article:modified_time" content="2025-08-29T02:18:47.651Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="coredump">
+<meta property="article:tag" content="linux">
+<meta property="article:tag" content="问题分析">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://zhuanlan.zhihu.com/p/626026606">
+
+<link rel="canonical" href="https://tobrightmoon.github.io/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/">
+
+
+<script id="page-configurations">
+  // https://hexo.io/docs/variables.html
+  CONFIG.page = {
+    sidebar: "",
+    isHome : false,
+    isPost : true,
+    lang   : 'zh-CN'
+  };
+</script>
+
+  <title>coredump的那些事:01.coredump的启动 | ToBrightMoon 的个人博客</title>
+  
+
+
+
+
+
+
+  <noscript>
+  <style>
+  .use-motion .brand,
+  .use-motion .menu-item,
+  .sidebar-inner,
+  .use-motion .post-block,
+  .use-motion .pagination,
+  .use-motion .comments,
+  .use-motion .post-header,
+  .use-motion .post-body,
+  .use-motion .collection-header { opacity: initial; }
+
+  .use-motion .site-title,
+  .use-motion .site-subtitle {
+    opacity: initial;
+    top: initial;
+  }
+
+  .use-motion .logo-line-before i { left: initial; }
+  .use-motion .logo-line-after i { right: initial; }
+  </style>
+</noscript>
+
+</head>
+
+<body itemscope itemtype="http://schema.org/WebPage">
+  <div class="container use-motion">
+    <div class="headband"></div>
+
+    <header class="header" itemscope itemtype="http://schema.org/WPHeader">
+      <div class="header-inner"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏">
+      <span class="toggle-line toggle-line-first"></span>
+      <span class="toggle-line toggle-line-middle"></span>
+      <span class="toggle-line toggle-line-last"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <span class="logo-line-before"><i></i></span>
+      <h1 class="site-title">ToBrightMoon 的个人博客</h1>
+      <span class="logo-line-after"><i></i></span>
+    </a>
+      <p class="site-subtitle" itemprop="description">探索代码的奥秘</p>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+
+<nav class="site-nav">
+  <ul id="menu" class="main-menu menu">
+        <li class="menu-item menu-item-home">
+
+    <a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a>
+
+  </li>
+        <li class="menu-item menu-item-tags">
+
+    <a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a>
+
+  </li>
+        <li class="menu-item menu-item-categories">
+
+    <a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a>
+
+  </li>
+        <li class="menu-item menu-item-archives">
+
+    <a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a>
+
+  </li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup">
+        <div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div id="search-result">
+  <div id="no-result">
+    <i class="fa fa-spinner fa-pulse fa-5x fa-fw"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</div>
+    </header>
+
+    
+  <div class="back-to-top">
+    <i class="fa fa-arrow-up"></i>
+    <span>0%</span>
+  </div>
+  <div class="reading-progress-bar"></div>
+
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="content-wrap">
+          
+
+          <div class="content post posts-expand">
+            
+
+    
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h1 class="post-title" itemprop="name headline">
+          coredump的那些事:01.coredump的启动
+        </h1>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+              
+
+              <time title="创建时间：2025-08-29 00:00:00 / 修改时间：10:18:47" itemprop="dateCreated datePublished" datetime="2025-08-29T00:00:00+08:00">2025-08-29</time>
+            </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/coredump/" itemprop="url" rel="index"><span itemprop="name">coredump</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/coredump/%E7%A8%8B%E5%BA%8F%E5%91%98%E7%9A%84%E8%87%AA%E6%88%91%E4%BF%AE%E5%85%BB/" itemprop="url" rel="index"><span itemprop="name">程序员的自我修养</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+        <h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 <em>段错误</em> 导致的死机现象。当出现这种问题的时候，</p>
+<p>一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。</p>
+<p><em>注：本文的一些终端操作均在ubuntu22.04下进行</em></p>
+<span id="more"></span>
+<h2 id="coredump介绍"><a href="#coredump介绍" class="headerlink" title="coredump介绍"></a>coredump介绍</h2><h3 id="coredump简介"><a href="#coredump简介" class="headerlink" title="coredump简介"></a>coredump简介</h3><p>关于coredump的介绍， 可以使用 <code>man 5 core</code> 命令，在终端 shell中查看 coredump 的手册</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"></span><br><span class="line">The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the time</span><br><span class="line">of termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 which</span><br><span class="line">cause a process to dump core can be found in signal(7).</span><br><span class="line"></span><br><span class="line">...</span><br></pre></td></tr></table></figure>
+<p>上面的英文，使用中文简单总结就是:</p>
+<p><em>当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息</em></p>
+<p>从上面的介绍中可以得到一些信息:</p>
+<ol>
+<li>没有处理一些信号会导致进程终止并产生coredump文件</li>
+<li>coredump是操作系统产生的</li>
+<li>coredump可以供gdb调试器使用</li>
+</ol>
+<p>核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。</p>
+<h3 id="产生coredump生成的信号"><a href="#产生coredump生成的信号" class="headerlink" title="产生coredump生成的信号"></a>产生coredump生成的信号</h3><p>那么到底那些信号会导致coredump的产生呢? 我们使用 <code>man 7 signal</code> 这个命令去查看信号的手册，在 <code>Standard signals</code> 小节中有着相关的内容，相关的内容如下</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line">Standard signals</span><br><span class="line">      Linux  supports  the  standard signals listed below.  </span><br><span class="line">      ......</span><br><span class="line"></span><br><span class="line">      Signal      Standard   Action   Comment</span><br><span class="line">      ────────────────────────────────────────────────────────────────────────</span><br><span class="line">      SIGABRT      P1990      Core    Abort signal from abort(3)</span><br><span class="line">      SIGBUS       P2001      Core    Bus error (bad memory access)</span><br><span class="line">      SIGFPE       P1990      Core    Floating-point exception</span><br><span class="line">      SIGILL       P1990      Core    Illegal Instruction</span><br><span class="line">      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT</span><br><span class="line">      SIGQUIT      P1990      Core    Quit from keyboard</span><br><span class="line">      SIGSEGV      P1990      Core    Invalid memory reference</span><br><span class="line">      SIGSYS       P2001      Core    Bad system call (SVr4);</span><br><span class="line">                                      see also seccomp(2)</span><br><span class="line">      SIGTRAP      P2001      Core    Trace/breakpoint trap</span><br><span class="line">      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]</span><br><span class="line">      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);</span><br><span class="line">                                      see setrlimit(2)</span><br><span class="line">      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);</span><br><span class="line">                                      see setrlimit(2)</span><br></pre></td></tr></table></figure>
+<p>这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。</p>
+<p>具体的coredump的产生的细节，可以参考知乎上的一篇文章<br><img src="https://zhuanlan.zhihu.com/p/626026606" alt="coredump生成原理"></p>
+<h2 id="coredump的配置"><a href="#coredump的配置" class="headerlink" title="coredump的配置"></a>coredump的配置</h2><p>之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。</p>
+<h3 id="coredump生成的限制"><a href="#coredump生成的限制" class="headerlink" title="coredump生成的限制"></a>coredump生成的限制</h3><p>Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 <code>man 5 core</code>这个命令去查看coredump的手册，去找到相关的内容:</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐</span><br><span class="line">    nal; see getrlimit(2) for details.</span><br><span class="line"></span><br><span class="line">    There are various circumstances in which a core dump file is not produced:</span><br><span class="line"></span><br><span class="line">    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumped</span><br><span class="line">core, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be created</span><br><span class="line">is not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).</span><br><span class="line"></span><br><span class="line">    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.</span><br><span class="line"></span><br><span class="line">    ......</span><br></pre></td></tr></table></figure>
+
+<p>将手册中的内容简单使用中文总结就是:</p>
+<p>有多种情况会导致 <strong>不生成 core dump 文件</strong>：</p>
+<ul>
+<li>进程没有权限写 core 文件（默认文件名为 <code>core</code> 或 <code>core.pid</code>，存放在当前工作目录）。</li>
+<li>目标文件已存在并有多个硬链接。</li>
+<li>文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。</li>
+<li>目录不存在。</li>
+<li><strong>RLIMIT_CORE</strong> 或 <strong>RLIMIT_FSIZE</strong> 被设置为 0。</li>
+<li>可执行文件没有读取权限（安全措施）。</li>
+<li>程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 <strong>prctl(2) PR_SET_DUMPABLE</strong> 和 <code>/proc/sys/fs/suid_dumpable</code> 允许）。</li>
+<li><code>/proc/sys/kernel/core_pattern</code> 为空 且 <code>/proc/sys/kernel/core_uses_pid</code> &#x3D; 0。</li>
+<li>内核编译时未启用 <strong>CONFIG_COREDUMP</strong>（Linux 3.7+）。</li>
+<li>进程使用了 <code>madvise(MADV_DONTDUMP)</code> 屏蔽了部分地址空间。</li>
+<li>在 systemd 系统中，core dump 可能由 <strong>systemd-coredump(8)</strong> 接管。</li>
+</ul>
+<p>那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:</p>
+<p>针对系统本身:</p>
+<ol>
+<li>磁盘空间足够，支持生成coredump。</li>
+<li>生成coredump的大小在受限范围内。</li>
+<li>生成文件的目录存在。</li>
+</ol>
+<p>针对进程：</p>
+<ol>
+<li>进程未被systemd接管，没有屏蔽 地址空间</li>
+<li>有相关位置的读写权限。</li>
+</ol>
+<p>我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。</p>
+<p>此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容</p>
+<h3 id="操作步骤"><a href="#操作步骤" class="headerlink" title="操作步骤"></a>操作步骤</h3><h4 id="临时开启"><a href="#临时开启" class="headerlink" title="临时开启"></a>临时开启</h4><p>linux提供了<code>ulimit</code>这个命令去修改coredump的限制，相关的内容可以通过 <code>man ulimit</code>去查阅。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">## 打开终端,修改系统限制为不限制 coredumop大小</span></span><br><span class="line"><span class="comment">## 不要关闭终端，因为ulimit命令只在当前终端下生效。</span></span><br><span class="line"><span class="built_in">ulimit</span> -c unlimited</span><br><span class="line"></span><br><span class="line"><span class="comment">## 将当前的coredump输出目录修改成你的进程有权限读写的位置</span></span><br><span class="line"><span class="comment">## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符</span></span><br><span class="line"><span class="built_in">sudo</span> bash -c <span class="string">&#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;</span></span><br><span class="line"></span><br><span class="line"><span class="comment">## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下</span></span><br></pre></td></tr></table></figure>
+<h4 id="长久开启"><a href="#长久开启" class="headerlink" title="长久开启"></a>长久开启</h4><p>想要长久的配置coredump文件的启动，需要修改 <code>/etc/security/limits.conf</code>和 <code>/etc/sysctl.conf</code> 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 使用gedit工具打开limits.conf文件 </span></span><br><span class="line"><span class="built_in">sudo</span> gedit /etc/security/limits.conf </span><br><span class="line"></span><br><span class="line"><span class="comment"># 在文件的最后一行增加如下内容,注意*不能省略</span></span><br><span class="line">*               soft    core            unlimited </span><br><span class="line"></span><br><span class="line"><span class="comment"># 编辑/etc/sysctl.conf文件</span></span><br><span class="line"><span class="built_in">sudo</span> gedit /etc/sysctl.conf</span><br><span class="line"></span><br><span class="line"><span class="comment"># 在文件的最后一行增加如下内容</span></span><br><span class="line"></span><br><span class="line">kernel.core_pattern=/path/%e-%p.core</span><br></pre></td></tr></table></figure>
+
+<p>配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用</p>
+<p>创建服务文件:</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">sudo</span> gedit /etc/systemd/system/sysctl-reload.service</span><br></pre></td></tr></table></figure>
+
+<p>文件内容如下所示</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">[Unit]</span><br><span class="line">Description=Reload sysctl settings after all services have started</span><br><span class="line">After=network.target</span><br><span class="line"></span><br><span class="line">[Service]</span><br><span class="line">Type=oneshot</span><br><span class="line">ExecStart=/sbin/sysctl -p /etc/sysctl.conf</span><br><span class="line">RemainAfterExit=yes</span><br><span class="line"></span><br><span class="line">[Install]</span><br><span class="line">WantedBy=multi-user.target</span><br></pre></td></tr></table></figure>
+
+<p>执行如下命令配置服务</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 确保服务可以开机自动启动</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl <span class="built_in">enable</span> sysctl-reload.service</span><br><span class="line"></span><br><span class="line"><span class="comment"># 重新加载“systemd”配置</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl daemon-reload</span><br><span class="line"></span><br><span class="line"><span class="comment"># 启动服务</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl start sysctl-reload.service</span><br><span class="line"></span><br><span class="line"><span class="comment"># 查看服务启动的结果</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl status sysctl-reload.service</span><br></pre></td></tr></table></figure>
+
+<h3 id="配套的脚本"><a href="#配套的脚本" class="headerlink" title="配套的脚本"></a>配套的脚本</h3><p>读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够<em>知其然,也知其所以然</em>,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。</p>
+<p>这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 <code>~/coredump</code> 目录下。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#!/bin/bash</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 获取当前用户的用户名</span></span><br><span class="line">USERNAME=$(<span class="built_in">whoami</span>)</span><br><span class="line">CORE_PATH=<span class="string">&quot;/home/<span class="variable">$USERNAME</span>/coredump&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 创建coredump存储目录</span></span><br><span class="line"><span class="built_in">mkdir</span> -p <span class="variable">$CORE_PATH</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 定义新脚本的文件名和路径</span></span><br><span class="line">SCRIPT_PATH=<span class="string">&quot;<span class="variable">$CORE_PATH</span>/rename_core.sh&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 使用重定向符号将内容写入新脚本</span></span><br><span class="line"><span class="built_in">cat</span> &lt;&lt; <span class="string">EOF &gt; $SCRIPT_PATH</span></span><br><span class="line"><span class="string">#!/bin/bash</span></span><br><span class="line"><span class="string">COREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;</span></span><br><span class="line"><span class="string">EOF</span></span><br><span class="line"></span><br><span class="line"><span class="built_in">cat</span> &lt;&lt; <span class="string">&#x27;EOF&#x27;</span> &gt;&gt; <span class="variable">$SCRIPT_PATH</span></span><br><span class="line">TIMESTAMP=<span class="string">&quot;<span class="subst">$(date +%Y-%m-%d-%H-%M-%S)</span>&quot;</span></span><br><span class="line">COREFILE_NAME=<span class="string">&quot;<span class="variable">$&#123;1&#125;</span>-<span class="variable">$&#123;2&#125;</span>-<span class="variable">$TIMESTAMP</span>.core&quot;</span></span><br><span class="line"><span class="comment"># 创建coredump文件</span></span><br><span class="line"><span class="built_in">cat</span> &gt; <span class="string">&quot;<span class="variable">$COREFILE_DIR</span>/<span class="variable">$COREFILE_NAME</span>&quot;</span></span><br><span class="line">EOF</span><br><span class="line"></span><br><span class="line"><span class="built_in">chmod</span> +x <span class="variable">$SCRIPT_PATH</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 永久设置coredump文件大小限制</span></span><br><span class="line"><span class="built_in">sudo</span> bash -c  <span class="string">&#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;</span></span><br><span class="line"><span class="built_in">sudo</span> bash -c <span class="string">&#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;</span></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="comment"># 确保设置在重启后仍然有效</span></span><br><span class="line"><span class="built_in">echo</span> <span class="string">&quot;Making changes persistent...&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="built_in">sudo</span> bash -c <span class="string">&#x27;echo &quot;kernel.core_pattern=|&#x27;</span><span class="variable">$SCRIPT_PATH</span><span class="string">&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;</span></span><br><span class="line"></span><br><span class="line">SERVICE=<span class="string">&quot;/etc/systemd/system/sysctl-reload.service&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="built_in">sudo</span> bash -c <span class="string">&#x27;echo &quot;[Unit]</span></span><br><span class="line"><span class="string">Description=Reload sysctl settings after all services have started</span></span><br><span class="line"><span class="string">After=network.target</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">[Service]</span></span><br><span class="line"><span class="string">Type=oneshot</span></span><br><span class="line"><span class="string">ExecStart=/sbin/sysctl -p /etc/sysctl.conf</span></span><br><span class="line"><span class="string">RemainAfterExit=yes</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">[Install]</span></span><br><span class="line"><span class="string">WantedBy=multi-user.target&quot; &gt; &#x27;</span><span class="variable">$SERVICE</span><span class="string">&#x27;&#x27;</span></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="comment"># 确保服务可以开机自动启动</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl <span class="built_in">enable</span> sysctl-reload.service</span><br><span class="line"></span><br><span class="line"><span class="comment"># 重新加载“systemd”配置</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl daemon-reload</span><br><span class="line"></span><br><span class="line"><span class="comment"># 启动服务</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl start sysctl-reload.service</span><br><span class="line"></span><br><span class="line"><span class="comment"># 查看服务启动的结果</span></span><br><span class="line"><span class="built_in">sudo</span> systemctl status sysctl-reload.service</span><br></pre></td></tr></table></figure>
+
+<h2 id="相关部分的部分内核源码解读"><a href="#相关部分的部分内核源码解读" class="headerlink" title="相关部分的部分内核源码解读"></a>相关部分的部分内核源码解读</h2><p>之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。</p>
+<p>这个函数的位置是 linux内核中的 <code>fs/coredump.c</code>中。我查看的源码的分支是 v6.9,读者也可以从 <code>https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635</code> 这个网址查看。</p>
+<h3 id="初始化参数"><a href="#初始化参数" class="headerlink" title="初始化参数"></a>初始化参数</h3><figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">struct</span> <span class="title class_">mm_struct</span> *mm = current-&gt;mm; <span class="comment">// 进程的内存描述符，保存了进程的虚拟内存信息</span></span><br><span class="line"><span class="keyword">struct</span> <span class="title class_">linux_binfmt</span> * binfmt;</span><br><span class="line">......</span><br><span class="line"><span class="keyword">struct</span> <span class="title class_">coredump_params</span> cprm = &#123;</span><br><span class="line">	.siginfo = siginfo,</span><br><span class="line">	.limit = <span class="built_in">rlimit</span>(RLIMIT_CORE), <span class="comment">// coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）</span></span><br><span class="line">	.mm_flags = mm-&gt;flags,</span><br><span class="line">	.vma_meta = <span class="literal">NULL</span>,</span><br><span class="line">	.cpu = <span class="built_in">raw_smp_processor_id</span>(),</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制</p>
+<h3 id="简单的检查"><a href="#简单的检查" class="headerlink" title="简单的检查"></a>简单的检查</h3><p>如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">binfmt = mm-&gt;binfmt;</span><br><span class="line"><span class="keyword">if</span> (!binfmt || !binfmt-&gt;core_dump)</span><br><span class="line">	<span class="keyword">goto</span> fail;</span><br><span class="line"><span class="keyword">if</span> (!__get_dumpable(cprm.mm_flags))</span><br><span class="line">	<span class="keyword">goto</span> fail;</span><br></pre></td></tr></table></figure>
+
+<h3 id="输出方式的决定"><a href="#输出方式的决定" class="headerlink" title="输出方式的决定"></a>输出方式的决定</h3><p>如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><span class="line">ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);</span><br><span class="line"></span><br><span class="line"><span class="keyword">if</span> (ispipe) &#123;</span><br><span class="line">   ......</span><br><span class="line">    <span class="comment">/* 管道模式，把 core dump 交给用户态程序处理 */</span></span><br><span class="line">    sub_info = <span class="built_in">call_usermodehelper_setup</span>(helper_argv[<span class="number">0</span>],</span><br><span class="line">                        helper_argv, <span class="literal">NULL</span>, GFP_KERNEL,</span><br><span class="line">                        umh_pipe_setup, <span class="literal">NULL</span>, &amp;cprm);</span><br><span class="line">    retval = <span class="built_in">call_usermodehelper_exec</span>(sub_info, UMH_WAIT_EXEC);</span><br><span class="line">&#125; <span class="keyword">else</span> &#123;</span><br><span class="line">    .....</span><br><span class="line">    <span class="comment">// 检查文件的大小和suid模式下是否是绝对路径</span></span><br><span class="line">    <span class="keyword">if</span> (cprm.limit &lt; binfmt-&gt;min_coredump)</span><br><span class="line">			<span class="keyword">goto</span> fail_unlock;</span><br><span class="line"></span><br><span class="line">		<span class="keyword">if</span> (need_suid_safe &amp;&amp; cn.corename[<span class="number">0</span>] != <span class="string">&#x27;/&#x27;</span>) &#123;</span><br><span class="line">			<span class="built_in">printk</span>(KERN_WARNING <span class="string">&quot;Pid %d(%s) can only dump core &quot;</span>\</span><br><span class="line">				<span class="string">&quot;to fully qualified path!\n&quot;</span>,</span><br><span class="line">				<span class="built_in">task_tgid_vnr</span>(current), current-&gt;comm);</span><br><span class="line">			<span class="built_in">printk</span>(KERN_WARNING <span class="string">&quot;Skipping core dump\n&quot;</span>);</span><br><span class="line">			<span class="keyword">goto</span> fail_unlock;</span><br><span class="line">		&#125;</span><br><span class="line">    <span class="comment">/* 文件模式，直接写入 core 文件 */</span></span><br><span class="line">    cprm.file = <span class="built_in">filp_open</span>(cn.corename, open_flags, <span class="number">0600</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">static</span> <span class="type">int</span> <span class="title">format_corename</span><span class="params">(<span class="keyword">struct</span> core_name *cn, <span class="keyword">struct</span> coredump_params *cprm,</span></span></span><br><span class="line"><span class="params"><span class="function">			   <span class="type">size_t</span> **argv, <span class="type">int</span> *argc)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">	....</span><br><span class="line">	<span class="type">int</span> ispipe = (*pat_ptr == <span class="string">&#x27;|&#x27;</span>); <span class="comment">// 就是通过core_pattern 是否是| 决定的</span></span><br><span class="line">	<span class="type">bool</span> was_space = <span class="literal">false</span>;</span><br><span class="line">	.....</span><br><span class="line"></span><br><span class="line">	<span class="comment">// 一些coredump name的输出配置</span></span><br><span class="line">	<span class="keyword">while</span> (*pat_ptr) &#123;</span><br><span class="line">		...</span><br><span class="line">		<span class="keyword">if</span> (*pat_ptr != <span class="string">&#x27;%&#x27;</span>) &#123;</span><br><span class="line">			err = <span class="built_in">cn_printf</span>(cn, <span class="string">&quot;%c&quot;</span>, *pat_ptr++);</span><br><span class="line">		&#125; <span class="keyword">else</span> &#123;</span><br><span class="line">			<span class="keyword">switch</span> (*++pat_ptr) &#123;</span><br><span class="line">			<span class="comment">/* single % at the end, drop that */</span></span><br><span class="line">			<span class="keyword">case</span> <span class="number">0</span>:</span><br><span class="line">				<span class="keyword">goto</span> out;</span><br><span class="line">			<span class="comment">/* Double percent, output one percent */</span></span><br><span class="line">			<span class="keyword">case</span> <span class="string">&#x27;%&#x27;</span>:</span><br><span class="line">				err = <span class="built_in">cn_printf</span>(cn, <span class="string">&quot;%c&quot;</span>, <span class="string">&#x27;%&#x27;</span>);</span><br><span class="line">				<span class="keyword">break</span>;</span><br><span class="line">			<span class="comment">/* pid */</span></span><br><span class="line">			<span class="keyword">case</span> <span class="string">&#x27;p&#x27;</span>:</span><br><span class="line">				pid_in_pattern = <span class="number">1</span>;</span><br><span class="line">				err = <span class="built_in">cn_printf</span>(cn, <span class="string">&quot;%d&quot;</span>,</span><br><span class="line">					      <span class="built_in">task_tgid_vnr</span>(current));</span><br><span class="line">				<span class="keyword">break</span>;</span><br><span class="line">			...</span><br><span class="line">		&#125;</span><br><span class="line"></span><br><span class="line">		....</span><br><span class="line">	&#125;</span><br><span class="line"></span><br><span class="line">out:</span><br><span class="line">    ......</span><br><span class="line">	<span class="keyword">return</span> ispipe;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”</p>
+<h3 id="写入内存镜像"><a href="#写入内存镜像" class="headerlink" title="写入内存镜像"></a>写入内存镜像</h3><p>遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!<span class="built_in">dump_vma_snapshot</span>(&amp;cprm))</span><br><span class="line">		<span class="keyword">goto</span> close_fail;</span><br><span class="line"></span><br><span class="line">	<span class="built_in">file_start_write</span>(cprm.file);</span><br><span class="line">	core_dumped = binfmt-&gt;<span class="built_in">core_dump</span>(&amp;cprm);</span><br><span class="line">	<span class="keyword">if</span> (cprm.to_skip) &#123;</span><br><span class="line">		cprm.to_skip--;</span><br><span class="line">		<span class="built_in">dump_emit</span>(&amp;cprm, <span class="string">&quot;&quot;</span>, <span class="number">1</span>);</span><br><span class="line">	&#125;</span><br><span class="line">	<span class="built_in">file_end_write</span>(cprm.file);</span><br><span class="line">	<span class="built_in">free_vma_snapshot</span>(&amp;cprm);</span><br></pre></td></tr></table></figure>
+
+<h3 id="收尾"><a href="#收尾" class="headerlink" title="收尾"></a>收尾</h3><p>关闭一些文件,回收些资源</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (cprm.file)</span><br><span class="line"><span class="built_in">filp_close</span>(cprm.file, <span class="literal">NULL</span>);</span><br><span class="line"></span><br><span class="line"><span class="built_in">coredump_finish</span>(core_dumped);</span><br><span class="line"><span class="built_in">revert_creds</span>(old_cred);</span><br><span class="line"><span class="built_in">put_cred</span>(cred);</span><br></pre></td></tr></table></figure>
+
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>本文围绕 <strong>coredump 的生成与配置</strong> 展开，主要内容如下：</p>
+<ol>
+<li><p><strong>coredump 的本质</strong></p>
+<ul>
+<li>操作系统在进程异常退出时生成的内存镜像文件</li>
+<li>可用于 gdb 等工具还原程序当时的运行状态</li>
+</ul>
+</li>
+<li><p><strong>生成条件与限制</strong></p>
+<ul>
+<li>信号触发：SIGSEGV、SIGABRT、SIGBUS 等</li>
+<li>限制因素：<code>RLIMIT_CORE</code>、权限、文件系统、<code>core_pattern</code> 等</li>
+</ul>
+</li>
+<li><p><strong>配置方法</strong></p>
+<ul>
+<li>临时配置：<code>ulimit -c unlimited</code> + 修改 <code>/proc/sys/kernel/core_pattern</code></li>
+<li>长期配置：编辑 <code>/etc/security/limits.conf</code>、<code>/etc/sysctl.conf</code>，配合 systemd 保持生效</li>
+</ul>
+</li>
+<li><p><strong>内核实现</strong></p>
+<ul>
+<li><code>do_coredump()</code> 是核心函数</li>
+<li>负责检查限制、解析 core_pattern、最终写入 core 文件</li>
+<li>从源码角度验证了手册与实际操作的正确性</li>
+</ul>
+</li>
+</ol>
+
+    </div>
+
+    
+    
+    
+
+      <footer class="post-footer">
+          <div class="post-tags">
+              <a href="/tags/coredump/" rel="tag"># coredump</a>
+              <a href="/tags/linux/" rel="tag"># linux</a>
+              <a href="/tags/%E9%97%AE%E9%A2%98%E5%88%86%E6%9E%90/" rel="tag"># 问题分析</a>
+          </div>
+
+        
+
+
+        
+    <div class="post-nav">
+      <div class="post-nav-item">
+    <a href="/2025/08/26/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/" rel="prev" title="grpc实践之路:01.同步客户端的使用">
+      <i class="fa fa-chevron-left"></i> grpc实践之路:01.同步客户端的使用
+    </a></div>
+      <div class="post-nav-item"></div>
+    </div>
+      </footer>
+    
+  </article>
+  
+  
+  
+
+
+
+          </div>
+          
+
+<script>
+  window.addEventListener('tabs:register', () => {
+    let { activeClass } = CONFIG.comments;
+    if (CONFIG.comments.storage) {
+      activeClass = localStorage.getItem('comments_active') || activeClass;
+    }
+    if (activeClass) {
+      let activeTab = document.querySelector(`a[href="#comment-${activeClass}"]`);
+      if (activeTab) {
+        activeTab.click();
+      }
+    }
+  });
+  if (CONFIG.comments.storage) {
+    window.addEventListener('tabs:click', event => {
+      if (!event.target.matches('.tabs-comment .tab-content .tab-pane')) return;
+      let commentClass = event.target.classList[1];
+      localStorage.setItem('comments_active', commentClass);
+    });
+  }
+</script>
+
+        </div>
+          
+  
+  <div class="toggle sidebar-toggle">
+    <span class="toggle-line toggle-line-first"></span>
+    <span class="toggle-line toggle-line-middle"></span>
+    <span class="toggle-line toggle-line-last"></span>
+  </div>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <ul class="sidebar-nav motion-element">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <!--noindex-->
+      <div class="post-toc-wrap sidebar-panel">
+          <div class="post-toc motion-element"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%89%8D%E8%A8%80"><span class="nav-number">1.</span> <span class="nav-text">前言</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#coredump%E4%BB%8B%E7%BB%8D"><span class="nav-number">2.</span> <span class="nav-text">coredump介绍</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#coredump%E7%AE%80%E4%BB%8B"><span class="nav-number">2.1.</span> <span class="nav-text">coredump简介</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E4%BA%A7%E7%94%9Fcoredump%E7%94%9F%E6%88%90%E7%9A%84%E4%BF%A1%E5%8F%B7"><span class="nav-number">2.2.</span> <span class="nav-text">产生coredump生成的信号</span></a></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#coredump%E7%9A%84%E9%85%8D%E7%BD%AE"><span class="nav-number">3.</span> <span class="nav-text">coredump的配置</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#coredump%E7%94%9F%E6%88%90%E7%9A%84%E9%99%90%E5%88%B6"><span class="nav-number">3.1.</span> <span class="nav-text">coredump生成的限制</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%93%8D%E4%BD%9C%E6%AD%A5%E9%AA%A4"><span class="nav-number">3.2.</span> <span class="nav-text">操作步骤</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#%E4%B8%B4%E6%97%B6%E5%BC%80%E5%90%AF"><span class="nav-number">3.2.1.</span> <span class="nav-text">临时开启</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#%E9%95%BF%E4%B9%85%E5%BC%80%E5%90%AF"><span class="nav-number">3.2.2.</span> <span class="nav-text">长久开启</span></a></li></ol></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E9%85%8D%E5%A5%97%E7%9A%84%E8%84%9A%E6%9C%AC"><span class="nav-number">3.3.</span> <span class="nav-text">配套的脚本</span></a></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E7%9B%B8%E5%85%B3%E9%83%A8%E5%88%86%E7%9A%84%E9%83%A8%E5%88%86%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E8%A7%A3%E8%AF%BB"><span class="nav-number">4.</span> <span class="nav-text">相关部分的部分内核源码解读</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%88%9D%E5%A7%8B%E5%8C%96%E5%8F%82%E6%95%B0"><span class="nav-number">4.1.</span> <span class="nav-text">初始化参数</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%AE%80%E5%8D%95%E7%9A%84%E6%A3%80%E6%9F%A5"><span class="nav-number">4.2.</span> <span class="nav-text">简单的检查</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E8%BE%93%E5%87%BA%E6%96%B9%E5%BC%8F%E7%9A%84%E5%86%B3%E5%AE%9A"><span class="nav-number">4.3.</span> <span class="nav-text">输出方式的决定</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%86%99%E5%85%A5%E5%86%85%E5%AD%98%E9%95%9C%E5%83%8F"><span class="nav-number">4.4.</span> <span class="nav-text">写入内存镜像</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%94%B6%E5%B0%BE"><span class="nav-number">4.5.</span> <span class="nav-text">收尾</span></a></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E6%80%BB%E7%BB%93"><span class="nav-number">5.</span> <span class="nav-text">总结</span></a></li></ol></div>
+      </div>
+      <!--/noindex-->
+
+      <div class="site-overview-wrap sidebar-panel">
+        <div class="site-author motion-element" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="ToBrightMoon"
+      src="/images/avatar.png">
+  <p class="site-author-name" itemprop="name">ToBrightMoon</p>
+  <div class="site-description" itemprop="description">记录我的开发与成长，分享 C++ 和源码分析</div>
+</div>
+<div class="site-state-wrap motion-element">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+          <a href="/archives/">
+        
+          <span class="site-state-item-count">18</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+            <a href="/categories/">
+          
+        <span class="site-state-item-count">7</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+            <a href="/tags/">
+          
+        <span class="site-state-item-count">10</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author motion-element">
+      <span class="links-of-author-item">
+        <a href="https://github.com/ToBrightmoon" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;ToBrightmoon" rel="noopener" target="_blank"><i class="fab fa-github fa-fw"></i></a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="https://www.zhihu.com/people/meng-zhong-ren-5-90" title="知乎 → https:&#x2F;&#x2F;www.zhihu.com&#x2F;people&#x2F;meng-zhong-ren-5-90" rel="noopener" target="_blank"><i class="fa-custom zhihu fa-fw"></i></a>
+      </span>
+  </div>
+
+
+
+      </div>
+
+    </div>
+  </aside>
+  <div id="sidebar-dimmer"></div>
+
+
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        
+
+        
+
+<div class="copyright">
+  
+  &copy; 
+  <span itemprop="copyrightYear">2025</span>
+  <span class="with-love">
+    <i class="fa fa-heart"></i>
+  </span>
+  <span class="author" itemprop="copyrightHolder">ToBrightMoon</span>
+</div>
+  <div class="powered-by">由 <a href="https://hexo.io/" class="theme-link" rel="noopener" target="_blank">Hexo</a> & <a href="https://theme-next.org/" class="theme-link" rel="noopener" target="_blank">NexT.Gemini</a> 强力驱动
+  </div>
+
+        
+
+
+
+
+
+
+
+
+      </div>
+    </footer>
+  </div>
+
+  
+  <script src="/lib/anime.min.js"></script>
+  <script src="/lib/velocity/velocity.min.js"></script>
+  <script src="/lib/velocity/velocity.ui.min.js"></script>
+
+<script src="/js/utils.js"></script>
+
+<script src="/js/motion.js"></script>
+
+
+<script src="/js/schemes/pisces.js"></script>
+
+
+<script src="/js/next-boot.js"></script>
+
+
+
+
+  
+
+
+
+
+  
+<script src="/js/local-search.js"></script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+</body>
+</html>

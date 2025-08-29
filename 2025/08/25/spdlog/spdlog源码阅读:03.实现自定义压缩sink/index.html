@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<meta name="theme-color" content="#222">
+<meta name="generator" content="Hexo 7.3.0">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Lora:300,300italic,400,400italic,700,700italic|Roboto:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+<link rel="stylesheet" href="/lib/font-awesome/css/all.min.css">
+
+<script id="hexo-configurations">
+    var NexT = window.NexT || {};
+    var CONFIG = {"hostname":"tobrightmoon.github.io","root":"/","scheme":"Gemini","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"always","padding":20,"offset":12,"onmobile":true},"copycode":{"enable":true,"show_result":true,"style":"mac"},"back2top":{"enable":true,"sidebar":false,"scrollpercent":true},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}},"path":"search.xml"};
+  </script>
+
+  <meta name="description" content="引言spdlog 是一个功能强大且高度可扩展的 C++ 日志库，其模块化设计允许开发者通过自定义 sink 实现灵活的日志输出。在前两篇文章中，我们分析了 spdlog 的异步日志机制以及 daily_file_sink 和 rotating_file_sink 的实现。本文将聚焦于 如何在 spdlog 中实现自定义 sink，以 compressed_file_sink 为例，详细讲解如何利用">
+<meta property="og:type" content="article">
+<meta property="og:title" content="spdlog源码阅读:03.实现自定义压缩sink">
+<meta property="og:url" content="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/index.html">
+<meta property="og:site_name" content="ToBrightMoon 的个人博客">
+<meta property="og:description" content="引言spdlog 是一个功能强大且高度可扩展的 C++ 日志库，其模块化设计允许开发者通过自定义 sink 实现灵活的日志输出。在前两篇文章中，我们分析了 spdlog 的异步日志机制以及 daily_file_sink 和 rotating_file_sink 的实现。本文将聚焦于 如何在 spdlog 中实现自定义 sink，以 compressed_file_sink 为例，详细讲解如何利用">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://tobrightmoon.github.io/images/spdlog_sink_compress.png">
+<meta property="article:published_time" content="2025-08-25T16:00:00.000Z">
+<meta property="article:modified_time" content="2025-08-29T02:18:47.659Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="C++">
+<meta property="article:tag" content="spdlog">
+<meta property="article:tag" content="日志系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://tobrightmoon.github.io/images/spdlog_sink_compress.png">
+
+<link rel="canonical" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/">
+
+
+<script id="page-configurations">
+  // https://hexo.io/docs/variables.html
+  CONFIG.page = {
+    sidebar: "",
+    isHome : false,
+    isPost : true,
+    lang   : 'zh-CN'
+  };
+</script>
+
+  <title>spdlog源码阅读:03.实现自定义压缩sink | ToBrightMoon 的个人博客</title>
+  
+
+
+
+
+
+
+  <noscript>
+  <style>
+  .use-motion .brand,
+  .use-motion .menu-item,
+  .sidebar-inner,
+  .use-motion .post-block,
+  .use-motion .pagination,
+  .use-motion .comments,
+  .use-motion .post-header,
+  .use-motion .post-body,
+  .use-motion .collection-header { opacity: initial; }
+
+  .use-motion .site-title,
+  .use-motion .site-subtitle {
+    opacity: initial;
+    top: initial;
+  }
+
+  .use-motion .logo-line-before i { left: initial; }
+  .use-motion .logo-line-after i { right: initial; }
+  </style>
+</noscript>
+
+</head>
+
+<body itemscope itemtype="http://schema.org/WebPage">
+  <div class="container use-motion">
+    <div class="headband"></div>
+
+    <header class="header" itemscope itemtype="http://schema.org/WPHeader">
+      <div class="header-inner"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏">
+      <span class="toggle-line toggle-line-first"></span>
+      <span class="toggle-line toggle-line-middle"></span>
+      <span class="toggle-line toggle-line-last"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <span class="logo-line-before"><i></i></span>
+      <h1 class="site-title">ToBrightMoon 的个人博客</h1>
+      <span class="logo-line-after"><i></i></span>
+    </a>
+      <p class="site-subtitle" itemprop="description">探索代码的奥秘</p>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+
+<nav class="site-nav">
+  <ul id="menu" class="main-menu menu">
+        <li class="menu-item menu-item-home">
+
+    <a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a>
+
+  </li>
+        <li class="menu-item menu-item-tags">
+
+    <a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a>
+
+  </li>
+        <li class="menu-item menu-item-categories">
+
+    <a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a>
+
+  </li>
+        <li class="menu-item menu-item-archives">
+
+    <a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a>
+
+  </li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup">
+        <div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div id="search-result">
+  <div id="no-result">
+    <i class="fa fa-spinner fa-pulse fa-5x fa-fw"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</div>
+    </header>
+
+    
+  <div class="back-to-top">
+    <i class="fa fa-arrow-up"></i>
+    <span>0%</span>
+  </div>
+  <div class="reading-progress-bar"></div>
+
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="content-wrap">
+          
+
+          <div class="content post posts-expand">
+            
+
+    
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h1 class="post-title" itemprop="name headline">
+          spdlog源码阅读:03.实现自定义压缩sink
+        </h1>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+        <h1 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h1><p>spdlog 是一个功能强大且高度可扩展的 C++ 日志库，其模块化设计允许开发者通过自定义 sink 实现灵活的日志输出。在前两篇文章中，我们分析了 spdlog 的异步日志机制以及 <code>daily_file_sink</code> 和 <code>rotating_file_sink</code> 的实现。本文将聚焦于 <strong>如何在 spdlog 中实现自定义 sink</strong>，以 <code>compressed_file_sink</code> 为例，详细讲解如何利用 zlib 库实现日志压缩功能，减少磁盘空间占用。</p>
+<p>通过本文，你将学会：</p>
+<ul>
+<li>spdlog 中自定义 sink 的实现步骤。</li>
+<li><code>compressed_file_sink</code> 如何通过 zlib 实现日志压缩。</li>
+<li>自定义 sink 的关键设计要点和注意事项。</li>
+</ul>
+<p><strong>注：本文分析的源码基于 spdlog v1.15.1 和提供的 <code>compressed_file_sink</code> 实现。</strong></p>
+<span id="more"></span>
+<h1 id="spdlog-中自定义-sink-的实现方法"><a href="#spdlog-中自定义-sink-的实现方法" class="headerlink" title="spdlog 中自定义 sink 的实现方法"></a>spdlog 中自定义 sink 的实现方法</h1><p>spdlog 的 sink 机制是其扩展性的核心。所有 sink 都继承自 <code>base_sink</code> 模板类，通过实现两个关键虚函数 <code>sink_it_</code> 和 <code>flush_</code>，即可定义日志的输出逻辑。以下是实现自定义 sink 的通用步骤：</p>
+<ol>
+<li><strong>继承 base_sink</strong>：创建一个新类，继承 <code>base_sink&lt;Mutex&gt;</code>，选择合适的互斥锁（如 <code>std::mutex</code> 用于多线程，<code>null_mutex</code> 用于单线程）。</li>
+<li>**实现 sink_it_**：定义日志消息的处理逻辑，如格式化、加工或输出到目标（如文件、网络）。</li>
+<li>**实现 flush_**：确保缓冲区数据被刷新到目标，完成输出。</li>
+<li><strong>管理资源</strong>：在构造函数中初始化资源（如文件句柄、缓冲区），在析构函数中清理。</li>
+<li><strong>提供工厂函数</strong>：为多线程和单线程模式定义便捷的创建函数（如 <code>compressed_file_logger_mt/st</code>）。</li>
+</ol>
+<p><code>compressed_file_sink</code> 遵循上述步骤，通过集成 zlib 库实现了压缩日志的输出，下面我们以其为案例进行深入分析。</p>
+<h1 id="compressed-file-sink-实现解析"><a href="#compressed-file-sink-实现解析" class="headerlink" title="compressed_file_sink 实现解析"></a>compressed_file_sink 实现解析</h1><p><code>compressed_file_sink</code> 是一个自定义 sink，通过缓冲日志消息、利用 zlib 压缩数据并写入文件，实现高效的日志存储。以下从 demo 入手，逐步剖析其实现原理。</p>
+<h2 id="使用-demo"><a href="#使用-demo" class="headerlink" title="使用 demo"></a>使用 demo</h2><p>以下是一个简单的 <code>compressed_file_sink</code> 使用示例：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;spdlog/spdlog.h&quot;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;compressed_file_sink.h&quot;</span></span></span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">compressed_file_example</span><span class="params">()</span> </span>&#123;</span><br><span class="line">    <span class="keyword">auto</span> compressed_logger = spdlog::<span class="built_in">compressed_file_logger_mt</span>(<span class="string">&quot;compressed_logger&quot;</span>, <span class="string">&quot;logs/compressed_log.z&quot;</span>, <span class="number">8192</span>, Z_DEFAULT_COMPRESSION);</span><br><span class="line">    compressed_logger-&gt;<span class="built_in">info</span>(<span class="string">&quot;This is a compressed log message.&quot;</span>);</span><br><span class="line">    compressed_logger-&gt;<span class="built_in">flush</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>在这个 demo 中，我们创建了一个多线程的压缩日志 logger，日志消息通过 <code>compressed_file_sink</code> 压缩后写入 <code>logs/compressed_log.z</code> 文件。</p>
+<h2 id="日志消息流转与压缩实现"><a href="#日志消息流转与压缩实现" class="headerlink" title="日志消息流转与压缩实现"></a>日志消息流转与压缩实现</h2><p>以 <code>info(&quot;This is a compressed log message.&quot;)</code> 为例，分析日志消息的处理流程，重点讲解压缩逻辑。</p>
+<h3 id="日志生产"><a href="#日志生产" class="headerlink" title="日志生产"></a>日志生产</h3><ol>
+<li><strong>调用 info 方法</strong>：<ul>
+<li>用户调用 <code>logger-&gt;info</code>，触发模板函数，最终调用 <code>base_sink</code> 的 <code>log</code> 方法，执行 <code>sink_it_</code> 虚函数。</li>
+<li>在 <code>compressed_file_sink::sink_it_</code> 中，日志消息被格式化并追加到内部缓冲区。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">sink_it_</span><span class="params">(<span class="type">const</span> details::log_msg &amp;msg)</span> <span class="keyword">override</span> </span>&#123;</span><br><span class="line">    <span class="type">memory_buf_t</span> formatted;</span><br><span class="line">    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);</span><br><span class="line">    buffer_.<span class="built_in">append</span>(formatted.<span class="built_in">data</span>(), formatted.<span class="built_in">data</span>() + formatted.<span class="built_in">size</span>());</span><br><span class="line">    <span class="keyword">if</span> (buffer_.<span class="built_in">size</span>() &gt;= buffer_capacity_) &#123;</span><br><span class="line">        <span class="built_in">compress_and_write_</span>();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<ol start="2">
+<li><strong>缓冲管理</strong>：<ul>
+<li>格式化后的日志消息存储在 <code>buffer_</code>（类型为 <code>memory_buf_t</code>）。</li>
+<li>当 <code>buffer_</code> 大小达到 <code>buffer_capacity_</code>（默认 8192 字节）时，调用 <code>compress_and_write_</code> 进行压缩和写入。</li>
+</ul>
+</li>
+</ol>
+<h3 id="日志压缩与写入"><a href="#日志压缩与写入" class="headerlink" title="日志压缩与写入"></a>日志压缩与写入</h3><p><code>compress_and_write_</code> 是压缩功能的核心，结合 zlib 库完成数据压缩并写入文件。以下是其实现步骤：</p>
+<ol>
+<li><strong>初始化 zlib 输入</strong>：<ul>
+<li>将 <code>buffer_</code> 的数据传递给 zlib 压缩流 <code>strm_</code>，设置输入指针（<code>next_in</code>）和长度（<code>avail_in</code>）。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">strm_.avail_in = <span class="built_in">static_cast</span>&lt;uInt&gt;(buffer_.<span class="built_in">size</span>());</span><br><span class="line">strm_.next_in = <span class="built_in">reinterpret_cast</span>&lt;Bytef *&gt;(<span class="built_in">const_cast</span>&lt;<span class="type">char</span> *&gt;(buffer_.<span class="built_in">data</span>()));</span><br></pre></td></tr></table></figure>
+
+<ol start="2">
+<li><strong>逐步压缩（Z_NO_FLUSH）</strong>：<ul>
+<li>使用 <code>deflate</code> 函数以 <code>Z_NO_FLUSH</code> 模式分步处理输入数据，输出到临时缓冲区 <code>compress_buffer_</code>（类型为 <code>std::vector&lt;unsigned char&gt;</code>）。</li>
+<li>循环调用 <code>deflate</code> 直到所有输入数据被消耗，收集压缩输出到 <code>compressed_output</code>。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">do</span> &#123;</span><br><span class="line">    strm_.avail_out = <span class="built_in">static_cast</span>&lt;uInt&gt;(compress_buffer_.<span class="built_in">size</span>());</span><br><span class="line">    strm_.next_out = compress_buffer_.<span class="built_in">data</span>();</span><br><span class="line">    deflate_ret = <span class="built_in">deflate</span>(&amp;strm_, Z_NO_FLUSH);</span><br><span class="line">    <span class="type">size_t</span> have = compress_buffer_.<span class="built_in">size</span>() - strm_.avail_out;</span><br><span class="line">    <span class="keyword">if</span> (have &gt; <span class="number">0</span>) &#123;</span><br><span class="line">        compressed_output.<span class="built_in">insert</span>(compressed_output.<span class="built_in">end</span>(), compress_buffer_.<span class="built_in">data</span>(), compress_buffer_.<span class="built_in">data</span>() + have);</span><br><span class="line">    &#125;</span><br><span class="line">&#125; <span class="keyword">while</span> (strm_.avail_out == <span class="number">0</span> &amp;&amp; strm_.avail_in &gt; <span class="number">0</span>);</span><br></pre></td></tr></table></figure>
+
+<ol start="3">
+<li><strong>结束压缩（Z_FINISH）</strong>：<ul>
+<li>使用 <code>Z_FINISH</code> 模式完成当前压缩块，生成完整的压缩数据。</li>
+<li>继续调用 <code>deflate</code> 直到返回 <code>Z_STREAM_END</code>，确保所有输出被收集。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">do</span> &#123;</span><br><span class="line">    strm_.avail_out = <span class="built_in">static_cast</span>&lt;uInt&gt;(compress_buffer_.<span class="built_in">size</span>());</span><br><span class="line">    strm_.next_out = compress_buffer_.<span class="built_in">data</span>();</span><br><span class="line">    finish_ret = <span class="built_in">deflate</span>(&amp;strm_, Z_FINISH);</span><br><span class="line">    <span class="type">size_t</span> have = compress_buffer_.<span class="built_in">size</span>() - strm_.avail_out;</span><br><span class="line">    <span class="keyword">if</span> (have &gt; <span class="number">0</span>) &#123;</span><br><span class="line">        compressed_output.<span class="built_in">insert</span>(compressed_output.<span class="built_in">end</span>(), compress_buffer_.<span class="built_in">data</span>(), compress_buffer_.<span class="built_in">data</span>() + have);</span><br><span class="line">    &#125;</span><br><span class="line">&#125; <span class="keyword">while</span> (finish_ret != Z_STREAM_END);</span><br></pre></td></tr></table></figure>
+
+<ol start="4">
+<li><strong>写入文件</strong>：<ul>
+<li>压缩数据存储在 <code>compressed_output</code> 中。</li>
+<li>首先写入 4 字节的压缩块长度（<code>uint32_t</code>），便于解压时解析。</li>
+<li>然后写入压缩数据，使用 <code>file_helper_.write</code> 完成文件 IO。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">uint32_t</span> compressed_size = <span class="built_in">static_cast</span>&lt;<span class="type">uint32_t</span>&gt;(compressed_output.<span class="built_in">size</span>());</span><br><span class="line"><span class="keyword">if</span> (compressed_size &gt; <span class="number">0</span>) &#123;</span><br><span class="line">    <span class="type">memory_buf_t</span> size_buf;</span><br><span class="line">    size_buf.<span class="built_in">append</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(&amp;compressed_size), </span><br><span class="line">                    <span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(&amp;compressed_size) + <span class="built_in">sizeof</span>(compressed_size));</span><br><span class="line">    file_helper_.<span class="built_in">write</span>(size_buf);</span><br><span class="line">    <span class="type">memory_buf_t</span> data_buf;</span><br><span class="line">    data_buf.<span class="built_in">append</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(compressed_output.<span class="built_in">data</span>()), </span><br><span class="line">                    <span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(compressed_output.<span class="built_in">data</span>()) + compressed_output.<span class="built_in">size</span>());</span><br><span class="line">    file_helper_.<span class="built_in">write</span>(data_buf);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<ol start="5">
+<li><strong>重置与清理</strong>：<ul>
+<li>通过 <code>deflateReset</code> 重置 zlib 流，为下一块压缩准备。</li>
+<li>清空 <code>buffer_</code>，等待新的日志消息。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">deflateReset</span>(&amp;strm_);</span><br><span class="line">buffer_.<span class="built_in">clear</span>();</span><br></pre></td></tr></table></figure>
+
+<h3 id="刷新与资源管理"><a href="#刷新与资源管理" class="headerlink" title="刷新与资源管理"></a>刷新与资源管理</h3><ol>
+<li><strong>刷新缓冲区</strong>：<ul>
+<li>用户调用 <code>logger-&gt;flush()</code> 触发 <code>flush_</code> 方法，调用 <code>compress_and_write_</code> 压缩剩余数据，并通过 <code>file_helper_.flush()</code> 确保写入磁盘。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">flush_</span><span class="params">()</span> <span class="keyword">override</span> </span>&#123;</span><br><span class="line">    <span class="built_in">compress_and_write_</span>();</span><br><span class="line">    file_helper_.<span class="built_in">flush</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<ol start="2">
+<li><strong>资源初始化与清理</strong>：<ul>
+<li><strong>构造函数</strong>：初始化 zlib 流（<code>deflateInit</code>）、打开文件（<code>file_helper_.open</code>）、预分配缓冲区（<code>buffer_</code> 和 <code>compress_buffer_</code>）。</li>
+<li><strong>析构函数</strong>：刷新缓冲区、释放 zlib 资源（<code>deflateEnd</code>），<code>file_helper_</code> 自动关闭文件。</li>
+</ul>
+</li>
+</ol>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">explicit</span> <span class="title">compressed_file_sink</span><span class="params">(<span class="type">const</span> <span class="type">filename_t</span> &amp;filename, <span class="type">size_t</span> buffer_capacity = <span class="number">8192</span>,</span></span></span><br><span class="line"><span class="params"><span class="function">                              <span class="type">int</span> compression_level = Z_DEFAULT_COMPRESSION)</span> </span>&#123;</span><br><span class="line">    strm_.zalloc = Z_NULL;</span><br><span class="line">    strm_.zfree = Z_NULL;</span><br><span class="line">    strm_.opaque = Z_NULL;</span><br><span class="line">    <span class="type">int</span> ret = <span class="built_in">deflateInit</span>(&amp;strm_, compression_level_);</span><br><span class="line">    <span class="keyword">if</span> (ret != Z_OK) <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;Failed to initialize zlib deflate&quot;</span>, ret);</span><br><span class="line">    file_helper_.<span class="built_in">open</span>(filename_, <span class="literal">false</span>);</span><br><span class="line">    buffer_.<span class="built_in">reserve</span>(buffer_capacity_);</span><br><span class="line">    compress_buffer_.<span class="built_in">resize</span>(buffer_capacity_);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">~<span class="built_in">compressed_file_sink</span>() <span class="keyword">override</span> &#123;</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="function">std::lock_guard&lt;Mutex&gt; <span class="title">lock</span><span class="params">(base_sink&lt;Mutex&gt;::mutex_)</span></span>;</span><br><span class="line">        <span class="built_in">flush_</span>();</span><br><span class="line">        <span class="built_in">deflateEnd</span>(&amp;strm_);</span><br><span class="line">    &#125; <span class="built_in">catch</span> (...) &#123;&#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h2 id="关键类与设计"><a href="#关键类与设计" class="headerlink" title="关键类与设计"></a>关键类与设计</h2><h3 id="类层次结构"><a href="#类层次结构" class="headerlink" title="类层次结构"></a>类层次结构</h3><p><code>compressed_file_sink</code> 的设计充分利用了 spdlog 的模块化架构，以下是关键类关系：</p>
+<ul>
+<li><strong>base_sink</strong>：提供日志格式化和线程安全的基础功能，定义 <code>sink_it_</code> 和 <code>flush_</code> 接口。</li>
+<li><strong>compressed_file_sink</strong>：继承 <code>base_sink</code>，实现压缩逻辑，管理 zlib 流和缓冲区。</li>
+<li><strong>file_helper</strong>：封装文件操作，负责打开、写入和刷新。</li>
+<li><strong>formatter</strong>：格式化日志消息。</li>
+</ul>
+<p>类图如下：<br><img src="/images/spdlog_sink_compress.png" alt="spdlog_sink_compress.png"></p>
+<h1 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h1><p>通过分析 <code>compressed_file_sink</code>，我们深入理解了 spdlog 中自定义 sink 的实现方法。<code>compressed_file_sink</code> 利用 zlib 库，通过缓冲、分块压缩和长度前缀的机制，实现了高效的日志压缩功能。</p>
+<p>未来可探索以下方向：</p>
+<ul>
+<li>结合 <code>daily_file_sink</code>，实现按天分割的压缩日志。</li>
+<li>尝试其他压缩库（如 zstd），提升压缩速度或比率。</li>
+</ul>
+<p>希望本文能为你提供清晰的自定义 sink 实现指南！如需进一步探讨或优化建议，欢迎随时交流。</p>
+<p>#附：完整压缩源码和压缩日志读取器</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br><span class="line">92</span><br><span class="line">93</span><br><span class="line">94</span><br><span class="line">95</span><br><span class="line">96</span><br><span class="line">97</span><br><span class="line">98</span><br><span class="line">99</span><br><span class="line">100</span><br><span class="line">101</span><br><span class="line">102</span><br><span class="line">103</span><br><span class="line">104</span><br><span class="line">105</span><br><span class="line">106</span><br><span class="line">107</span><br><span class="line">108</span><br><span class="line">109</span><br><span class="line">110</span><br><span class="line">111</span><br><span class="line">112</span><br><span class="line">113</span><br><span class="line">114</span><br><span class="line">115</span><br><span class="line">116</span><br><span class="line">117</span><br><span class="line">118</span><br><span class="line">119</span><br><span class="line">120</span><br><span class="line">121</span><br><span class="line">122</span><br><span class="line">123</span><br><span class="line">124</span><br><span class="line">125</span><br><span class="line">126</span><br><span class="line">127</span><br><span class="line">128</span><br><span class="line">129</span><br><span class="line">130</span><br><span class="line">131</span><br><span class="line">132</span><br><span class="line">133</span><br><span class="line">134</span><br><span class="line">135</span><br><span class="line">136</span><br><span class="line">137</span><br><span class="line">138</span><br><span class="line">139</span><br><span class="line">140</span><br><span class="line">141</span><br><span class="line">142</span><br><span class="line">143</span><br><span class="line">144</span><br><span class="line">145</span><br><span class="line">146</span><br><span class="line">147</span><br><span class="line">148</span><br><span class="line">149</span><br><span class="line">150</span><br><span class="line">151</span><br><span class="line">152</span><br><span class="line">153</span><br><span class="line">154</span><br><span class="line">155</span><br><span class="line">156</span><br><span class="line">157</span><br><span class="line">158</span><br><span class="line">159</span><br><span class="line">160</span><br><span class="line">161</span><br><span class="line">162</span><br><span class="line">163</span><br><span class="line">164</span><br><span class="line">165</span><br><span class="line">166</span><br><span class="line">167</span><br><span class="line">168</span><br><span class="line">169</span><br><span class="line">170</span><br><span class="line">171</span><br><span class="line">172</span><br><span class="line">173</span><br><span class="line">174</span><br><span class="line">175</span><br><span class="line">176</span><br><span class="line">177</span><br><span class="line">178</span><br><span class="line">179</span><br><span class="line">180</span><br><span class="line">181</span><br><span class="line">182</span><br><span class="line">183</span><br><span class="line">184</span><br><span class="line">185</span><br><span class="line">186</span><br><span class="line">187</span><br><span class="line">188</span><br><span class="line">189</span><br><span class="line">190</span><br><span class="line">191</span><br><span class="line">192</span><br><span class="line">193</span><br><span class="line">194</span><br><span class="line">195</span><br><span class="line">196</span><br><span class="line">197</span><br><span class="line">198</span><br><span class="line">199</span><br><span class="line">200</span><br><span class="line">201</span><br><span class="line">202</span><br><span class="line">203</span><br><span class="line">204</span><br><span class="line">205</span><br><span class="line">206</span><br><span class="line">207</span><br><span class="line">208</span><br><span class="line">209</span><br><span class="line">210</span><br><span class="line">211</span><br><span class="line">212</span><br><span class="line">213</span><br><span class="line">214</span><br><span class="line">215</span><br><span class="line">216</span><br><span class="line">217</span><br><span class="line">218</span><br><span class="line">219</span><br><span class="line">220</span><br><span class="line">221</span><br><span class="line">222</span><br><span class="line">223</span><br><span class="line">224</span><br><span class="line">225</span><br><span class="line">226</span><br><span class="line">227</span><br><span class="line">228</span><br><span class="line">229</span><br><span class="line">230</span><br><span class="line">231</span><br><span class="line">232</span><br><span class="line">233</span><br><span class="line">234</span><br><span class="line">235</span><br><span class="line">236</span><br><span class="line">237</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">pragma</span> once</span></span><br><span class="line"></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/common.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/sinks/base_sink.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/details/file_helper.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/details/null_mutex.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/details/synchronous_factory.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;spdlog/fmt/fmt.h&gt;</span></span></span><br><span class="line"></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;zlib.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;string&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;mutex&gt;</span></span></span><br><span class="line"></span><br><span class="line"><span class="keyword">namespace</span> spdlog</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">namespace</span> sinks</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="comment">// 自定义压缩文件 Sink (使用 file_helper)</span></span><br><span class="line">        <span class="keyword">template</span>&lt;<span class="keyword">typename</span> Mutex&gt;</span><br><span class="line">        <span class="keyword">class</span> <span class="title class_">compressed_file_sink</span> : <span class="keyword">public</span> base_sink&lt;Mutex&gt;</span><br><span class="line">        &#123;</span><br><span class="line">        <span class="keyword">public</span>:</span><br><span class="line">            <span class="comment">// 构造函数</span></span><br><span class="line">            <span class="function"><span class="keyword">explicit</span> <span class="title">compressed_file_sink</span><span class="params">(<span class="type">const</span> <span class="type">filename_t</span> &amp;filename, <span class="type">size_t</span> buffer_capacity = <span class="number">8192</span>,</span></span></span><br><span class="line"><span class="params"><span class="function">                                          <span class="type">int</span> compression_level = Z_DEFAULT_COMPRESSION)</span></span></span><br><span class="line"><span class="function">                : filename_(filename), buffer_capacity_(buffer_capacity), compression_level_(compression_level)</span></span><br><span class="line"><span class="function">            &#123;</span></span><br><span class="line">                <span class="comment">// 初始化 zlib 压缩流</span></span><br><span class="line">                strm_.zalloc = Z_NULL;</span><br><span class="line">                strm_.zfree = Z_NULL;</span><br><span class="line">                strm_.opaque = Z_NULL;</span><br><span class="line">                <span class="type">int</span> ret = <span class="built_in">deflateInit</span>(&amp;strm_, compression_level_);</span><br><span class="line">                <span class="keyword">if</span> (ret != Z_OK)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;Failed to initialize zlib deflate&quot;</span>, ret);</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 使用 file_helper 打开文件 (false 表示不截断，实现追加效果)</span></span><br><span class="line">                <span class="keyword">try</span></span><br><span class="line">                &#123;</span><br><span class="line">                    file_helper_.<span class="built_in">open</span>(filename_, <span class="literal">false</span>);</span><br><span class="line">                &#125; <span class="built_in">catch</span> (<span class="type">const</span> spdlog_ex &amp;ex)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="built_in">deflateEnd</span>(&amp;strm_); <span class="comment">// 清理 zlib 资源</span></span><br><span class="line">                    <span class="keyword">throw</span> ex; <span class="comment">// 重新抛出文件打开异常</span></span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">                <span class="comment">// 预分配缓冲区 (使用 spdlog::memory_buf_t)</span></span><br><span class="line">                buffer_.<span class="built_in">reserve</span>(buffer_capacity_);</span><br><span class="line">                compress_buffer_.<span class="built_in">resize</span>(buffer_capacity_); <span class="comment">// 初始压缩缓冲区大小 (保持 vector&lt;unsigned char&gt; 以便与 zlib C API 交互)</span></span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 析构函数：确保所有缓冲数据被压缩和写入</span></span><br><span class="line">            ~<span class="built_in">compressed_file_sink</span>() <span class="keyword">override</span></span><br><span class="line">            &#123;</span><br><span class="line">                <span class="keyword">try</span></span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="comment">// 获取锁以安全地刷新</span></span><br><span class="line">                    <span class="function">std::lock_guard&lt;Mutex&gt; <span class="title">lock</span><span class="params">(base_sink&lt;Mutex&gt;::mutex_)</span></span>;</span><br><span class="line">                    <span class="built_in">flush_</span>(); <span class="comment">// 刷新剩余缓冲区</span></span><br><span class="line">                    <span class="built_in">deflateEnd</span>(&amp;strm_); <span class="comment">// 清理 zlib 资源</span></span><br><span class="line">                    <span class="comment">// file_helper 会在析构时自动关闭文件，无需显式调用 close()</span></span><br><span class="line">                &#125; <span class="built_in">catch</span> (...)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="comment">// 析构函数中不应抛出异常</span></span><br><span class="line">                &#125;</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            <span class="built_in">compressed_file_sink</span>(<span class="type">const</span> compressed_file_sink &amp;) = <span class="keyword">delete</span>;</span><br><span class="line"></span><br><span class="line">            compressed_file_sink &amp;<span class="keyword">operator</span>=(<span class="type">const</span> compressed_file_sink &amp;) = <span class="keyword">delete</span>;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">protected</span>:</span><br><span class="line">            <span class="comment">// 核心日志记录方法</span></span><br><span class="line">            <span class="function"><span class="type">void</span> <span class="title">sink_it_</span><span class="params">(<span class="type">const</span> details::log_msg &amp;msg)</span> <span class="keyword">override</span></span></span><br><span class="line"><span class="function">            </span>&#123;</span><br><span class="line">                <span class="type">memory_buf_t</span> formatted;</span><br><span class="line">                base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 将格式化后的消息追加到内部缓冲区 buffer_</span></span><br><span class="line">                buffer_.<span class="built_in">append</span>(formatted.<span class="built_in">data</span>(), formatted.<span class="built_in">data</span>() + formatted.<span class="built_in">size</span>());</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 如果缓冲区达到阈值，则压缩并写入文件</span></span><br><span class="line">                <span class="keyword">if</span> (buffer_.<span class="built_in">size</span>() &gt;= buffer_capacity_)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="built_in">compress_and_write_</span>();</span><br><span class="line">                &#125;</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 强制刷新缓冲区</span></span><br><span class="line">            <span class="function"><span class="type">void</span> <span class="title">flush_</span><span class="params">()</span> <span class="keyword">override</span></span></span><br><span class="line"><span class="function">            </span>&#123;</span><br><span class="line">                <span class="built_in">compress_and_write_</span>();</span><br><span class="line">                file_helper_.<span class="built_in">flush</span>(); <span class="comment">// 刷新 file_helper 的缓冲区</span></span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">private</span>:</span><br><span class="line">            <span class="comment">// private:</span></span><br><span class="line">            <span class="function"><span class="type">void</span> <span class="title">compress_and_write_</span><span class="params">()</span></span></span><br><span class="line"><span class="function">            </span>&#123;</span><br><span class="line">                <span class="keyword">if</span> (buffer_.<span class="built_in">size</span>() == <span class="number">0</span>)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="keyword">return</span>;</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line">                strm_.avail_in = <span class="built_in">static_cast</span>&lt;uInt&gt;(buffer_.<span class="built_in">size</span>());</span><br><span class="line">                strm_.next_in = <span class="built_in">reinterpret_cast</span>&lt;Bytef *&gt;(<span class="built_in">const_cast</span>&lt;<span class="type">char</span> *&gt;(buffer_.<span class="built_in">data</span>()));</span><br><span class="line"></span><br><span class="line">                std::vector&lt;<span class="type">unsigned</span> <span class="type">char</span>&gt; compressed_output;</span><br><span class="line">                <span class="type">int</span> deflate_ret = Z_OK;</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 缓冲区用于 deflate 的单次输出</span></span><br><span class="line">                <span class="comment">// 调整大小以更好地适应可能的压缩输出，可以根据需要调整</span></span><br><span class="line">                <span class="keyword">if</span> (compress_buffer_.<span class="built_in">size</span>() &lt; buffer_.<span class="built_in">size</span>() / <span class="number">2</span>)</span><br><span class="line">                &#123;</span><br><span class="line">                    compress_buffer_.<span class="built_in">resize</span>(buffer_.<span class="built_in">size</span>() / <span class="number">2</span> + <span class="number">128</span>); <span class="comment">// 简单策略：至少是输入一半+一些头部</span></span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">                <span class="comment">// ---- Step 1: 使用 Z_NO_FLUSH 消耗所有输入 ----</span></span><br><span class="line">                <span class="keyword">do</span></span><br><span class="line">                &#123;</span><br><span class="line">                    strm_.avail_out = <span class="built_in">static_cast</span>&lt;uInt&gt;(compress_buffer_.<span class="built_in">size</span>());</span><br><span class="line">                    strm_.next_out = compress_buffer_.<span class="built_in">data</span>();</span><br><span class="line"></span><br><span class="line">                    deflate_ret = <span class="built_in">deflate</span>(&amp;strm_, Z_NO_FLUSH); <span class="comment">// 先处理输入，不清空内部状态</span></span><br><span class="line"></span><br><span class="line">                    <span class="keyword">if</span> (deflate_ret != Z_OK &amp;&amp; deflate_ret != Z_BUF_ERROR)</span><br><span class="line">                    &#123;</span><br><span class="line">                        <span class="comment">// Z_STREAM_END 不应该在这里发生</span></span><br><span class="line">                        <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;zlib deflate(Z_NO_FLUSH) failed&quot;</span>, deflate_ret);</span><br><span class="line">                    &#125;</span><br><span class="line">                    <span class="type">size_t</span> have = compress_buffer_.<span class="built_in">size</span>() - strm_.avail_out;</span><br><span class="line">                    <span class="keyword">if</span> (have &gt; <span class="number">0</span>)</span><br><span class="line">                    &#123;</span><br><span class="line">                        compressed_output.<span class="built_in">insert</span>(compressed_output.<span class="built_in">end</span>(), compress_buffer_.<span class="built_in">data</span>(),</span><br><span class="line">                                                 compress_buffer_.<span class="built_in">data</span>() + have);</span><br><span class="line">                    &#125;</span><br><span class="line">                    <span class="comment">// 继续，直到输出缓冲区不再被填满（表示deflate可以处理更多输入，如果还有的话）</span></span><br><span class="line">                    <span class="comment">// 并且还有输入数据需要处理</span></span><br><span class="line">                &#125; <span class="keyword">while</span> (strm_.avail_out == <span class="number">0</span> &amp;&amp; strm_.avail_in &gt; <span class="number">0</span>);</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 此时，所有输入 (strm.avail_in) 应该已经被消耗，除非发生错误</span></span><br><span class="line">                <span class="keyword">if</span> (strm_.avail_in != <span class="number">0</span> &amp;&amp; deflate_ret != Z_BUF_ERROR)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="comment">// 如果还有输入但 deflate 没有要求更多输出空间，这不正常</span></span><br><span class="line">                    <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;zlib deflate did not consume all input unexpectedly&quot;</span>);</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">                <span class="comment">// ---- Step 2: 使用 Z_FINISH 结束当前流（块）并收集所有剩余输出 ----</span></span><br><span class="line">                <span class="type">int</span> finish_ret = Z_OK;</span><br><span class="line">                <span class="keyword">do</span></span><br><span class="line">                &#123;</span><br><span class="line">                    strm_.avail_out = <span class="built_in">static_cast</span>&lt;uInt&gt;(compress_buffer_.<span class="built_in">size</span>());</span><br><span class="line">                    strm_.next_out = compress_buffer_.<span class="built_in">data</span>();</span><br><span class="line"></span><br><span class="line">                    finish_ret = <span class="built_in">deflate</span>(&amp;strm_, Z_FINISH); <span class="comment">// 结束当前块/流</span></span><br><span class="line"></span><br><span class="line">                    <span class="comment">// Z_FINISH 可能会返回 Z_OK 或 Z_BUF_ERROR 多次，直到返回 Z_STREAM_END</span></span><br><span class="line">                    <span class="keyword">if</span> (finish_ret != Z_OK &amp;&amp; finish_ret != Z_STREAM_END &amp;&amp; finish_ret != Z_BUF_ERROR)</span><br><span class="line">                    &#123;</span><br><span class="line">                        <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;zlib deflate(Z_FINISH) failed&quot;</span>, finish_ret);</span><br><span class="line">                    &#125;</span><br><span class="line">                    <span class="type">size_t</span> have = compress_buffer_.<span class="built_in">size</span>() - strm_.avail_out;</span><br><span class="line">                    <span class="keyword">if</span> (have &gt; <span class="number">0</span>)</span><br><span class="line">                    &#123;</span><br><span class="line">                        compressed_output.<span class="built_in">insert</span>(compressed_output.<span class="built_in">end</span>(), compress_buffer_.<span class="built_in">data</span>(),</span><br><span class="line">                                                 compress_buffer_.<span class="built_in">data</span>() + have);</span><br><span class="line">                    &#125;</span><br><span class="line">                    <span class="comment">// 继续调用 Z_FINISH 直到它返回 Z_STREAM_END</span></span><br><span class="line">                &#125; <span class="keyword">while</span> (finish_ret != Z_STREAM_END);</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">                <span class="comment">// ---- Step 3: 写入文件 (与之前相同) ----</span></span><br><span class="line">                <span class="type">uint32_t</span> compressed_size = <span class="built_in">static_cast</span>&lt;<span class="type">uint32_t</span>&gt;(compressed_output.<span class="built_in">size</span>());</span><br><span class="line">                <span class="keyword">if</span> (compressed_size &gt; <span class="number">0</span>)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="type">memory_buf_t</span> size_buf;</span><br><span class="line">                    size_buf.<span class="built_in">append</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(&amp;compressed_size),</span><br><span class="line">                                    <span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(&amp;compressed_size) + <span class="built_in">sizeof</span>(compressed_size));</span><br><span class="line">                    file_helper_.<span class="built_in">write</span>(size_buf);</span><br><span class="line"></span><br><span class="line">                    <span class="type">memory_buf_t</span> data_buf;</span><br><span class="line">                    data_buf.<span class="built_in">append</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(compressed_output.<span class="built_in">data</span>()),</span><br><span class="line">                                    <span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(compressed_output.<span class="built_in">data</span>()) + compressed_output.</span><br><span class="line">                                    <span class="built_in">size</span>());</span><br><span class="line">                    file_helper_.<span class="built_in">write</span>(data_buf);</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line">                <span class="comment">// ---- Step 4: 重置 zlib 流，为下一个独立块做准备 ----</span></span><br><span class="line">                <span class="comment">// 因为我们使用了 Z_FINISH，流状态需要完全重置</span></span><br><span class="line">                <span class="type">int</span> reset_ret = <span class="built_in">deflateReset</span>(&amp;strm_);</span><br><span class="line">                <span class="keyword">if</span> (reset_ret != Z_OK)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="keyword">throw</span> <span class="built_in">spdlog_ex</span>(<span class="string">&quot;Failed to reset zlib deflate stream&quot;</span>, reset_ret);</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 清空内部缓冲区</span></span><br><span class="line">                buffer_.<span class="built_in">clear</span>();</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">            <span class="type">filename_t</span> filename_; <span class="comment">// 日志文件名</span></span><br><span class="line">            details::file_helper file_helper_; <span class="comment">// 使用 spdlog 的文件助手</span></span><br><span class="line">            <span class="type">memory_buf_t</span> buffer_; <span class="comment">// 未压缩数据的内部缓冲区 (使用 memory_buf_t)</span></span><br><span class="line">            <span class="type">size_t</span> buffer_capacity_; <span class="comment">// 内部缓冲区阈值</span></span><br><span class="line">            <span class="type">int</span> compression_level_; <span class="comment">// zlib 压缩级别</span></span><br><span class="line">            z_stream strm_; <span class="comment">// zlib 压缩流</span></span><br><span class="line">            std::vector&lt;<span class="type">unsigned</span> <span class="type">char</span>&gt; compress_buffer_; <span class="comment">// 用于存放压缩数据的临时缓冲区</span></span><br><span class="line">        &#125;;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 类型别名和工厂函数保持不变</span></span><br><span class="line">        <span class="keyword">using</span> compressed_file_sink_mt = compressed_file_sink&lt;std::mutex&gt;;</span><br><span class="line">        <span class="keyword">using</span> compressed_file_sink_st = compressed_file_sink&lt;details::null_mutex&gt;;</span><br><span class="line">    &#125; <span class="comment">// namespace sinks</span></span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> Factory </span>= spdlog::synchronous_factory&gt;</span><br><span class="line">    <span class="function"><span class="keyword">inline</span> std::shared_ptr&lt;logger&gt; <span class="title">compressed_file_logger_mt</span><span class="params">(<span class="type">const</span> std::string &amp;logger_name, <span class="type">const</span> <span class="type">filename_t</span> &amp;filename,</span></span></span><br><span class="line"><span class="params"><span class="function">                                                             <span class="type">size_t</span> buffer_capacity = <span class="number">8192</span>,</span></span></span><br><span class="line"><span class="params"><span class="function">                                                             <span class="type">int</span> compression_level = Z_DEFAULT_COMPRESSION)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">return</span> Factory::<span class="keyword">template</span> <span class="built_in">create</span>&lt;sinks::compressed_file_sink_mt&gt;(logger_name, filename, buffer_capacity,</span><br><span class="line">                                                                        compression_level);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> Factory </span>= spdlog::synchronous_factory&gt;</span><br><span class="line">    <span class="function"><span class="keyword">inline</span> std::shared_ptr&lt;logger&gt; <span class="title">compressed_file_logger_st</span><span class="params">(<span class="type">const</span> std::string &amp;logger_name, <span class="type">const</span> <span class="type">filename_t</span> &amp;filename,</span></span></span><br><span class="line"><span class="params"><span class="function">                                                             <span class="type">size_t</span> buffer_capacity = <span class="number">8192</span>,</span></span></span><br><span class="line"><span class="params"><span class="function">                                                             <span class="type">int</span> compression_level = Z_DEFAULT_COMPRESSION)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">return</span> Factory::<span class="keyword">template</span> <span class="built_in">create</span>&lt;sinks::compressed_file_sink_st&gt;(logger_name, filename, buffer_capacity,</span><br><span class="line">                                                                        compression_level);</span><br><span class="line">    &#125;</span><br><span class="line">&#125; <span class="comment">// namespace spdlog</span></span><br><span class="line"></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br><span class="line">92</span><br><span class="line">93</span><br><span class="line">94</span><br><span class="line">95</span><br><span class="line">96</span><br><span class="line">97</span><br><span class="line">98</span><br><span class="line">99</span><br><span class="line">100</span><br><span class="line">101</span><br><span class="line">102</span><br><span class="line">103</span><br><span class="line">104</span><br><span class="line">105</span><br><span class="line">106</span><br><span class="line">107</span><br><span class="line">108</span><br><span class="line">109</span><br><span class="line">110</span><br><span class="line">111</span><br><span class="line">112</span><br><span class="line">113</span><br><span class="line">114</span><br><span class="line">115</span><br><span class="line">116</span><br><span class="line">117</span><br><span class="line">118</span><br><span class="line">119</span><br><span class="line">120</span><br><span class="line">121</span><br><span class="line">122</span><br><span class="line">123</span><br><span class="line">124</span><br><span class="line">125</span><br><span class="line">126</span><br><span class="line">127</span><br><span class="line">128</span><br><span class="line">129</span><br><span class="line">130</span><br><span class="line">131</span><br><span class="line">132</span><br><span class="line">133</span><br><span class="line">134</span><br><span class="line">135</span><br><span class="line">136</span><br><span class="line">137</span><br><span class="line">138</span><br><span class="line">139</span><br><span class="line">140</span><br><span class="line">141</span><br><span class="line">142</span><br><span class="line">143</span><br><span class="line">144</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;iostream&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;fstream&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;vector&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;string&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;zlib.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;cstdint&gt;</span> <span class="comment">// for uint32_t</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;stdexcept&gt;</span> <span class="comment">// for runtime_error</span></span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 解压缓冲区大小</span></span><br><span class="line"><span class="type">const</span> <span class="type">size_t</span> DECOMPRESS_BUFFER_SIZE = <span class="number">16384</span>; <span class="comment">// 16 KB</span></span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">main</span><span class="params">(<span class="type">int</span> argc, <span class="type">char</span> *argv[])</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (argc != <span class="number">3</span>)</span><br><span class="line">    &#123;</span><br><span class="line">        std::cerr &lt;&lt; <span class="string">&quot;用法: &quot;</span> &lt;&lt; argv[<span class="number">0</span>] &lt;&lt; <span class="string">&quot; &lt;compressed_log_file&gt;&quot;</span> &lt;&lt; <span class="string">&quot; &lt;decompression_log_file&gt;&quot;</span> &lt;&lt; std::endl;</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="type">const</span> <span class="type">char</span> *filename = argv[<span class="number">1</span>];</span><br><span class="line">    <span class="type">const</span> <span class="type">char</span> *decompressed_filename = argv[<span class="number">2</span>];</span><br><span class="line">    <span class="function">std::ifstream <span class="title">infile</span><span class="params">(filename, std::ios::binary)</span></span>;</span><br><span class="line">    <span class="function">std::ofstream <span class="title">outfile</span><span class="params">(decompressed_filename, std::ios::binary)</span></span>;</span><br><span class="line">    <span class="keyword">if</span> (!infile.<span class="built_in">is_open</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        std::cerr &lt;&lt; <span class="string">&quot;错误: 无法打开文件 &quot;</span> &lt;&lt; filename &lt;&lt; std::endl;</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 初始化 zlib 解压流</span></span><br><span class="line">    z_stream strm;</span><br><span class="line">    strm.zalloc = Z_NULL;</span><br><span class="line">    strm.zfree = Z_NULL;</span><br><span class="line">    strm.opaque = Z_NULL;</span><br><span class="line">    strm.avail_in = <span class="number">0</span>;</span><br><span class="line">    strm.next_in = Z_NULL;</span><br><span class="line">    <span class="type">int</span> ret = <span class="built_in">inflateInit</span>(&amp;strm);</span><br><span class="line">    <span class="keyword">if</span> (ret != Z_OK)</span><br><span class="line">    &#123;</span><br><span class="line">        std::cerr &lt;&lt; <span class="string">&quot;错误: 初始化 zlib inflate 失败, code: &quot;</span> &lt;&lt; ret &lt;&lt; std::endl;</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    std::vector&lt;<span class="type">unsigned</span> <span class="type">char</span>&gt; compressed_buffer;</span><br><span class="line">    <span class="function">std::vector&lt;<span class="type">unsigned</span> <span class="type">char</span>&gt; <span class="title">decompress_buffer</span><span class="params">(DECOMPRESS_BUFFER_SIZE)</span></span>;</span><br><span class="line">    <span class="type">uint32_t</span> compressed_block_size = <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">try</span></span><br><span class="line">    &#123;</span><br><span class="line">        <span class="comment">// 循环读取文件中的压缩块</span></span><br><span class="line">        <span class="keyword">while</span> (infile.<span class="built_in">read</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">char</span> *&gt;(&amp;compressed_block_size), <span class="built_in">sizeof</span>(compressed_block_size)))</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="keyword">if</span> (compressed_block_size == <span class="number">0</span>)</span><br><span class="line">            &#123;</span><br><span class="line">                <span class="comment">// 可能是空块写入（虽然我们的sink实现不会写0长度块），跳过</span></span><br><span class="line">                <span class="keyword">continue</span>;</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 读取指定大小的压缩数据</span></span><br><span class="line">            compressed_buffer.<span class="built_in">resize</span>(compressed_block_size);</span><br><span class="line">            <span class="keyword">if</span> (!infile.<span class="built_in">read</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">char</span> *&gt;(compressed_buffer.<span class="built_in">data</span>()), compressed_block_size))</span><br><span class="line">            &#123;</span><br><span class="line">                std::cerr &lt;&lt; <span class="string">&quot;错误: 读取压缩数据块时文件提前结束或发生错误。&quot;</span> &lt;&lt; std::endl;</span><br><span class="line">                <span class="comment">// 根据需要决定是退出还是尝试继续处理已读取部分</span></span><br><span class="line">                <span class="keyword">break</span>; <span class="comment">// 或者 return 1;</span></span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            strm.avail_in = compressed_block_size;</span><br><span class="line">            strm.next_in = compressed_buffer.<span class="built_in">data</span>();</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 循环解压当前块</span></span><br><span class="line">            <span class="keyword">do</span></span><br><span class="line">            &#123;</span><br><span class="line">                strm.avail_out = <span class="built_in">static_cast</span>&lt;uInt&gt;(decompress_buffer.<span class="built_in">size</span>());</span><br><span class="line">                strm.next_out = decompress_buffer.<span class="built_in">data</span>();</span><br><span class="line"></span><br><span class="line">                ret = <span class="built_in">inflate</span>(&amp;strm, Z_NO_FLUSH); <span class="comment">// 使用 Z_NO_FLUSH 进行正常解压</span></span><br><span class="line"></span><br><span class="line">                <span class="keyword">switch</span> (ret)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="keyword">case</span> Z_NEED_DICT:</span><br><span class="line">                    <span class="keyword">case</span> Z_DATA_ERROR:</span><br><span class="line">                    <span class="keyword">case</span> Z_MEM_ERROR:</span><br><span class="line">                        <span class="built_in">inflateEnd</span>(&amp;strm);</span><br><span class="line">                        <span class="keyword">throw</span> std::<span class="built_in">runtime_error</span>(std::<span class="built_in">string</span>(<span class="string">&quot;zlib inflate 错误: &quot;</span>) + strm.msg);</span><br><span class="line">                    <span class="keyword">case</span> Z_STREAM_ERROR:</span><br><span class="line">                        <span class="built_in">inflateEnd</span>(&amp;strm);</span><br><span class="line">                        <span class="keyword">throw</span> std::<span class="built_in">runtime_error</span>(<span class="string">&quot;zlib inflate 错误: 无效的流状态&quot;</span>);</span><br><span class="line">                &#125;</span><br><span class="line"></span><br><span class="line">                <span class="comment">// 计算解压出的数据量</span></span><br><span class="line">                <span class="type">size_t</span> have = decompress_buffer.<span class="built_in">size</span>() - strm.avail_out;</span><br><span class="line">                <span class="keyword">if</span> (have &gt; <span class="number">0</span>)</span><br><span class="line">                &#123;</span><br><span class="line">                    <span class="comment">// 将解压后的数据写入标准输出</span></span><br><span class="line">                    std::cout.<span class="built_in">write</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(decompress_buffer.<span class="built_in">data</span>()), have);</span><br><span class="line">                    outfile.<span class="built_in">write</span>(<span class="built_in">reinterpret_cast</span>&lt;<span class="type">const</span> <span class="type">char</span> *&gt;(decompress_buffer.<span class="built_in">data</span>()), have);</span><br><span class="line">                &#125;</span><br><span class="line">                <span class="comment">// 如果输出缓冲区满了，inflate 需要再次被调用来处理剩余的输入</span></span><br><span class="line">            &#125; <span class="keyword">while</span> (strm.avail_out == <span class="number">0</span>); <span class="comment">// 继续解压直到输出缓冲区不再被填满</span></span><br><span class="line">            <span class="comment">// 检查当前块是否解压完毕</span></span><br><span class="line">            <span class="keyword">if</span> (strm.avail_in != <span class="number">0</span>)</span><br><span class="line">            &#123;</span><br><span class="line">                <span class="comment">// Z_SYNC_FLUSH 写入的块，解压时 inflate 可能在块结束时返回 Z_OK 而不是 Z_STREAM_END</span></span><br><span class="line">                <span class="comment">// 只要输入被消耗完 (avail_in == 0) 就认为一个块处理完了</span></span><br><span class="line">                <span class="comment">// 如果输入没消耗完但 inflate 又没返回错误，可能逻辑有问题</span></span><br><span class="line">                <span class="comment">// 对于 Z_SYNC_FLUSH, 我们期望 avail_in 最终为 0</span></span><br><span class="line">                <span class="built_in">inflateEnd</span>(&amp;strm);</span><br><span class="line">                <span class="keyword">throw</span> std::<span class="built_in">runtime_error</span>(<span class="string">&quot;解压错误: 输入数据未完全消耗完但解压停止&quot;</span>);</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="comment">// inflateReset(&amp;strm); // 不需要 reset，因为每次都读新块并设置 avail_in/next_in</span></span><br><span class="line">            <span class="comment">// inflateInit 应该为每个独立块工作</span></span><br><span class="line">            <span class="comment">// 修正：对于流式解压，应该持续使用同一个 strm，并在块之间可能需要 inflateSync</span></span><br><span class="line">            <span class="comment">// 或者更简单的，如果块是独立压缩的（如我们的例子，虽然用了 Z_SYNC_FLUSH 但逻辑上独立）</span></span><br><span class="line">            <span class="comment">// 可以在处理完一个块后调用 inflateReset</span></span><br><span class="line">            ret = <span class="built_in">inflateReset</span>(&amp;strm);</span><br><span class="line">            <span class="keyword">if</span> (ret != Z_OK)</span><br><span class="line">            &#123;</span><br><span class="line">                <span class="built_in">inflateEnd</span>(&amp;strm);</span><br><span class="line">                <span class="keyword">throw</span> std::<span class="built_in">runtime_error</span>(<span class="string">&quot;zlib inflateReset 失败&quot;</span>);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125; <span class="comment">// end while read block size</span></span><br><span class="line"></span><br><span class="line">        <span class="comment">// 检查是否因为读取错误而退出循环</span></span><br><span class="line">        <span class="keyword">if</span> (!infile.<span class="built_in">eof</span>() &amp;&amp; infile.<span class="built_in">fail</span>())</span><br><span class="line">        &#123;</span><br><span class="line">            std::cerr &lt;&lt; <span class="string">&quot;错误: 读取文件时发生 I/O 错误。&quot;</span> &lt;&lt; std::endl;</span><br><span class="line">            outfile.<span class="built_in">close</span>();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125; <span class="built_in">catch</span> (<span class="type">const</span> std::exception &amp;e)</span><br><span class="line">    &#123;</span><br><span class="line">        std::cerr &lt;&lt; <span class="string">&quot;运行时错误: &quot;</span> &lt;&lt; e.<span class="built_in">what</span>() &lt;&lt; std::endl;</span><br><span class="line">        <span class="built_in">inflateEnd</span>(&amp;strm); <span class="comment">// 确保清理</span></span><br><span class="line">        outfile.<span class="built_in">close</span>();</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 清理 zlib 资源</span></span><br><span class="line">    <span class="built_in">inflateEnd</span>(&amp;strm);</span><br><span class="line">    std::cout.<span class="built_in">flush</span>(); <span class="comment">// 确保所有输出都被写入</span></span><br><span class="line">    outfile.<span class="built_in">close</span>();</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br></pre></td></tr></table></figure>
+
+
+
+
+    </div>
+
+    
+    
+    
+
+      <footer class="post-footer">
+          <div class="post-tags">
+              <a href="/tags/C/" rel="tag"># C++</a>
+              <a href="/tags/spdlog/" rel="tag"># spdlog</a>
+              <a href="/tags/%E6%97%A5%E5%BF%97%E7%B3%BB%E7%BB%9F/" rel="tag"># 日志系统</a>
+          </div>
+
+        
+
+
+        
+    <div class="post-nav">
+      <div class="post-nav-item">
+    <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/" rel="prev" title="spdlog源码阅读:02.sink分析">
+      <i class="fa fa-chevron-left"></i> spdlog源码阅读:02.sink分析
+    </a></div>
+      <div class="post-nav-item">
+    <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/" rel="next" title="spdlog源码阅读:01.异步机制解析">
+      spdlog源码阅读:01.异步机制解析 <i class="fa fa-chevron-right"></i>
+    </a></div>
+    </div>
+      </footer>
+    
+  </article>
+  
+  
+  
+
+
+
+          </div>
+          
+
+<script>
+  window.addEventListener('tabs:register', () => {
+    let { activeClass } = CONFIG.comments;
+    if (CONFIG.comments.storage) {
+      activeClass = localStorage.getItem('comments_active') || activeClass;
+    }
+    if (activeClass) {
+      let activeTab = document.querySelector(`a[href="#comment-${activeClass}"]`);
+      if (activeTab) {
+        activeTab.click();
+      }
+    }
+  });
+  if (CONFIG.comments.storage) {
+    window.addEventListener('tabs:click', event => {
+      if (!event.target.matches('.tabs-comment .tab-content .tab-pane')) return;
+      let commentClass = event.target.classList[1];
+      localStorage.setItem('comments_active', commentClass);
+    });
+  }
+</script>
+
+        </div>
+          
+  
+  <div class="toggle sidebar-toggle">
+    <span class="toggle-line toggle-line-first"></span>
+    <span class="toggle-line toggle-line-middle"></span>
+    <span class="toggle-line toggle-line-last"></span>
+  </div>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <ul class="sidebar-nav motion-element">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <!--noindex-->
+      <div class="post-toc-wrap sidebar-panel">
+          <div class="post-toc motion-element"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#%E5%BC%95%E8%A8%80"><span class="nav-number">1.</span> <span class="nav-text">引言</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#spdlog-%E4%B8%AD%E8%87%AA%E5%AE%9A%E4%B9%89-sink-%E7%9A%84%E5%AE%9E%E7%8E%B0%E6%96%B9%E6%B3%95"><span class="nav-number">2.</span> <span class="nav-text">spdlog 中自定义 sink 的实现方法</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#compressed-file-sink-%E5%AE%9E%E7%8E%B0%E8%A7%A3%E6%9E%90"><span class="nav-number">3.</span> <span class="nav-text">compressed_file_sink 实现解析</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E4%BD%BF%E7%94%A8-demo"><span class="nav-number">3.1.</span> <span class="nav-text">使用 demo</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E6%97%A5%E5%BF%97%E6%B6%88%E6%81%AF%E6%B5%81%E8%BD%AC%E4%B8%8E%E5%8E%8B%E7%BC%A9%E5%AE%9E%E7%8E%B0"><span class="nav-number">3.2.</span> <span class="nav-text">日志消息流转与压缩实现</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%97%A5%E5%BF%97%E7%94%9F%E4%BA%A7"><span class="nav-number">3.2.1.</span> <span class="nav-text">日志生产</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9%E4%B8%8E%E5%86%99%E5%85%A5"><span class="nav-number">3.2.2.</span> <span class="nav-text">日志压缩与写入</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%88%B7%E6%96%B0%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86"><span class="nav-number">3.2.3.</span> <span class="nav-text">刷新与资源管理</span></a></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%85%B3%E9%94%AE%E7%B1%BB%E4%B8%8E%E8%AE%BE%E8%AE%A1"><span class="nav-number">3.3.</span> <span class="nav-text">关键类与设计</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E7%B1%BB%E5%B1%82%E6%AC%A1%E7%BB%93%E6%9E%84"><span class="nav-number">3.3.1.</span> <span class="nav-text">类层次结构</span></a></li></ol></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#%E6%80%BB%E7%BB%93"><span class="nav-number">4.</span> <span class="nav-text">总结</span></a></li></ol></div>
+      </div>
+      <!--/noindex-->
+
+      <div class="site-overview-wrap sidebar-panel">
+        <div class="site-author motion-element" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="ToBrightMoon"
+      src="/images/avatar.png">
+  <p class="site-author-name" itemprop="name">ToBrightMoon</p>
+  <div class="site-description" itemprop="description">记录我的开发与成长，分享 C++ 和源码分析</div>
+</div>
+<div class="site-state-wrap motion-element">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+          <a href="/archives/">
+        
+          <span class="site-state-item-count">18</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+            <a href="/categories/">
+          
+        <span class="site-state-item-count">7</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+            <a href="/tags/">
+          
+        <span class="site-state-item-count">10</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author motion-element">
+      <span class="links-of-author-item">
+        <a href="https://github.com/ToBrightmoon" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;ToBrightmoon" rel="noopener" target="_blank"><i class="fab fa-github fa-fw"></i></a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="https://www.zhihu.com/people/meng-zhong-ren-5-90" title="知乎 → https:&#x2F;&#x2F;www.zhihu.com&#x2F;people&#x2F;meng-zhong-ren-5-90" rel="noopener" target="_blank"><i class="fa-custom zhihu fa-fw"></i></a>
+      </span>
+  </div>
+
+
+
+      </div>
+
+    </div>
+  </aside>
+  <div id="sidebar-dimmer"></div>
+
+
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        
+
+        
+
+<div class="copyright">
+  
+  &copy; 
+  <span itemprop="copyrightYear">2025</span>
+  <span class="with-love">
+    <i class="fa fa-heart"></i>
+  </span>
+  <span class="author" itemprop="copyrightHolder">ToBrightMoon</span>
+</div>
+  <div class="powered-by">由 <a href="https://hexo.io/" class="theme-link" rel="noopener" target="_blank">Hexo</a> & <a href="https://theme-next.org/" class="theme-link" rel="noopener" target="_blank">NexT.Gemini</a> 强力驱动
+  </div>
+
+        
+
+
+
+
+
+
+
+
+      </div>
+    </footer>
+  </div>
+
+  
+  <script src="/lib/anime.min.js"></script>
+  <script src="/lib/velocity/velocity.min.js"></script>
+  <script src="/lib/velocity/velocity.ui.min.js"></script>
+
+<script src="/js/utils.js"></script>
+
+<script src="/js/motion.js"></script>
+
+
+<script src="/js/schemes/pisces.js"></script>
+
+
+<script src="/js/next-boot.js"></script>
+
+
+
+
+  
+
+
+
+
+  
+<script src="/js/local-search.js"></script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+</body>
+</html>

@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<meta name="theme-color" content="#222">
+<meta name="generator" content="Hexo 7.3.0">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Lora:300,300italic,400,400italic,700,700italic|Roboto:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+<link rel="stylesheet" href="/lib/font-awesome/css/all.min.css">
+
+<script id="hexo-configurations">
+    var NexT = window.NexT || {};
+    var CONFIG = {"hostname":"tobrightmoon.github.io","root":"/","scheme":"Gemini","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"always","padding":20,"offset":12,"onmobile":true},"copycode":{"enable":true,"show_result":true,"style":"mac"},"back2top":{"enable":true,"sidebar":false,"scrollpercent":true},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}},"path":"search.xml"};
+  </script>
+
+  <meta name="description" content="引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="spdlog源码阅读:02.sink分析">
+<meta property="og:url" content="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/index.html">
+<meta property="og:site_name" content="ToBrightMoon 的个人博客">
+<meta property="og:description" content="引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。">
+<meta property="og:locale" content="zh_CN">
+<meta property="article:published_time" content="2025-08-25T16:00:00.000Z">
+<meta property="article:modified_time" content="2025-08-29T02:18:47.658Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="C++">
+<meta property="article:tag" content="spdlog">
+<meta property="article:tag" content="日志系统">
+<meta name="twitter:card" content="summary">
+
+<link rel="canonical" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/">
+
+
+<script id="page-configurations">
+  // https://hexo.io/docs/variables.html
+  CONFIG.page = {
+    sidebar: "",
+    isHome : false,
+    isPost : true,
+    lang   : 'zh-CN'
+  };
+</script>
+
+  <title>spdlog源码阅读:02.sink分析 | ToBrightMoon 的个人博客</title>
+  
+
+
+
+
+
+
+  <noscript>
+  <style>
+  .use-motion .brand,
+  .use-motion .menu-item,
+  .sidebar-inner,
+  .use-motion .post-block,
+  .use-motion .pagination,
+  .use-motion .comments,
+  .use-motion .post-header,
+  .use-motion .post-body,
+  .use-motion .collection-header { opacity: initial; }
+
+  .use-motion .site-title,
+  .use-motion .site-subtitle {
+    opacity: initial;
+    top: initial;
+  }
+
+  .use-motion .logo-line-before i { left: initial; }
+  .use-motion .logo-line-after i { right: initial; }
+  </style>
+</noscript>
+
+</head>
+
+<body itemscope itemtype="http://schema.org/WebPage">
+  <div class="container use-motion">
+    <div class="headband"></div>
+
+    <header class="header" itemscope itemtype="http://schema.org/WPHeader">
+      <div class="header-inner"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏">
+      <span class="toggle-line toggle-line-first"></span>
+      <span class="toggle-line toggle-line-middle"></span>
+      <span class="toggle-line toggle-line-last"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <span class="logo-line-before"><i></i></span>
+      <h1 class="site-title">ToBrightMoon 的个人博客</h1>
+      <span class="logo-line-after"><i></i></span>
+    </a>
+      <p class="site-subtitle" itemprop="description">探索代码的奥秘</p>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+
+<nav class="site-nav">
+  <ul id="menu" class="main-menu menu">
+        <li class="menu-item menu-item-home">
+
+    <a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a>
+
+  </li>
+        <li class="menu-item menu-item-tags">
+
+    <a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a>
+
+  </li>
+        <li class="menu-item menu-item-categories">
+
+    <a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a>
+
+  </li>
+        <li class="menu-item menu-item-archives">
+
+    <a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a>
+
+  </li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup">
+        <div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div id="search-result">
+  <div id="no-result">
+    <i class="fa fa-spinner fa-pulse fa-5x fa-fw"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</div>
+    </header>
+
+    
+  <div class="back-to-top">
+    <i class="fa fa-arrow-up"></i>
+    <span>0%</span>
+  </div>
+  <div class="reading-progress-bar"></div>
+
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="content-wrap">
+          
+
+          <div class="content post posts-expand">
+            
+
+    
+  
+  
+  <article itemscope itemtype="http://schema.org/Article" class="post-block" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="https://tobrightmoon.github.io/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.png">
+      <meta itemprop="name" content="ToBrightMoon">
+      <meta itemprop="description" content="记录我的开发与成长，分享 C++ 和源码分析">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="ToBrightMoon 的个人博客">
+    </span>
+      <header class="post-header">
+        <h1 class="post-title" itemprop="name headline">
+          spdlog源码阅读:02.sink分析
+        </h1>
+
+        <div class="post-meta">
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-calendar"></i>
+              </span>
+              <span class="post-meta-item-text">发表于</span>
+
+              <time title="创建时间：2025-08-26 00:00:00" itemprop="dateCreated datePublished" datetime="2025-08-26T00:00:00+08:00">2025-08-26</time>
+            </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">更新于</span>
+                <time title="修改时间：2025-08-29 10:18:47" itemprop="dateModified" datetime="2025-08-29T10:18:47+08:00">2025-08-29</time>
+              </span>
+            <span class="post-meta-item">
+              <span class="post-meta-item-icon">
+                <i class="far fa-folder"></i>
+              </span>
+              <span class="post-meta-item-text">分类于</span>
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/" itemprop="url" rel="index"><span itemprop="name">源码分析</span></a>
+                </span>
+                  ，
+                <span itemprop="about" itemscope itemtype="http://schema.org/Thing">
+                  <a href="/categories/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/spdlog/" itemprop="url" rel="index"><span itemprop="name">spdlog</span></a>
+                </span>
+            </span>
+
+          
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody">
+
+      
+        <h2 id="引言"><a href="#引言" class="headerlink" title="引言"></a>引言</h2><p>上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。</p>
+<span id="more"></span>
+<h1 id="daily-file-sink"><a href="#daily-file-sink" class="headerlink" title="daily_file_sink"></a>daily_file_sink</h1><p>在每天特定的时间点创建新的日志文件</p>
+<h2 id="基础配置"><a href="#基础配置" class="headerlink" title="基础配置"></a>基础配置</h2><p>在使用daily_file_sink的时候，有几个重要的构造函数的参数</p>
+<p><strong>rotation_hour</strong>:分割的小时</p>
+<p><strong>rotation_minute</strong>：分割的分钟</p>
+<p><strong>truncate</strong>:是否截断文件</p>
+<p><strong>max_files</strong>：最大的文件数目，设定为0的时候不限制文件个数，否则保留设置的max_files文件个数</p>
+<h2 id="实现原理"><a href="#实现原理" class="headerlink" title="实现原理"></a>实现原理</h2><p>daily_file_sink是通过被动触发日志文件的分割的，当用户写入日志的时候，daily_file_sink会通过日志消息的时间和计算的需要转轮的时间判断是否需要将日志输出到新的文件中，并通过一个环形队列管理这些日志文件，当文件数量超过设定数目的时候，删除旧的文件。</p>
+<h3 id="计算分割时间点"><a href="#计算分割时间点" class="headerlink" title="计算分割时间点"></a>计算分割时间点</h3><figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="function">log_clock::time_point <span class="title">next_rotation_tp_</span><span class="params">()</span> </span>&#123;</span><br><span class="line">        <span class="keyword">auto</span> now = log_clock::<span class="built_in">now</span>(); <span class="comment">//获取当前时间</span></span><br><span class="line">        tm date = <span class="built_in">now_tm</span>(now);</span><br><span class="line">        </span><br><span class="line">        <span class="comment">//使用配置的时间作为轮转日志的时间</span></span><br><span class="line">        date.tm_hour = rotation_h_; </span><br><span class="line">        date.tm_min = rotation_m_;</span><br><span class="line">        date.tm_sec = <span class="number">0</span>;</span><br><span class="line">        <span class="keyword">auto</span> rotation_time = log_clock::<span class="built_in">from_time_t</span>(std::<span class="built_in">mktime</span>(&amp;date));</span><br><span class="line">        <span class="comment">//当前时间还未到计算出的轮转时间</span></span><br><span class="line">        <span class="keyword">if</span> (rotation_time &gt; now) &#123;</span><br><span class="line">            <span class="keyword">return</span> rotation_time;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">//当前时间超过了设定的轮转时间，直接换到下一点时间点作为轮转时间</span></span><br><span class="line">        <span class="keyword">return</span> &#123;rotation_time + std::chrono::<span class="built_in">hours</span>(<span class="number">24</span>)&#125;;</span><br><span class="line">    &#125;</span><br></pre></td></tr></table></figure>
+<p>每次sink初始化或者发生日志轮转的时候，就会调用这个函数计算下一次轮转日志的时间点。这个函数会使用用户配置的rotation_h_和rotation_m_，如果这个时间点过去了，就会那么就是明天的同一时间轮转。<br>比如，下午16点启动日志，但是设定是每天6点分割，那么下一次轮转的时间就是第二天的6点，本次不会分割。</p>
+<h3 id="文件管理"><a href="#文件管理" class="headerlink" title="文件管理"></a>文件管理</h3><p>daily_file_sink通过max_files参数限制保留的旧日志文件的个数,并且通过filenames_q_队列维护这些文件，在初始化阶段使用init_filenames_q_去填充这个队列</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">init_filenames_q_</span><span class="params">()</span> </span>&#123;</span><br><span class="line">        <span class="keyword">using</span> details::os::path_exists;</span><br><span class="line"></span><br><span class="line">        <span class="comment">//环形队列存储文件名</span></span><br><span class="line">        filenames_q_ = details::<span class="built_in">circular_q</span>&lt;<span class="type">filename_t</span>&gt;(<span class="built_in">static_cast</span>&lt;<span class="type">size_t</span>&gt;(max_files_));</span><br><span class="line">        std::vector&lt;<span class="type">filename_t</span>&gt; filenames;</span><br><span class="line">        <span class="keyword">auto</span> now = log_clock::<span class="built_in">now</span>();</span><br><span class="line">        </span><br><span class="line">        <span class="comment">//按照时间倒序查找现有的日志文件</span></span><br><span class="line">        <span class="keyword">while</span> (filenames.<span class="built_in">size</span>() &lt; max_files_) &#123;</span><br><span class="line">            <span class="comment">//按照时间计算文件名</span></span><br><span class="line">            <span class="keyword">auto</span> filename = FileNameCalc::<span class="built_in">calc_filename</span>(base_filename_, <span class="built_in">now_tm</span>(now));</span><br><span class="line">            </span><br><span class="line">            <span class="comment">//当前文件不存在，立刻停止</span></span><br><span class="line">            <span class="keyword">if</span> (!<span class="built_in">path_exists</span>(filename)) &#123;</span><br><span class="line">                <span class="keyword">break</span>;</span><br><span class="line">            &#125;</span><br><span class="line">            filenames.<span class="built_in">emplace_back</span>(filename);</span><br><span class="line">            now -= std::chrono::<span class="built_in">hours</span>(<span class="number">24</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 将找到的文件名按反向顺序（最旧的在前）添加到队列中</span></span><br><span class="line">        <span class="comment">// 这确保了当队列满时，最旧的文件名位于队列前端，准备被删除。</span></span><br><span class="line">        <span class="keyword">for</span> (<span class="keyword">auto</span> iter = filenames.<span class="built_in">rbegin</span>(); iter != filenames.<span class="built_in">rend</span>(); ++iter) &#123;</span><br><span class="line">            filenames_q_.<span class="built_in">push_back</span>(std::<span class="built_in">move</span>(*iter));</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br></pre></td></tr></table></figure>
+<p>这个初始化过程巧妙地查找了前几天的现有日志文件，并将它们添加到队列中，使得找到的最旧的文件位于队列的前面，以便在队列满时首先被移除。</p>
+<h3 id="写入与转轮"><a href="#写入与转轮" class="headerlink" title="写入与转轮"></a>写入与转轮</h3><p>当写入的时候，会根据日志消息的时间判断是否需要轮转，并且根据时间生成新的文件名，生成新的日志文件，写入日志消息，并且清理旧文件</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">sink_it_</span><span class="params">(<span class="type">const</span> details::log_msg &amp;msg)</span> <span class="keyword">override</span> </span>&#123;</span><br><span class="line">       <span class="comment">//根据日志时间进行判断是否需要转轮</span></span><br><span class="line">       <span class="keyword">auto</span> time = msg.time;</span><br><span class="line">       <span class="type">bool</span> should_rotate = time &gt;= rotation_tp_;</span><br><span class="line">       <span class="keyword">if</span> (should_rotate) &#123;</span><br><span class="line">           <span class="keyword">auto</span> filename = FileNameCalc::<span class="built_in">calc_filename</span>(base_filename_, <span class="built_in">now_tm</span>(time));</span><br><span class="line">           </span><br><span class="line">           <span class="comment">//打开新文件，重新计算轮转时间</span></span><br><span class="line">           file_helper_.<span class="built_in">open</span>(filename, truncate_);</span><br><span class="line">           rotation_tp_ = <span class="built_in">next_rotation_tp_</span>();</span><br><span class="line">       &#125;</span><br><span class="line">       <span class="type">memory_buf_t</span> formatted;</span><br><span class="line">       base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);</span><br><span class="line">       file_helper_.<span class="built_in">write</span>(formatted);</span><br><span class="line"></span><br><span class="line">       <span class="comment">// 轮转之后，并且max_files_&gt;0，清理老文件</span></span><br><span class="line">       <span class="keyword">if</span> (should_rotate &amp;&amp; max_files_ &gt; <span class="number">0</span>) &#123;</span><br><span class="line">           <span class="built_in">delete_old_</span>();</span><br><span class="line">       &#125;</span><br><span class="line">   &#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">delete_old_</span><span class="params">()</span> </span>&#123;</span><br><span class="line">        <span class="keyword">using</span> details::os::filename_to_str;</span><br><span class="line">        <span class="keyword">using</span> details::os::remove_if_exists;</span><br><span class="line"></span><br><span class="line">        <span class="type">filename_t</span> current_file = file_helper_.<span class="built_in">filename</span>();</span><br><span class="line">        <span class="comment">//队列满了，进行操作，删除最老的的文件</span></span><br><span class="line">        <span class="keyword">if</span> (filenames_q_.<span class="built_in">full</span>()) &#123;</span><br><span class="line">            <span class="keyword">auto</span> old_filename = std::<span class="built_in">move</span>(filenames_q_.<span class="built_in">front</span>());</span><br><span class="line">            filenames_q_.<span class="built_in">pop_front</span>(); <span class="comment">//从队列中删除最老的</span></span><br><span class="line">            <span class="type">bool</span> ok = <span class="built_in">remove_if_exists</span>(old_filename) == <span class="number">0</span>; <span class="comment">//从磁盘删除</span></span><br><span class="line">            <span class="keyword">if</span> (!ok) &#123;</span><br><span class="line">                filenames_q_.<span class="built_in">push_back</span>(std::<span class="built_in">move</span>(current_file));</span><br><span class="line">                <span class="built_in">throw_spdlog_ex</span>(<span class="string">&quot;Failed removing daily file &quot;</span> + <span class="built_in">filename_to_str</span>(old_filename),</span><br><span class="line">                                errno);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">//当前的最新文件加入队列</span></span><br><span class="line">        filenames_q_.<span class="built_in">push_back</span>(std::<span class="built_in">move</span>(current_file));</span><br><span class="line">    &#125;</span><br></pre></td></tr></table></figure>
+
+<p>本质上，daily_file_sink 确保日志按天分隔，在指定时间启动新文件，并可选地清理超过设定天数的旧文件。</p>
+<h1 id="rotating-file-sink"><a href="#rotating-file-sink" class="headerlink" title="rotating_file_sink"></a>rotating_file_sink</h1><p>日志文档达到固定的大小后，输出生成新的日志文件</p>
+<h2 id="基础配置-1"><a href="#基础配置-1" class="headerlink" title="基础配置"></a>基础配置</h2><p><strong>max_size</strong>：文件最大的字节数</p>
+<p><strong>max_files</strong>：最大的文件个数，0的时候，一直只有一个文件存在</p>
+<h2 id="实现原理-1"><a href="#实现原理-1" class="headerlink" title="实现原理"></a>实现原理</h2><p>通过日志的写入被动触发日志文件的转轮，当原文件的大小和要写入的字节大小总和超过设定值的时候触发日志的轮转，生成新文件，并通过将日志文件重名维持文件个数</p>
+<h3 id="初始化"><a href="#初始化" class="headerlink" title="初始化"></a>初始化</h3><p>创建日志的时候，rotating_file_sink会打开基础的文件，它计算初始大小，并且如果 rotate_on_open 为 true 且文件不为空，可以选择立即执行一次轮转。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">typename</span> Mutex&gt;</span><br><span class="line">rotating_file_sink&lt;Mutex&gt;::<span class="built_in">rotating_file_sink</span>(</span><br><span class="line">    <span class="type">filename_t</span> base_filename,</span><br><span class="line">    std::<span class="type">size_t</span> max_size,</span><br><span class="line">    std::<span class="type">size_t</span> max_files,</span><br><span class="line">    <span class="type">bool</span> rotate_on_open,</span><br><span class="line">    <span class="type">const</span> file_event_handlers &amp;event_handlers)</span><br><span class="line">    : <span class="built_in">base_filename_</span>(std::<span class="built_in">move</span>(base_filename)),</span><br><span class="line">      <span class="built_in">max_size_</span>(max_size),</span><br><span class="line">      <span class="built_in">max_files_</span>(max_files),</span><br><span class="line">      file_helper_&#123;event_handlers&#125; &#123;</span><br><span class="line">      </span><br><span class="line">      <span class="comment">//配置参数的检查</span></span><br><span class="line">    <span class="keyword">if</span> (max_size == <span class="number">0</span>) &#123;</span><br><span class="line">        <span class="built_in">throw_spdlog_ex</span>(<span class="string">&quot;rotating sink constructor: max_size arg cannot be zero&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (max_files &gt; <span class="number">200000</span>) &#123;</span><br><span class="line">        <span class="built_in">throw_spdlog_ex</span>(<span class="string">&quot;rotating sink constructor: max_files arg cannot exceed 200000&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">//为0的时候是原名打开日志文件</span></span><br><span class="line">    file_helper_.<span class="built_in">open</span>(<span class="built_in">calc_filename</span>(base_filename_, <span class="number">0</span>));</span><br><span class="line">    current_size_ = file_helper_.<span class="built_in">size</span>(); </span><br><span class="line">    </span><br><span class="line">    <span class="comment">//打开的时候如果配置true并且文件大小不为0，开始轮转</span></span><br><span class="line">    <span class="keyword">if</span> (rotate_on_open &amp;&amp; current_size_ &gt; <span class="number">0</span>) &#123;</span><br><span class="line">        <span class="built_in">rotate_</span>();</span><br><span class="line">        current_size_ = <span class="number">0</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h3 id="文件重命名"><a href="#文件重命名" class="headerlink" title="文件重命名"></a>文件重命名</h3><p>日志的轮转逻辑的核心在rotate_函数中，主要是处理重命名逻辑，根据max_files_参数维持备份文件<br>比如是3,日志文件的原始名是log.txt，会存在log.txt日志文件和log.1.txt,log.2.txt,log.3.txt等备份文件</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 示例: base_filename=&quot;log.txt&quot;, max_files=3</span></span><br><span class="line"><span class="comment">// 轮转顺序:</span></span><br><span class="line"><span class="comment">// 1. 删除 log.3.txt (如果存在) --&gt; 实际是第2步重命名时覆盖，或者rename前删除</span></span><br><span class="line"><span class="comment">// 2. 将 log.2.txt 重命名为 log.3.txt</span></span><br><span class="line"><span class="comment">// 3. 将 log.1.txt 重命名为 log.2.txt</span></span><br><span class="line"><span class="comment">// 4. 将 log.txt 重命名为 log.1.txt</span></span><br><span class="line"><span class="comment">// 5. 重新打开 log.txt (截断) 以写入新日志</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">typename</span> Mutex&gt;</span><br><span class="line"><span class="type">void</span> rotating_file_sink&lt;Mutex&gt;::<span class="built_in">rotate_</span>() &#123;</span><br><span class="line">    <span class="keyword">using</span> details::os::filename_to_str;</span><br><span class="line">    <span class="keyword">using</span> details::os::path_exists;</span><br><span class="line"></span><br><span class="line">    file_helper_.<span class="built_in">close</span>(); <span class="comment">// 首先关闭当前日志文件</span></span><br><span class="line"></span><br><span class="line">    <span class="comment">// 从最旧的备份文件索引开始，向下迭代到当前文件 (索引 0)</span></span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">auto</span> i = max_files_; i &gt; <span class="number">0</span>; --i) &#123;</span><br><span class="line">        <span class="type">filename_t</span> src = <span class="built_in">calc_filename</span>(base_filename_, i - <span class="number">1</span>); <span class="comment">// 例如 log.1.txt (当 i=2), log.txt (当 i=1)</span></span><br><span class="line">        <span class="keyword">if</span> (!<span class="built_in">path_exists</span>(src)) &#123;</span><br><span class="line">            <span class="keyword">continue</span>; <span class="comment">// 如果源文件不存在，则跳过</span></span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">filename_t</span> target = <span class="built_in">calc_filename</span>(base_filename_, i); <span class="comment">// 例如 log.2.txt (当 i=2), log.1.txt (当 i=1)</span></span><br><span class="line"></span><br><span class="line">        <span class="comment">// 将 src 重命名为 target。如果 target 已存在，会先删除它。</span></span><br><span class="line">        <span class="keyword">if</span> (!<span class="built_in">rename_file_</span>(src, target)) &#123;</span><br><span class="line">            <span class="comment">// 处理重命名失败 (重试逻辑并抛出异常)</span></span><br><span class="line">            <span class="comment">// ... (错误处理如提供的代码所示) ...</span></span><br><span class="line">            file_helper_.<span class="built_in">reopen</span>(<span class="literal">true</span>); <span class="comment">// 即使重命名失败，也要截断日志文件以防超出限制！</span></span><br><span class="line">            current_size_ = <span class="number">0</span>;</span><br><span class="line">            <span class="built_in">throw_spdlog_ex</span>(<span class="string">&quot;rotating_file_sink: failed renaming &quot;</span> + <span class="built_in">filename_to_str</span>(src) + <span class="string">&quot; to &quot;</span> + <span class="built_in">filename_to_str</span>(target), errno);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 重新打开基础日志文件，并进行截断，以便重新开始写入</span></span><br><span class="line">    file_helper_.<span class="built_in">reopen</span>(<span class="literal">true</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>轮转是向后工作的：最旧的文件 (base_filename.max_files.ext) 被删除， 然后 base_filename.(max_files-1).ext 被重命名为 base_filename.max_files.ext，依此类推，直到当前的 base_filename.ext 被重命名为 base_filename.1.ext 。最后，base_filename.ext 被重新打开为一个空文件。</p>
+<h3 id="写入与轮转"><a href="#写入与轮转" class="headerlink" title="写入与轮转"></a>写入与轮转</h3><p>当日志消息准备写入的时候，会首先格式化日志消息，然后计算新大小，检查是否应该进行轮转。需要轮转时flush文件然后轮转日志文件。完成之后写入日志消息。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">typename</span> Mutex&gt;</span><br><span class="line"><span class="type">void</span> rotating_file_sink&lt;Mutex&gt;::<span class="built_in">sink_it_</span>(<span class="type">const</span> details::log_msg &amp;msg) &#123;</span><br><span class="line">    <span class="type">memory_buf_t</span> formatted;</span><br><span class="line">    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);</span><br><span class="line">    <span class="keyword">auto</span> new_size = current_size_ + formatted.<span class="built_in">size</span>();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (new_size &gt; max_size_) &#123;</span><br><span class="line">        file_helper_.<span class="built_in">flush</span>();</span><br><span class="line">        <span class="comment">// 仅当文件非空时才轮转，避免对空文件的轮转</span></span><br><span class="line">        <span class="keyword">if</span> (file_helper_.<span class="built_in">size</span>() &gt; <span class="number">0</span>) &#123; </span><br><span class="line">            <span class="built_in">rotate_</span>();</span><br><span class="line">            new_size = formatted.<span class="built_in">size</span>(); <span class="comment">// 新文件的大小就是这条消息的大小</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    file_helper_.<span class="built_in">write</span>(formatted);</span><br><span class="line">    current_size_ = new_size;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>此 sink 确保单个日志文件不会超过特定大小，通过保留分布在多个文件中的最新日志数据的滚动窗口来管理磁盘空间。</p>
+<h1 id="差异对比"><a href="#差异对比" class="headerlink" title="差异对比"></a>差异对比</h1><table>
+<thead>
+<tr>
+<th align="left">特性</th>
+<th align="center">daily_file_sink</th>
+<th align="center">rotating_file_sink</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="left"><strong>触发条件</strong></td>
+<td align="center">固定时间点（如每日 00:00）</td>
+<td align="center">文件大小达到 <code>max_size</code> 时触发</td>
+</tr>
+<tr>
+<td align="left"><strong>文件名规则</strong></td>
+<td align="center">按时间生成（如 <code>app-2023-09-15.log</code>）</td>
+<td align="center">基础名 + 序号（如 <code>app.log.1</code>）</td>
+</tr>
+<tr>
+<td align="left"><strong>旧文件处理</strong></td>
+<td align="center">删除超过 <code>max_files</code> 天数的文件</td>
+<td align="center">重命名后循环覆盖（保留固定数量备份）</td>
+</tr>
+<tr>
+<td align="left"><strong>时间关联性</strong></td>
+<td align="center">强（按时间归档）</td>
+<td align="center">弱（按空间需求处理）</td>
+</tr>
+<tr>
+<td align="left"><strong>核心功能</strong></td>
+<td align="center">时间驱动的日志归档</td>
+<td align="center">磁盘空间控制</td>
+</tr>
+</tbody></table>
+
+    </div>
+
+    
+    
+    
+
+      <footer class="post-footer">
+          <div class="post-tags">
+              <a href="/tags/C/" rel="tag"># C++</a>
+              <a href="/tags/spdlog/" rel="tag"># spdlog</a>
+              <a href="/tags/%E6%97%A5%E5%BF%97%E7%B3%BB%E7%BB%9F/" rel="tag"># 日志系统</a>
+          </div>
+
+        
+
+
+        
+    <div class="post-nav">
+      <div class="post-nav-item">
+    <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:04.format%E6%A0%BC%E5%BC%8F%E5%8C%96%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90/" rel="prev" title="spdlog源码阅读:04.format格式化引擎分析">
+      <i class="fa fa-chevron-left"></i> spdlog源码阅读:04.format格式化引擎分析
+    </a></div>
+      <div class="post-nav-item">
+    <a href="/2025/08/25/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:03.%E5%AE%9E%E7%8E%B0%E8%87%AA%E5%AE%9A%E4%B9%89%E5%8E%8B%E7%BC%A9sink/" rel="next" title="spdlog源码阅读:03.实现自定义压缩sink">
+      spdlog源码阅读:03.实现自定义压缩sink <i class="fa fa-chevron-right"></i>
+    </a></div>
+    </div>
+      </footer>
+    
+  </article>
+  
+  
+  
+
+
+
+          </div>
+          
+
+<script>
+  window.addEventListener('tabs:register', () => {
+    let { activeClass } = CONFIG.comments;
+    if (CONFIG.comments.storage) {
+      activeClass = localStorage.getItem('comments_active') || activeClass;
+    }
+    if (activeClass) {
+      let activeTab = document.querySelector(`a[href="#comment-${activeClass}"]`);
+      if (activeTab) {
+        activeTab.click();
+      }
+    }
+  });
+  if (CONFIG.comments.storage) {
+    window.addEventListener('tabs:click', event => {
+      if (!event.target.matches('.tabs-comment .tab-content .tab-pane')) return;
+      let commentClass = event.target.classList[1];
+      localStorage.setItem('comments_active', commentClass);
+    });
+  }
+</script>
+
+        </div>
+          
+  
+  <div class="toggle sidebar-toggle">
+    <span class="toggle-line toggle-line-first"></span>
+    <span class="toggle-line toggle-line-middle"></span>
+    <span class="toggle-line toggle-line-last"></span>
+  </div>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <ul class="sidebar-nav motion-element">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <!--noindex-->
+      <div class="post-toc-wrap sidebar-panel">
+          <div class="post-toc motion-element"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%BC%95%E8%A8%80"><span class="nav-number">1.</span> <span class="nav-text">引言</span></a></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#daily-file-sink"><span class="nav-number"></span> <span class="nav-text">daily_file_sink</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%9F%BA%E7%A1%80%E9%85%8D%E7%BD%AE"><span class="nav-number">1.</span> <span class="nav-text">基础配置</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86"><span class="nav-number">2.</span> <span class="nav-text">实现原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E8%AE%A1%E7%AE%97%E5%88%86%E5%89%B2%E6%97%B6%E9%97%B4%E7%82%B9"><span class="nav-number">2.1.</span> <span class="nav-text">计算分割时间点</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%96%87%E4%BB%B6%E7%AE%A1%E7%90%86"><span class="nav-number">2.2.</span> <span class="nav-text">文件管理</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%86%99%E5%85%A5%E4%B8%8E%E8%BD%AC%E8%BD%AE"><span class="nav-number">2.3.</span> <span class="nav-text">写入与转轮</span></a></li></ol></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#rotating-file-sink"><span class="nav-number"></span> <span class="nav-text">rotating_file_sink</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%9F%BA%E7%A1%80%E9%85%8D%E7%BD%AE-1"><span class="nav-number">1.</span> <span class="nav-text">基础配置</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86-1"><span class="nav-number">2.</span> <span class="nav-text">实现原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%88%9D%E5%A7%8B%E5%8C%96"><span class="nav-number">2.1.</span> <span class="nav-text">初始化</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E6%96%87%E4%BB%B6%E9%87%8D%E5%91%BD%E5%90%8D"><span class="nav-number">2.2.</span> <span class="nav-text">文件重命名</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#%E5%86%99%E5%85%A5%E4%B8%8E%E8%BD%AE%E8%BD%AC"><span class="nav-number">2.3.</span> <span class="nav-text">写入与轮转</span></a></li></ol></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#%E5%B7%AE%E5%BC%82%E5%AF%B9%E6%AF%94"><span class="nav-number"></span> <span class="nav-text">差异对比</span></a></div>
+      </div>
+      <!--/noindex-->
+
+      <div class="site-overview-wrap sidebar-panel">
+        <div class="site-author motion-element" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="ToBrightMoon"
+      src="/images/avatar.png">
+  <p class="site-author-name" itemprop="name">ToBrightMoon</p>
+  <div class="site-description" itemprop="description">记录我的开发与成长，分享 C++ 和源码分析</div>
+</div>
+<div class="site-state-wrap motion-element">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+          <a href="/archives/">
+        
+          <span class="site-state-item-count">18</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+            <a href="/categories/">
+          
+        <span class="site-state-item-count">7</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+            <a href="/tags/">
+          
+        <span class="site-state-item-count">10</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author motion-element">
+      <span class="links-of-author-item">
+        <a href="https://github.com/ToBrightmoon" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;ToBrightmoon" rel="noopener" target="_blank"><i class="fab fa-github fa-fw"></i></a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="https://www.zhihu.com/people/meng-zhong-ren-5-90" title="知乎 → https:&#x2F;&#x2F;www.zhihu.com&#x2F;people&#x2F;meng-zhong-ren-5-90" rel="noopener" target="_blank"><i class="fa-custom zhihu fa-fw"></i></a>
+      </span>
+  </div>
+
+
+
+      </div>
+
+    </div>
+  </aside>
+  <div id="sidebar-dimmer"></div>
+
+
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        
+
+        
+
+<div class="copyright">
+  
+  &copy; 
+  <span itemprop="copyrightYear">2025</span>
+  <span class="with-love">
+    <i class="fa fa-heart"></i>
+  </span>
+  <span class="author" itemprop="copyrightHolder">ToBrightMoon</span>
+</div>
+  <div class="powered-by">由 <a href="https://hexo.io/" class="theme-link" rel="noopener" target="_blank">Hexo</a> & <a href="https://theme-next.org/" class="theme-link" rel="noopener" target="_blank">NexT.Gemini</a> 强力驱动
+  </div>
+
+        
+
+
+
+
+
+
+
+
+      </div>
+    </footer>
+  </div>
+
+  
+  <script src="/lib/anime.min.js"></script>
+  <script src="/lib/velocity/velocity.min.js"></script>
+  <script src="/lib/velocity/velocity.ui.min.js"></script>
+
+<script src="/js/utils.js"></script>
+
+<script src="/js/motion.js"></script>
+
+
+<script src="/js/schemes/pisces.js"></script>
+
+
+<script src="/js/next-boot.js"></script>
+
+
+
+
+  
+
+
+
+
+  
+<script src="/js/local-search.js"></script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+</body>
+</html>
