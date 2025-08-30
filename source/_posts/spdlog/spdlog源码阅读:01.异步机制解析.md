@@ -200,7 +200,7 @@ void basic_file_sink<Mutex>::sink_it_(const details::log_msg &msg) {
 上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
 
 可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
-![spdlog_seq.png](/images/spdlog_seq.png)
+![spdlog_seq.png](/images/spdlog/spdlog_seq.png)
 
 ### 强制刷新与结束线程
 在上面线程中的工作中提到了三种异步日志消息，`log`，`flush`,`terminate`。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
@@ -237,7 +237,7 @@ thread_pool::~thread_pool() {
 ### 类层次结构
 通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。
 他们的类关系图如下所示：
-![spdlog_class.png](/images/spdlog.png)
+![spdlog_class.png](/images/spdlog/spdlog.png)
 **logger**：用户打印日志的接口基类
 
 **formatter**：格式化日志消息的基类

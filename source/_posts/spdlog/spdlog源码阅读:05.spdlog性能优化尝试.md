@@ -38,11 +38,11 @@ tags:
 
 整体架构从原先的：
 
-![mpmc.png](/images/mpmc.png)
+![mpmc.png](/images/spdlog/mpmc.png)
 
 演变为：
 
-![spsc.png](/images/spsc.png)
+![spsc.png](/images/spdlog/spsc.png)
 ## 关键组件设计与实现
 
 为了实现上述思路，我们需要对 `spdlog` 的核心异步组件 `details::thread_pool` 进行改造，并引入新的队列类型。我们将改造后的线程池称为 `details::thread_pool_local`，新的 `logger` 实现称为 `async_logger_local`。

@@ -195,7 +195,7 @@ explicit compressed_file_sink(const filename_t &filename, size_t buffer_capacity
 - **formatter**：格式化日志消息。
 
 类图如下：
-![spdlog_sink_compress.png](/images/spdlog_sink_compress.png)
+![spdlog_sink_compress.png](/images/spdlog/spdlog_sink_compress.png)
 
 # 总结
 

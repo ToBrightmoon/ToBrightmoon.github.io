@@ -106,7 +106,7 @@ protected:
 
 下面是logger,sink和formatter三个类的类图:
 
-![logger类](/images/logger_sink.png)
+![logger类](/images/spdlog/logger_sink.png)
 ### **这样做有什么好处？**
 
 * **高度解耦：** logger、sink、formatter 三者职责清晰，logger 不关心输出细节，sink 不关心格式化细节。
@@ -205,7 +205,7 @@ inline std::shared_ptr<logger> basic_logger_mt(const std::string &logger_name,
 
 下面是工厂调用的时序图:
 
-![factory](/images/factory.png)
+![factory](/images/spdlog/factory.png)
 
 ### **这样做有什么好处？**
 
