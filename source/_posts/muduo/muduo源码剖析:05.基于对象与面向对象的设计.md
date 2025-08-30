@@ -169,7 +169,7 @@ muduo 的核心组件几乎都是：**具体类 + 回调注入**
 
 **类图示意：**
 
-![TcpServer](/images/TcpServer.png)
+![TcpServer](/images/muduo/TcpServer.png)
 
 **组合优于继承，行为通过注入，而非继承重写。**
 
@@ -225,7 +225,7 @@ void Channel::handleEvent(...) {
 
 **时序图：**
 
-![RAII](/images/raii.png)
+![RAII](/images/muduo/raii.png)
 
 保障了：
 

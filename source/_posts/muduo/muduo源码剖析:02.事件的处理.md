@@ -176,7 +176,7 @@ eventHandling_ = false;
 
 下面的就是loop事件循环的时序图:
 
-![loop循环](/images/loop循环.png)
+![loop循环](/images/muduo/loop循环.png)
 
 理解了 EventLoop 的核心驱动逻辑和 Channel 的事件分发机制后，我们就可以具体分析“三个半事件”的处理了。
 
@@ -305,7 +305,7 @@ connectionCallback_(shared_from_this()); // 调用用户设置的连接建立回
 
 这是建立连接的时序图：
 
-![建立新连接](/images/建立新连接.png)
+![建立新连接](/images/muduo/建立新连接.png)
 ## **事件二：收到消息 (MessageCallback)**
 
 当客户端发送数据时，TcpConnection 对应的 channel_ 会触发读事件，进而调用 TcpConnection::handleRead。
@@ -344,7 +344,7 @@ handleError(); // 通常也会调用 handleClose
 
 这是处理读事件的时序图:
 
-![收到消息](/images/处理消息.png)
+![收到消息](/images/muduo/处理消息.png)
 
 ## **事件三：消息发送完成 (WriteCompleteCallback)**
 
@@ -444,7 +444,7 @@ LOG_TRACE << "Connection fd = " << channel_->fd()
 
 这是上述过程的时序图
 
-![消息写完](/images/消息写完.png)
+![消息写完](/images/muduo/消息写完.png)
 
 ## **事件四：连接关闭**
 
@@ -531,7 +531,7 @@ EventLoop::removeChannel 会调用 Poller::removeChannel，最终通过 epoll_ct
 
 这是关闭连接的时序图:
 
-![连接关闭](/images/连接关闭.png)
+![连接关闭](/images/muduo/连接关闭.png)
 当 TcpConnectionPtr 的最后一个 shared_ptr 引用（通常是在 connectDestroyed 的 std::bind 对象析构时）消失后，TcpConnection 对象及其拥有的 Socket（会在析构时关闭 fd）和 Channel 对象会被自动析构，完成资源的彻底回收。
 
 这一套精心设计的流程，严格遵守了“对象生命周期管理”和“线程封闭”的原则，确保了连接关闭的正确性和资源的有效释放。

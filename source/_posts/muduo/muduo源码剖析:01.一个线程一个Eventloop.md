@@ -229,7 +229,7 @@ EventLoop 的构造函数中会检查 thread_local EventLoop* t_loopInThisThread
 
 下面是这个过程的时序图：
 
-![evntloop启动时序图](/images/eventloop启动.png)
+![evntloop启动时序图](/images/muduo/eventloop启动.png)
 
 ## **runInLoop：确保任务在正确的 EventLoop 中执行**
 
@@ -356,7 +356,7 @@ void EventLoop::doPendingFunctors()
 
 下面是这个过程的时序图：
 
-![eventloop事件传递](/images/eventloop传递事件.png)
+![eventloop事件传递](/images/muduo/eventloop传递事件.png)
 
 ## **后记**
 

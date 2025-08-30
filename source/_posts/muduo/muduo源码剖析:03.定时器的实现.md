@@ -365,7 +365,7 @@ return expired;
 
 下面是定时器到期处理的时序图,展示了 timerfd 触发后，TimerQueue 如何处理到期定时器的完整流程：
 
-![定时器到期处理](/images/定时器到期处理.png)
+![定时器到期处理](/images/muduo/定时器到期处理.png)
 
 ## **重置与重新调度：TimerQueue::reset**
 
@@ -465,7 +465,7 @@ assert(timers_.size() == activeTimers_.size());
 
 下面是取消操作的时序图,展示了通过 EventLoop::cancel 取消定时器的流程，包括线程安全处理和回调期间的取消逻辑:
 
-![取消操作](/images/取消操作.png)
+![取消操作](/images/muduo/取消操作.png)
 
 ## **Timer类与重复执行**
 
@@ -516,7 +516,7 @@ reset 方法中，如果一个定时器的 repeat() 为 true 且未被取消，�
 
 下面是添加重复执行任务的时序图,包括 Timer 对象的创建和 timerfd 的超时设置:
 
-![重复任务](/images/重复任务.png)
+![重复任务](/images/muduo/重复任务.png)
 
 ## **总结**
 
