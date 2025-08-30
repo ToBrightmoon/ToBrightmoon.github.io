@@ -464,7 +464,7 @@ void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#1
   </entry>
   <entry>
     <title>grpc实践之路:04.grpc异步回调接口的使用</title>
-    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <url>/2025/07/14/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
     <content><![CDATA[前言在之前的文章中，我们实现的服务端模型都有一个共同的特点：它们是同步的。无论是 Unary RPC 还是流式 RPC，我们的服务端实现在 RPC 处理函数中都会阻塞，直到该次请求处理完成。这意味着，为了同时服务多个客户端，gRPC 的同步服务器不得不在其内部的线程池中为每一个并发请求分配一个线程。这种“一个请求一个线程”的模式，在并发量不高时简单有效。但试想一下，当成千上万的客户端同时涌入时，服务器的线程资源会被迅速耗尽，系统将不堪重负。
 一个真正的高性能服务，必须具备“一人多能”的本领——用少量的核心线程，处理成千上万的并发请求。要做到这一点，我们必须拥抱异步编程。
 本文，我们将深入 gRPC C++ 最核心、也是官方最新推荐的异步服务模型——Callback API（回调式 API）。它也被称为“Reactor 模式”，因为它与我们熟悉的 muduo 等网络库的事件驱动思想如出一辙。我们将通过实践，构建一个真正意义上的高性能 gRPC 异步服务。
@@ -524,7 +524,7 @@ gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事
   </entry>
   <entry>
     <title>grpc实践之路:05.服务端与客户端的连接</title>
-    <url>/2025/07/14/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
+    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
     <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
 这引出了一个最根本的问题，也是本文将要探究的核心：
 一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
