@@ -221,7 +221,7 @@ int main(int argc, char **argv)
 先启动服务端，再启动客户端，你就能看到客户端成功获取到了服务端返回的版本号信息。一个完整的 RPC 调用就这么简单地完成了！
 
 下面就是这个服务的简单调用时序图
-![version_call](/images/version_call.png)
+![version_call](/images/grpc/version_call.png)
 
 
 ## **总结与展望**

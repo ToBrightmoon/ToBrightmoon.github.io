@@ -36,7 +36,7 @@ tags:
 这种长连接、持续推送的场景，正是流式服务大展拳脚的地方。
 
 下面是流的简单示意图:
-![stream](/images/stream.png)
+![stream](/images/grpc/stream.png)
 
 ## **第一步：在 .proto 中定义流式服务**
 
@@ -151,7 +151,7 @@ int main(int argc, char **argv)
 }
 ```
 下面是流服务产生数据的过程:
-![server](/images/server.png)
+![server](/images/grpc/server.png)
 在真实的项目中，我们不会在 RPC 处理函数里用一个循环来阻塞线程。更优雅的方式是，将 writer 对象保存起来，然后由 Service 层的其他部分（比如一个真正的日志系统）在产生新日志时，异步地调用这个 writer 的 Write 方法。
 
 ## **第三步：客户端实现 —— 成为一个“订阅者”**
@@ -231,7 +231,7 @@ int main(int argc, char **argv)
 ```
 
 下面是整个调用过程的时序图:
-![client](/images/client.png)
+![client](/images/grpc/client.png)
 ## **关于错误处理的初步思考**
 
 从上面的代码中，我们可以看到 gRPC 在流式通信中处理错误的基本方式：

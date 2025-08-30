@@ -102,7 +102,7 @@ return new GreeterReactor(request, response);
 };
 ```
 ---
-![reactor](/images/reactor_workflow.png)
+![reactor](/images/grpc/reactor_workflow.png)
 ## **第二步：理解新的异步工作流**
 
 这个基于 Reactor 的新模型，其工作流程是这样的：
@@ -115,7 +115,7 @@ return new GreeterReactor(request, response);
 6. **完成与销毁**： 当 gRPC 框架真正将响应发送完毕，并完成了所有清理工作后，它会调用 GreeterReactor::OnDone()。我们在这个回调函数中，安全地 delete this，完成 Reactor 对象的生命周期闭环。
 
 
-![com](/images/completion_queue_sequence-0.png)
+![com](/images/grpc/completion_queue_sequence-0.png)
 ### **扩展：如何实现异步的流式服务？**
 
 Reactor 模式对于流式 RPC 同样强大。让我们看看如何用它来实现一个服务端流式 RPC —— GetRealtimeLogs。
