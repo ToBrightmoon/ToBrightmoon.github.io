@@ -1,6 +1,7 @@
 ---
 title: "grpc实践之路:05.服务端与客户端的连接"
 date: 2025-07-18
+cover: /images/cover/grpc_cover.jpeg
 categories: 
   - 动手实践-三方库
   - grpc

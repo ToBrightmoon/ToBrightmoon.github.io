@@ -2,6 +2,7 @@
 ---
 title: "muduo源码剖析:04.Buffer设计分析"
 date: 2025-06-10
+cover: /images/cover/muduo_cover.png
 categories: 
   - 源码分析
   - muduo

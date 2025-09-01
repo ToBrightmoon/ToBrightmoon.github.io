@@ -1,6 +1,7 @@
 ---
 title: "spdlog源码阅读:05.spdlog性能优化尝试"
 date: 2025-05-13
+cover: /images/cover/spdlog_cover.png
 categories: 
   - 源码分析
   - spdlog

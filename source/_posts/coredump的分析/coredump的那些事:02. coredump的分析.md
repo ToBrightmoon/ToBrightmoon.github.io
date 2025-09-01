@@ -1,6 +1,7 @@
 ---
 title: "coredump的那些事:02.coredump的分析"
 date: 2025-08-29
+cover: /images/cover/coredump_cover.jpeg
 categories:
    - 程序员的自我修养
    - coredump

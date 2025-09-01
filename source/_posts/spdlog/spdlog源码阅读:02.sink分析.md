@@ -1,6 +1,7 @@
 ---
 title: "spdlog源码阅读:02.sink分析"
 date: 2025-04-30
+cover: /images/cover/spdlog_cover.png
 categories: 
   - 源码分析
   - spdlog

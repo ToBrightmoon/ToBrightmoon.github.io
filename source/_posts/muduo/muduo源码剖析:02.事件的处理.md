@@ -1,6 +1,7 @@
 ---
 title: "muduo源码剖析:02.事件的处理"
 date: 2025-05-31
+cover: /images/cover/muduo_cover.png
 categories: 
   - 源码分析
   - muduo

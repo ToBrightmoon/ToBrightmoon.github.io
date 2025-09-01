@@ -1,6 +1,7 @@
 ---
 title: "grpc实践之路:06.rpc的大问题思考"
 date: 2025-08-07
+cover: /images/cover/grpc_cover.jpeg
 categories: 
   - 动手实践-三方库
   - grpc

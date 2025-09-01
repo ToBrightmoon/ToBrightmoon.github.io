@@ -1,6 +1,7 @@
 ---
 title: "grpc实践之路:01.同步客户端的使用"
 date: 2025-06-30
+cover: /images/cover/grpc_cover.jpeg
 categories: 
   - 动手实践-三方库
   - grpc

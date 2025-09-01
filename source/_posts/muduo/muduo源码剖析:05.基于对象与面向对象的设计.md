@@ -2,6 +2,7 @@
 ---
 title: "muduo源码剖析:05.基于对象与面向对象的设计"
 date: 2025-06-13
+cover: /images/cover/muduo_cover.png
 categories: 
   - 源码分析
   - muduo

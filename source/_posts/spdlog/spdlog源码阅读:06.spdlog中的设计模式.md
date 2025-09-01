@@ -1,6 +1,7 @@
 ---
 title: "spdlog源码阅读:06.spdlog中的设计模式"
 date: 2025-06-20
+cover: /images/cover/spdlog_cover.png
 categories: 
   - 源码分析
   - spdlog

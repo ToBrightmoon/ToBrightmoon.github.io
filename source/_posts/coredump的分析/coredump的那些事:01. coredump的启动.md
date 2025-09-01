@@ -1,6 +1,7 @@
 ---
 title: "coredump的那些事:01.coredump的启动"
 date: 2025-08-20
+cover: /images/cover/coredump_cover.jpeg
 categories:
    - 程序员的自我修养
    - coredump

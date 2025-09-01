@@ -1,6 +1,7 @@
 ---
 title: "spdlog源码阅读:03.实现自定义压缩sink"
 date: 2025-05-06
+cover: /images/cover/spdlog_cover.png
 categories: 
   - 源码分析
   - spdlog

@@ -1,6 +1,7 @@
 ---
 title: "spdlog源码阅读:01.异步机制解析"
 date: 2025-04-24
+cover: /images/cover/spdlog_cover.png
 categories: 
   - 源码分析
   - spdlog

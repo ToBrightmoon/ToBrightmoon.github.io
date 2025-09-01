@@ -1,6 +1,7 @@
 ---
 title: "grpc实践之路:02.流的使用"
 date: 2025-07-02
+cover: /images/cover/grpc_cover.jpeg
 categories: 
   - 动手实践-三方库
   - grpc
