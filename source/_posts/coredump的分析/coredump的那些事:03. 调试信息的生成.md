@@ -84,7 +84,7 @@ g++ -o crash_no_debug crash.cpp
 
 ```text
 
-readelf -h crrash_debug
+readelf -h crash_debug
 
 ## 输出如下
 ELF 头：
@@ -121,7 +121,7 @@ ELF 头：
 然后，我们通过`readelf -S`命令去查看节点头(sections)
 
 ```text
-readlelf -S crrash_no_debug
+readelf -S crrash_no_debug
 
 There are 29 section headers, starting at offset 0x3690:
 
@@ -141,7 +141,7 @@ There are 29 section headers, starting at offset 0x3690:
 ```
 
 ```text
-readlelf -S crash_debug
+readelf -S crash_debug
 
 There are 35 section headers, starting at offset 0x39a0:
 
@@ -440,5 +440,8 @@ lookup_symbol_aux (const char *name, symbol_name_match_type match_type,
 
 > **一句话总结：**
 > `-g` 参数是 gdb 从“只能看十六进制地址”到“直接跳到源码行”的根本原因，背后依赖的就是 DWARF 格式调试信息。
+
+
+
 
 
