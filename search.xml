@@ -1,138 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <search>
   <entry>
-    <title>coredump的那些事:01.coredump的启动</title>
-    <url>/2025/08/19/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/</url>
-    <content><![CDATA[前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候，
-一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。
-注：本文的一些终端操作均在ubuntu22.04下进行
-
-coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册
-The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 whichcause a process to dump core can be found in signal(7)....
-上面的英文，使用中文简单总结就是:
-当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息
-从上面的介绍中可以得到一些信息:
-
-没有处理一些信号会导致进程终止并产生coredump文件
-coredump是操作系统产生的
-coredump可以供gdb调试器使用
-
-核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。
-产生coredump生成的信号那么到底那些信号会导致coredump的产生呢? 我们使用 man 7 signal 这个命令去查看信号的手册，在 Standard signals 小节中有着相关的内容，相关的内容如下
-Standard signals      Linux  supports  the  standard signals listed below.        ......      Signal      Standard   Action   Comment      ────────────────────────────────────────────────────────────────────────      SIGABRT      P1990      Core    Abort signal from abort(3)      SIGBUS       P2001      Core    Bus error (bad memory access)      SIGFPE       P1990      Core    Floating-point exception      SIGILL       P1990      Core    Illegal Instruction      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT      SIGQUIT      P1990      Core    Quit from keyboard      SIGSEGV      P1990      Core    Invalid memory reference      SIGSYS       P2001      Core    Bad system call (SVr4);                                      see also seccomp(2)      SIGTRAP      P2001      Core    Trace/breakpoint trap      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);                                      see setrlimit(2)      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);                                      see setrlimit(2)
-这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。
-具体的coredump的产生的细节，可以参考知乎上的一篇文章
-coredump的配置之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。
-coredump生成的限制Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 man 5 core这个命令去查看coredump的手册，去找到相关的内容:
-    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐    nal; see getrlimit(2) for details.    There are various circumstances in which a core dump file is not produced:    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumpedcore, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be createdis not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.    ......
-
-将手册中的内容简单使用中文总结就是:
-有多种情况会导致 不生成 core dump 文件：
-
-进程没有权限写 core 文件（默认文件名为 core 或 core.pid，存放在当前工作目录）。
-目标文件已存在并有多个硬链接。
-文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。
-目录不存在。
-RLIMIT_CORE 或 RLIMIT_FSIZE 被设置为 0。
-可执行文件没有读取权限（安全措施）。
-程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 prctl(2) PR_SET_DUMPABLE 和 /proc/sys/fs/suid_dumpable 允许）。
-/proc/sys/kernel/core_pattern 为空 且 /proc/sys/kernel/core_uses_pid &#x3D; 0。
-内核编译时未启用 CONFIG_COREDUMP（Linux 3.7+）。
-进程使用了 madvise(MADV_DONTDUMP) 屏蔽了部分地址空间。
-在 systemd 系统中，core dump 可能由 systemd-coredump(8) 接管。
-
-那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:
-针对系统本身:
-
-磁盘空间足够，支持生成coredump。
-生成coredump的大小在受限范围内。
-生成文件的目录存在。
-
-针对进程：
-
-进程未被systemd接管，没有屏蔽 地址空间
-有相关位置的读写权限。
-
-我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。
-此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容
-操作步骤临时开启linux提供了ulimit这个命令去修改coredump的限制，相关的内容可以通过 man ulimit去查阅。
-## 打开终端,修改系统限制为不限制 coredumop大小## 不要关闭终端，因为ulimit命令只在当前终端下生效。ulimit -c unlimited## 将当前的coredump输出目录修改成你的进程有权限读写的位置## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符sudo bash -c &#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下
-长久开启想要长久的配置coredump文件的启动，需要修改 /etc/security/limits.conf和 /etc/sysctl.conf 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效
-# 使用gedit工具打开limits.conf文件 sudo gedit /etc/security/limits.conf # 在文件的最后一行增加如下内容,注意*不能省略*               soft    core            unlimited # 编辑/etc/sysctl.conf文件sudo gedit /etc/sysctl.conf# 在文件的最后一行增加如下内容kernel.core_pattern=/path/%e-%p.core
-
-配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用
-创建服务文件:
-sudo gedit /etc/systemd/system/sysctl-reload.service
-
-文件内容如下所示
-[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target
-
-执行如下命令配置服务
-# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
-
-配套的脚本读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够知其然,也知其所以然,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。
-这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 ~/coredump 目录下。
-#!/bin/bash# 获取当前用户的用户名USERNAME=$(whoami)CORE_PATH=&quot;/home/$USERNAME/coredump&quot;# 创建coredump存储目录mkdir -p $CORE_PATH# 定义新脚本的文件名和路径SCRIPT_PATH=&quot;$CORE_PATH/rename_core.sh&quot;# 使用重定向符号将内容写入新脚本cat &lt;&lt; EOF &gt; $SCRIPT_PATH#!/bin/bashCOREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;EOFcat &lt;&lt; &#x27;EOF&#x27; &gt;&gt; $SCRIPT_PATHTIMESTAMP=&quot;$(date +%Y-%m-%d-%H-%M-%S)&quot;COREFILE_NAME=&quot;$&#123;1&#125;-$&#123;2&#125;-$TIMESTAMP.core&quot;# 创建coredump文件cat &gt; &quot;$COREFILE_DIR/$COREFILE_NAME&quot;EOFchmod +x $SCRIPT_PATH# 永久设置coredump文件大小限制sudo bash -c  &#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;sudo bash -c &#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;# 确保设置在重启后仍然有效echo &quot;Making changes persistent...&quot;sudo bash -c &#x27;echo &quot;kernel.core_pattern=|&#x27;$SCRIPT_PATH&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;SERVICE=&quot;/etc/systemd/system/sysctl-reload.service&quot;sudo bash -c &#x27;echo &quot;[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target&quot; &gt; &#x27;$SERVICE&#x27;&#x27;# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
-
-相关部分的部分内核源码解读之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。
-这个函数的位置是 linux内核中的 fs/coredump.c中。我查看的源码的分支是 v6.9,读者也可以从 https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635 这个网址查看。
-初始化参数struct mm_struct *mm = current-&gt;mm; // 进程的内存描述符，保存了进程的虚拟内存信息struct linux_binfmt * binfmt;......struct coredump_params cprm = &#123;	.siginfo = siginfo,	.limit = rlimit(RLIMIT_CORE), // coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）	.mm_flags = mm-&gt;flags,	.vma_meta = NULL,	.cpu = raw_smp_processor_id(),&#125;;
-
-这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制
-简单的检查如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败
-binfmt = mm-&gt;binfmt;if (!binfmt || !binfmt-&gt;core_dump)	goto fail;if (!__get_dumpable(cprm.mm_flags))	goto fail;
-
-输出方式的决定如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入
-ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);if (ispipe) &#123;   ......    /* 管道模式，把 core dump 交给用户态程序处理 */    sub_info = call_usermodehelper_setup(helper_argv[0],                        helper_argv, NULL, GFP_KERNEL,                        umh_pipe_setup, NULL, &amp;cprm);    retval = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);&#125; else &#123;    .....    // 检查文件的大小和suid模式下是否是绝对路径    if (cprm.limit &lt; binfmt-&gt;min_coredump)			goto fail_unlock;		if (need_suid_safe &amp;&amp; cn.corename[0] != &#x27;/&#x27;) &#123;			printk(KERN_WARNING &quot;Pid %d(%s) can only dump core &quot;\				&quot;to fully qualified path!\n&quot;,				task_tgid_vnr(current), current-&gt;comm);			printk(KERN_WARNING &quot;Skipping core dump\n&quot;);			goto fail_unlock;		&#125;    /* 文件模式，直接写入 core 文件 */    cprm.file = filp_open(cn.corename, open_flags, 0600);&#125;
-
-static int format_corename(struct core_name *cn, struct coredump_params *cprm,			   size_t **argv, int *argc)&#123;	....	int ispipe = (*pat_ptr == &#x27;|&#x27;); // 就是通过core_pattern 是否是| 决定的	bool was_space = false;	.....	// 一些coredump name的输出配置	while (*pat_ptr) &#123;		...		if (*pat_ptr != &#x27;%&#x27;) &#123;			err = cn_printf(cn, &quot;%c&quot;, *pat_ptr++);		&#125; else &#123;			switch (*++pat_ptr) &#123;			/* single % at the end, drop that */			case 0:				goto out;			/* Double percent, output one percent */			case &#x27;%&#x27;:				err = cn_printf(cn, &quot;%c&quot;, &#x27;%&#x27;);				break;			/* pid */			case &#x27;p&#x27;:				pid_in_pattern = 1;				err = cn_printf(cn, &quot;%d&quot;,					      task_tgid_vnr(current));				break;			...		&#125;		....	&#125;out:    ......	return ispipe;&#125;
-这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”
-写入内存镜像遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中
-if (!dump_vma_snapshot(&amp;cprm))		goto close_fail;	file_start_write(cprm.file);	core_dumped = binfmt-&gt;core_dump(&amp;cprm);	if (cprm.to_skip) &#123;		cprm.to_skip--;		dump_emit(&amp;cprm, &quot;&quot;, 1);	&#125;	file_end_write(cprm.file);	free_vma_snapshot(&amp;cprm);
-
-收尾关闭一些文件,回收些资源
-if (cprm.file)filp_close(cprm.file, NULL);coredump_finish(core_dumped);revert_creds(old_cred);put_cred(cred);
-
-总结本文围绕 coredump 的生成与配置 展开，主要内容如下：
-
-coredump 的本质
-
-操作系统在进程异常退出时生成的内存镜像文件
-可用于 gdb 等工具还原程序当时的运行状态
-
-
-生成条件与限制
-
-信号触发：SIGSEGV、SIGABRT、SIGBUS 等
-限制因素：RLIMIT_CORE、权限、文件系统、core_pattern 等
-
-
-配置方法
-
-临时配置：ulimit -c unlimited + 修改 /proc/sys/kernel/core_pattern
-长期配置：编辑 /etc/security/limits.conf、/etc/sysctl.conf，配合 systemd 保持生效
-
-
-内核实现
-
-do_coredump() 是核心函数
-负责检查限制、解析 core_pattern、最终写入 core 文件
-从源码角度验证了手册与实际操作的正确性
-
-
-
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>coredump</category>
-      </categories>
-      <tags>
-        <tag>coredump</tag>
-        <tag>linux</tag>
-        <tag>问题分析</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>coredump的那些事:02.coredump的分析</title>
     <url>/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:02.%20coredump%E7%9A%84%E5%88%86%E6%9E%90/</url>
     <content><![CDATA[前言在上一篇文章中，我们讲解了 如何配置 Linux 系统，让程序在崩溃时生成 coredump 文件。
@@ -276,6 +144,286 @@ coredump 是进程在崩溃瞬间的“冻结快照”，NOTE 段提供状态，
       </tags>
   </entry>
   <entry>
+    <title>coredump的那些事:01.coredump的启动</title>
+    <url>/2025/08/19/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/</url>
+    <content><![CDATA[前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候，
+一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。
+注：本文的一些终端操作均在ubuntu22.04下进行
+
+coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册
+The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 whichcause a process to dump core can be found in signal(7)....
+上面的英文，使用中文简单总结就是:
+当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息
+从上面的介绍中可以得到一些信息:
+
+没有处理一些信号会导致进程终止并产生coredump文件
+coredump是操作系统产生的
+coredump可以供gdb调试器使用
+
+核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。
+产生coredump生成的信号那么到底那些信号会导致coredump的产生呢? 我们使用 man 7 signal 这个命令去查看信号的手册，在 Standard signals 小节中有着相关的内容，相关的内容如下
+Standard signals      Linux  supports  the  standard signals listed below.        ......      Signal      Standard   Action   Comment      ────────────────────────────────────────────────────────────────────────      SIGABRT      P1990      Core    Abort signal from abort(3)      SIGBUS       P2001      Core    Bus error (bad memory access)      SIGFPE       P1990      Core    Floating-point exception      SIGILL       P1990      Core    Illegal Instruction      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT      SIGQUIT      P1990      Core    Quit from keyboard      SIGSEGV      P1990      Core    Invalid memory reference      SIGSYS       P2001      Core    Bad system call (SVr4);                                      see also seccomp(2)      SIGTRAP      P2001      Core    Trace/breakpoint trap      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);                                      see setrlimit(2)      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);                                      see setrlimit(2)
+这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。
+具体的coredump的产生的细节，可以参考知乎上的一篇文章
+coredump的配置之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。
+coredump生成的限制Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 man 5 core这个命令去查看coredump的手册，去找到相关的内容:
+    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐    nal; see getrlimit(2) for details.    There are various circumstances in which a core dump file is not produced:    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumpedcore, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be createdis not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.    ......
+
+将手册中的内容简单使用中文总结就是:
+有多种情况会导致 不生成 core dump 文件：
+
+进程没有权限写 core 文件（默认文件名为 core 或 core.pid，存放在当前工作目录）。
+目标文件已存在并有多个硬链接。
+文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。
+目录不存在。
+RLIMIT_CORE 或 RLIMIT_FSIZE 被设置为 0。
+可执行文件没有读取权限（安全措施）。
+程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 prctl(2) PR_SET_DUMPABLE 和 /proc/sys/fs/suid_dumpable 允许）。
+/proc/sys/kernel/core_pattern 为空 且 /proc/sys/kernel/core_uses_pid &#x3D; 0。
+内核编译时未启用 CONFIG_COREDUMP（Linux 3.7+）。
+进程使用了 madvise(MADV_DONTDUMP) 屏蔽了部分地址空间。
+在 systemd 系统中，core dump 可能由 systemd-coredump(8) 接管。
+
+那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:
+针对系统本身:
+
+磁盘空间足够，支持生成coredump。
+生成coredump的大小在受限范围内。
+生成文件的目录存在。
+
+针对进程：
+
+进程未被systemd接管，没有屏蔽 地址空间
+有相关位置的读写权限。
+
+我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。
+此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容
+操作步骤临时开启linux提供了ulimit这个命令去修改coredump的限制，相关的内容可以通过 man ulimit去查阅。
+## 打开终端,修改系统限制为不限制 coredumop大小## 不要关闭终端，因为ulimit命令只在当前终端下生效。ulimit -c unlimited## 将当前的coredump输出目录修改成你的进程有权限读写的位置## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符sudo bash -c &#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下
+长久开启想要长久的配置coredump文件的启动，需要修改 /etc/security/limits.conf和 /etc/sysctl.conf 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效
+# 使用gedit工具打开limits.conf文件 sudo gedit /etc/security/limits.conf # 在文件的最后一行增加如下内容,注意*不能省略*               soft    core            unlimited # 编辑/etc/sysctl.conf文件sudo gedit /etc/sysctl.conf# 在文件的最后一行增加如下内容kernel.core_pattern=/path/%e-%p.core
+
+配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用
+创建服务文件:
+sudo gedit /etc/systemd/system/sysctl-reload.service
+
+文件内容如下所示
+[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target
+
+执行如下命令配置服务
+# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+配套的脚本读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够知其然,也知其所以然,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。
+这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 ~/coredump 目录下。
+#!/bin/bash# 获取当前用户的用户名USERNAME=$(whoami)CORE_PATH=&quot;/home/$USERNAME/coredump&quot;# 创建coredump存储目录mkdir -p $CORE_PATH# 定义新脚本的文件名和路径SCRIPT_PATH=&quot;$CORE_PATH/rename_core.sh&quot;# 使用重定向符号将内容写入新脚本cat &lt;&lt; EOF &gt; $SCRIPT_PATH#!/bin/bashCOREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;EOFcat &lt;&lt; &#x27;EOF&#x27; &gt;&gt; $SCRIPT_PATHTIMESTAMP=&quot;$(date +%Y-%m-%d-%H-%M-%S)&quot;COREFILE_NAME=&quot;$&#123;1&#125;-$&#123;2&#125;-$TIMESTAMP.core&quot;# 创建coredump文件cat &gt; &quot;$COREFILE_DIR/$COREFILE_NAME&quot;EOFchmod +x $SCRIPT_PATH# 永久设置coredump文件大小限制sudo bash -c  &#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;sudo bash -c &#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;# 确保设置在重启后仍然有效echo &quot;Making changes persistent...&quot;sudo bash -c &#x27;echo &quot;kernel.core_pattern=|&#x27;$SCRIPT_PATH&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;SERVICE=&quot;/etc/systemd/system/sysctl-reload.service&quot;sudo bash -c &#x27;echo &quot;[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target&quot; &gt; &#x27;$SERVICE&#x27;&#x27;# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+相关部分的部分内核源码解读之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。
+这个函数的位置是 linux内核中的 fs/coredump.c中。我查看的源码的分支是 v6.9,读者也可以从 https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635 这个网址查看。
+初始化参数struct mm_struct *mm = current-&gt;mm; // 进程的内存描述符，保存了进程的虚拟内存信息struct linux_binfmt * binfmt;......struct coredump_params cprm = &#123;	.siginfo = siginfo,	.limit = rlimit(RLIMIT_CORE), // coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）	.mm_flags = mm-&gt;flags,	.vma_meta = NULL,	.cpu = raw_smp_processor_id(),&#125;;
+
+这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制
+简单的检查如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败
+binfmt = mm-&gt;binfmt;if (!binfmt || !binfmt-&gt;core_dump)	goto fail;if (!__get_dumpable(cprm.mm_flags))	goto fail;
+
+输出方式的决定如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入
+ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);if (ispipe) &#123;   ......    /* 管道模式，把 core dump 交给用户态程序处理 */    sub_info = call_usermodehelper_setup(helper_argv[0],                        helper_argv, NULL, GFP_KERNEL,                        umh_pipe_setup, NULL, &amp;cprm);    retval = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);&#125; else &#123;    .....    // 检查文件的大小和suid模式下是否是绝对路径    if (cprm.limit &lt; binfmt-&gt;min_coredump)			goto fail_unlock;		if (need_suid_safe &amp;&amp; cn.corename[0] != &#x27;/&#x27;) &#123;			printk(KERN_WARNING &quot;Pid %d(%s) can only dump core &quot;\				&quot;to fully qualified path!\n&quot;,				task_tgid_vnr(current), current-&gt;comm);			printk(KERN_WARNING &quot;Skipping core dump\n&quot;);			goto fail_unlock;		&#125;    /* 文件模式，直接写入 core 文件 */    cprm.file = filp_open(cn.corename, open_flags, 0600);&#125;
+
+static int format_corename(struct core_name *cn, struct coredump_params *cprm,			   size_t **argv, int *argc)&#123;	....	int ispipe = (*pat_ptr == &#x27;|&#x27;); // 就是通过core_pattern 是否是| 决定的	bool was_space = false;	.....	// 一些coredump name的输出配置	while (*pat_ptr) &#123;		...		if (*pat_ptr != &#x27;%&#x27;) &#123;			err = cn_printf(cn, &quot;%c&quot;, *pat_ptr++);		&#125; else &#123;			switch (*++pat_ptr) &#123;			/* single % at the end, drop that */			case 0:				goto out;			/* Double percent, output one percent */			case &#x27;%&#x27;:				err = cn_printf(cn, &quot;%c&quot;, &#x27;%&#x27;);				break;			/* pid */			case &#x27;p&#x27;:				pid_in_pattern = 1;				err = cn_printf(cn, &quot;%d&quot;,					      task_tgid_vnr(current));				break;			...		&#125;		....	&#125;out:    ......	return ispipe;&#125;
+这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”
+写入内存镜像遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中
+if (!dump_vma_snapshot(&amp;cprm))		goto close_fail;	file_start_write(cprm.file);	core_dumped = binfmt-&gt;core_dump(&amp;cprm);	if (cprm.to_skip) &#123;		cprm.to_skip--;		dump_emit(&amp;cprm, &quot;&quot;, 1);	&#125;	file_end_write(cprm.file);	free_vma_snapshot(&amp;cprm);
+
+收尾关闭一些文件,回收些资源
+if (cprm.file)filp_close(cprm.file, NULL);coredump_finish(core_dumped);revert_creds(old_cred);put_cred(cred);
+
+总结本文围绕 coredump 的生成与配置 展开，主要内容如下：
+
+coredump 的本质
+
+操作系统在进程异常退出时生成的内存镜像文件
+可用于 gdb 等工具还原程序当时的运行状态
+
+
+生成条件与限制
+
+信号触发：SIGSEGV、SIGABRT、SIGBUS 等
+限制因素：RLIMIT_CORE、权限、文件系统、core_pattern 等
+
+
+配置方法
+
+临时配置：ulimit -c unlimited + 修改 /proc/sys/kernel/core_pattern
+长期配置：编辑 /etc/security/limits.conf、/etc/sysctl.conf，配合 systemd 保持生效
+
+
+内核实现
+
+do_coredump() 是核心函数
+负责检查限制、解析 core_pattern、最终写入 core 文件
+从源码角度验证了手册与实际操作的正确性
+
+
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>coredump</category>
+      </categories>
+      <tags>
+        <tag>coredump</tag>
+        <tag>linux</tag>
+        <tag>问题分析</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>coredump的那些事:03.调试信息的生成</title>
+    <url>/2025/09/03/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:03.%20%E8%B0%83%E8%AF%95%E4%BF%A1%E6%81%AF%E7%9A%84%E7%94%9F%E6%88%90/</url>
+    <content><![CDATA[前言在之前的文章中，我们已经深入的的讲解了coredump文件的生成过程以及coredump的使用。我们也得到了一个核心的结论：调试程序的时候，只需要个三个关键的信息
+
+可执行的程序
+coredump文件
+调试信息
+
+针对其中的coredump的相关内容，我们已经进行了详细的讲解，这篇文章我们将详细的讲解关于调试信息的相关内容。
+在本篇文章中你将了解到:
+
+DWARF调试格式
+为什么strip之后gdb什么都看不到
+调试信息的生成与使用
+
+注:本文使用的Linux是ubuntu22.04，gcc版本是13.1
+问题的引出无符号问题现在很多同学都会遇到这种情况,自己本地写程序，出现死机问题了，直接IDE本地调试，然后去查IDE为什么能调试，知道是使用了 gdb，也了解了coredump。
+等到工作了，遇到了这种 coredump问题，被安排去练手，因为有coredump文件的问题其实难度是比较低的，然后根据自己的经验使用 gdb调试，结果发现：
+
+没有源码行号
+
+没有调用栈
+
+没有变量名
+
+
+一脸懵逼，甚至怀疑自己用的是“假的 gdb”。
+实际上，这并不是 gdb 的问题，而是因为生产环境里的程序几乎总是：
+
+Release 模式编译
+
+strip 过符号
+
+
+去减小文件大小和提升性能。
+此时生成的ELF文件缺少了调试信息，gdb只能通过coredump文件的PT_NODE和PT_LOAD，没有办法映射到源代码。
+本地开发的时候，很多人默认使用的是Debug模式，此时默认就保留了调试信息，所以一切正常。自己使用ide的时候开启release模式，无法直接使用断点调试与这个问题其实是一致的，都是缺少了调试信息 。
+-g参数的作用还是从一个实际的例子出发，我们沿用上一篇文章的coredump代码
+&#x2F;&#x2F; crash.cpp
+void corrupt_heap()&#123;    int *p = nullptr;    *p = 10;   // 崩溃点&#125;int main()&#123;    corrupt_heap();    return 0;&#125;
+
+使用如下命令去产生带调试信息和不带调试信息的可执行文件:
+## 产生带调试信息的g++ -g -o crash_debug crash.cpp## 产生不带调试信息的g++ -o crash_no_debug crash.cpp
+
+使用 readelf -h 命令分别查看两个文件的程序头
+readelf -h crrash_debug## 输出如下ELF 头：  Magic：   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00   类别:                              ELF64  数据:                              2 补码，小端序 (little endian)  ......  Size of this header:               64 (bytes)  Size of program headers:           56 (bytes)  Number of program headers:         13  Size of section headers:           64 (bytes)  Number of section headers:         35  Section header string table index: 34
+
+readelf -h crash_no_debugELF 头：  Magic：   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00   类别:                              ELF64  数据:                              2 补码，小端序 (little endian)  ......  Size of this header:               64 (bytes)  Size of program headers:           56 (bytes)  Number of program headers:         13  Size of section headers:           64 (bytes)  Number of section headers:         29  Section header string table index: 28
+
+通过比较可以发现二者的输出结果主要区别在于大小和Number of section headers,因为程序头主要是用来加载可执行程序的，有无调试信息二者的区别并不大。
+然后，我们通过readelf -S命令去查看节点头(sections)
+readlelf -S crrash_no_debugThere are 29 section headers, starting at offset 0x3690:节头：  [号] 名称              类型             地址              偏移量       大小              全体大小          旗标   链接   信息   对齐  [ 0]                   NULL             0000000000000000  00000000       0000000000000000  0000000000000000           0     0     0  .....  [26] .symtab           SYMTAB           0000000000000000  00003040       0000000000000360  0000000000000018          27    18     8  [27] .strtab           STRTAB           0000000000000000  000033a0       00000000000001de  0000000000000000           0     0     1  [28] .shstrtab         STRTAB           0000000000000000  0000357e       000000000000010c  0000000000000000           0     0     1.....
+
+readlelf -S crash_debugThere are 35 section headers, starting at offset 0x39a0:节头：  [号] 名称              类型             地址              偏移量       大小              全体大小          旗标   链接   信息   对齐  [ 0]                   NULL             0000000000000000  00000000       0000000000000000  0000000000000000           0     0     0  .......  [26] .debug_aranges    PROGBITS         0000000000000000  0000303b       0000000000000030  0000000000000000           0     0     1  [27] .debug_info       PROGBITS         0000000000000000  0000306b       000000000000008a  0000000000000000           0     0     1  [28] .debug_abbrev     PROGBITS         0000000000000000  000030f5       000000000000006d  0000000000000000           0     0     1  [29] .debug_line       PROGBITS         0000000000000000  00003162       000000000000005c  0000000000000000           0     0     1  [30] .debug_str        PROGBITS         0000000000000000  000031be       00000000000000b4  0000000000000001  MS       0     0     1  [31] .debug_line_str   PROGBITS         0000000000000000  00003272       000000000000008a  0000000000000001  MS       0     0     1  [32] .symtab           SYMTAB           0000000000000000  00003300       0000000000000360  0000000000000018          33    18     8  [33] .strtab           STRTAB           0000000000000000  00003660       00000000000001de  0000000000000000           0     0     1  [34] .shstrtab         STRTAB           0000000000000000  0000383e       000000000000015c  0000000000000000           0     0     1.....
+
+可以发现二者的主要区别就在于，带调试信息的ELF文件多了很多 debug_* 段，这些段就包含了调试信息，内核在加载的时候会忽略这些，但是gdb调试器会读取这些信息。
+DWARF 调试信息讲解之前一直使用调试信息这个通俗的叫法，实际上这个调试信息有专有的名词：DWARF（Debugging With Attributed Record Formats），是Linux ELF的标准调试格式。
+为什么strip之后gdb调试器就不能直接显示源码行数了？就是因为这些段被剥离了。
+在这里简单的介绍DWARF一些常用的段,更加详细，权威的描述参考 https://dwarfstd.org/doc/DWARF5.pdf。
+
+debug_info：核心 DIE 树，描述编译单元、函数（DW_TAG_subprogram）、变量（DW_TAG_variable）、类型（DW_TAG_class_type for C++ 类）。作用：GDB 解析类型&#x2F;符号，显示变量值（如 std::vector 的长度&#x2F;容量）。
+debug_abbrev：缩写表，压缩 .debug_info 的 DIE 格式。作用：加速 GDB 解析，减少冗余。
+debug_line：行号表（状态机编码），映射地址到源行&#x2F;文件。作用：GDB 用 RIP（从 core）找源代码行，支持断点&#x2F;步进。
+debug_frame：CFI，描述栈帧布局&#x2F;寄存器恢复。作用：GDB 栈回溯（bt），展开调用链。
+debug_str：字符串表（名称&#x2F;路径）。作用：提供可读字符串，GDB 显示函数&#x2F;变量名。
+
+调试信息的处理在这个小节就简单介绍，处理符号文件的几个简单的命令。符号文件的专业管理
+调试符号的剥离objcopy --only-keep-debug crash crash.dbg  # 提取符号到crash.dbgobjcopy --strip-debug crash                # 剥离crash中的调试信息
+crash为生产用精简二进制，crash.dbg为独立符号文件。objcopy优于strip，因为它保留build-id（位于.note.gnu.build-id），便于GDB匹配。
+C++程序因模板和类膨胀严重，可用-gsplit-dwarf生成.dwo文件，进一步分离符号。压缩符号文件：dwz crash.dbg可减少50%体积。自动化建议：在CI&#x2F;CD（如Jenkins）中加入脚本，确保每次构建生成匹配的符号文件：
+# 示例脚本objcopy --only-keep-debug crash crash.dbgobjcopy --strip-debug crashdwz crash.dbg
+调试信息的链接符号文件因为包含了很多敏感信息，实际上都是被管理起来的，比如debuginfod这个开源符号管理器。
+可以通过在本地配置debuginfod的服务器地址，可以自动拉取这个符号文件。
+export DEBUGINFOD_URLS=&quot;https://your.debuginfod.server&quot;
+
+当然，你要是很喜欢手动操作一切,可以直接使用。
+objcopy --only-keep-debug crash crash.dbgobjcopy --strip-debug --add-gnu-debuglink=crash.dbg crash
+将符号文件去嵌入到可执行程序中。
+源码解读在这一小节我们就通过gcc的源码和gdb的源码简单的看一下DWARF文件的生成过程与使用过程。
+GCC 如何生成 DWARF在 GCC 中，调试信息的生成发生在 后端阶段，核心代码在 gcc/dwarf2out.c。
+整体流程
+**前端 (parser)**：构建 AST，每个变量&#x2F;函数是一个 tree 节点。
+**后端 (expand&#x2F;final)**：在生成汇编时调用 dwarf2out_* 系列函数。
+dwarf2out.c：将 tree 转换为 DIE（Debugging Information Entry），写入 .debug_info 等段。
+
+关键函数片段变量&#x2F;函数声明：
+static voiddwarf2out_decl (tree decl)&#123;  dw_die_ref context_die = comp_unit_die ();  // 处理各种情况,函数，变量，类型等等  switch (TREE_CODE (decl))    &#123;    case ERROR_MARK:      return;    case FUNCTION_DECL:      ....      if (early_dwarf	  &amp;&amp; decl_function_context (decl)	  &amp;&amp; debug_info_level &gt; DINFO_LEVEL_TERSE)	context_die = NULL;      break;    case VAR_DECL:      if (local_function_static (decl))	context_die = lookup_decl_die (DECL_CONTEXT (decl));           if (debug_info_level &lt; DINFO_LEVEL_TERSE	  || (debug_info_level == DINFO_LEVEL_TERSE	      &amp;&amp; !TREE_PUBLIC (decl)))	return;      break;    ......    default:      return;    &#125;    // 生成调试信息  gen_decl_die (decl, NULL, NULL, context_die);  ......&#125;
+
+每一个 C++ 里的变量&#x2F;函数声明，最终都会被转成一个 DIE 节点，并写到 .debug_info。
+行号信息：
+static voiddwarf2out_source_line (unsigned int line, unsigned int column,		       const char *filename,                       int discriminator, bool is_stmt)&#123;  unsigned int file_num;  dw_line_info_table *table;  static var_loc_view lvugid;  // 如果 debug 信息等级太低，或者 DWARF 没启用，直接返回，不输出任何行号信息  if (debug_info_level &lt; DINFO_LEVEL_TERSE || !dwarf_debuginfo_p ())    return;  table = cur_line_info_table;  ......  // 更新行号信息  table-&gt;file_num = file_num;  table-&gt;line_num = line;  table-&gt;column_num = column;  table-&gt;discrim_num = discriminator;  table-&gt;is_stmt = is_stmt;  table-&gt;in_use = true;&#125;
+
+建立 地址 → 源码行号 的映射，写到 .debug_line，这是为什么 gdb 能显示 list 和断点对应到源码行。
+GDB 如何使用 DWARFGDB在调试时读取ELF中的DWARF信息，主要由gdb&#x2F;dwarf2&#x2F;read.c负责。该文件实现了DWARF解析器，将节加载到内存，构建符号表、行号表等，用于断点、变量检查等。
+整体流程
+加载 ELF：使用 bfd 打开 ELF，找到 .debug_* 段。
+dwarf2read.c：解析 .debug_info、.debug_line，构建符号表。
+symtab.c：提供 lookup_symbol 等接口，供用户操作（如 break main、print a）。
+
+关键函数片段初始化符号表：
+// gdb/dwarf2/read.cbooldwarf2_initialize_objfile (struct objfile *objfile,			   const struct dwarf2_debug_sections *names,			   bool can_copy)&#123;  // 检查是否具有可用的调试  if (!dwarf2_has_info (objfile, names, can_copy))    return false;  // 解析使用的上下文对象  dwarf2_per_objfile *per_objfile = get_dwarf2_per_objfile (objfile);  dwarf2_per_bfd *per_bfd = per_objfile-&gt;per_bfd;  dwarf_read_debug_printf (&quot;called&quot;);      // 具体的解析函数与策略  if ((objfile-&gt;flags &amp; OBJF_READNOW))  ......  return true;&#125;
+
+加载 ELF 文件时，GDB 会调用这个函数，开始读取 DWARF。
+符号查找：
+// gdb/symtab.c// 从一个作用域中找符号static struct block_symbollookup_symbol_aux (const char *name, symbol_name_match_type match_type,		   const struct block *block,		   const domain_search_flags domain, enum language language,		   struct field_of_this_result *is_a_field_of_this)&#123;  ......  // 局部作用域  result = lookup_local_symbol (name, match_type, block, domain, language);  if (result.symbol != NULL)    &#123;      symbol_lookup_debug_printf	(&quot;found symbol @ %s (using lookup_local_symbol)&quot;,	 host_address_to_string (result.symbol));      return result;    &#125;  langdef = language_def (language);  // 当成成员变量去找  if (is_a_field_of_this != NULL &amp;&amp; (domain &amp; SEARCH_STRUCT_DOMAIN) == 0)    &#123;      result = lookup_language_this (langdef, block);      if (result.symbol)	&#123;	  ......	  if (check_field (t, name, is_a_field_of_this))	    &#123;	      symbol_lookup_debug_printf (&quot;no symbol found&quot;);	      return &#123;&#125;;	    &#125;	&#125;    &#125;    // 全局去找  result = langdef-&gt;lookup_symbol_nonlocal (name, block, domain);  if (result.symbol != NULL)    &#123;     ....      return result;    &#125;    // 静态符号兜底  result = lookup_static_symbol (name, domain);  symbol_lookup_debug_printf    (&quot;found symbol @ %s (using lookup_static_symbol)&quot;,     result.symbol != NULL ? host_address_to_string (result.symbol) : &quot;NULL&quot;);  return result;&#125;
+
+当你在 gdb 输入 break main 或 print a 时，GDB 就利用这个函数查找符号。
+总结本篇文章围绕 -g 参数与调试信息 展开：
+从gdb 看不到行号、变量名这一问题出发，说明了：
+
+生产环境中默认编译成 release 并 strip，导致 ELF 缺少 .debug_* 段
+
+并通过实际的例子，讲解了-g参数的作用：
+
+-g 参数告诉编译器生成 DWARF 调试信息，写入 ELF 的 .debug_info、.debug_line 等段，供调试器使用
+
+并介绍了符号处理的几个命令:
+
+使用 readelf -S 可以验证调试段是否存在；
+strip 会移除调试段；
+objcopy --only-keep-debug 可以分离调试符号文件，并配合 --add-gnu-debuglink 或 debuginfod 使用。
+
+最后，简单看一下 gcc和gdb的相关源码：
+
+GCC 在 dwarf2out.c 中生成调试信息，将变量、函数、行号写入 DWARF 段；
+GDB 在 dwarf2read.c 中解析调试信息，构建 DIE 树，支持 bt、print、break 等命令。
+
+从开发者的角度看：
+
+没有 -g： gdb 只能看到裸地址和汇编。
+有 -g： gdb 能直接映射到源码行、变量、函数名。
+最佳实践： 在生产环境保留分离式符号文件，在本地或符号服务器上调试，兼顾安全与可用性。
+
+
+一句话总结：-g 参数是 gdb 从“只能看十六进制地址”到“直接跳到源码行”的根本原因，背后依赖的就是 DWARF 格式调试信息。
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>coredump</category>
+      </categories>
+      <tags>
+        <tag>coredump</tag>
+        <tag>linux</tag>
+        <tag>问题分析</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>grpc实践之路:01.同步客户端的使用</title>
     <url>/2025/06/29/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:01.%E5%90%8C%E6%AD%A5%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
     <content><![CDATA[前言：因为最近的个人需要,想要自己多做一点实践，因此我决定 ：开发一个带 GUI 的、用于管理和监控一个外部核心服务 (Core Service) 的跨平台桌面应用。 
@@ -346,6 +494,57 @@ client.cc
       </tags>
   </entry>
   <entry>
+    <title>grpc实践之路:03.Qt与grpc的集成使用</title>
+    <url>/2025/07/07/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:03.Qt%E4%B8%8Egrpc%E7%9A%84%E9%9B%86%E6%88%90%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们从一个Qt应用的角度出发，探讨了怎么使用grpc作为进程间通信的手段，进行点对点的调用，并且讲解了怎么处理服务端产生的流数据。但是，既然都没涉及到Qt相关的内容，本篇文章就讲解下在Qt中怎么去使用Grpc作为客户端的集成。
+Qt作为一个主要应用在GUI中的应用框架，在其中最大的挑战就是：如何避免阻塞 UI 主线程。当然可以利用QThread和信号槽的机制去解决这个问题，但是却有些繁琐，需要我们自己去进行线程管理和对象的生命周期。但是，好消息是自动 Qt6.9版本之后，Qt 官方已经正式提供了对 gRPC 的原生支持 (Qt Grpc 模块)。这意味着我们不再需要手动创建线程来包装gRPC 调用了。Qt 将 gRPC与它核心的事件循环和信号槽机制完美地融合在了一起。
+本文，我们将探索这个“官方解决方案”，看看如何利用 Qt Grpc 模块，以一种前所未有的、极其优雅的方式，在 Qt 应用中实践 gRPC 通信。
+
+准备工作：CMake 与 Qt gRPC 模块要使用 Qt 官方的 gRPC 支持，首先你需要确保在安装 Qt 时，已经勾选并安装了 Qt Protobuf 和 Qt Grpc 这两个模块，并且安装好了Grpc和Protobuf。
+并且Qt官方也提供了Grpc的函数去处理grpc的原生命令
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.16)  project(MyGrpcQtProject)#配置你的项目,保证先安装了grpc和protobuf# 找到 Qt6，并确保 Protobuf 和 Grpc 组件可用  find_package(Qt6 REQUIRED COMPONENTS Protobuf Grpc)  qt_standard_project_setup()# 添加你的可执行文件  qt_add_executable(MyApp main.cpp clientguide.cpp) # 假设你的客户端逻辑在 clientguide.cpp# Qt 提供的 magic command，自动处理 .proto 文件！  # 它会调用 protoc 和 grpc_cpp_plugin 生成 Qt 风格的代码  qt_add_grpc(MyApp CLIENT # 或者 SERVER, BIDI  PROTO_FILES  path/to/your/service.proto  )# 链接到 Qt 提供的库  target_link_libraries(MyApp PRIVATE Qt6::Protobuf Qt6::Grpc)
+
+qt_add_grpc 这个命令了它会自动处理代码生成和编译，也不需要去手动处理proto文件的生成c代码了
+代码生成我们还是使用之前类似的 .proto 文件，但这次，由 qt_add_grpc 生成的文件会有些不同，它们是为 Qt 量身定做的。
+clientguide.proto
+syntax = &quot;proto3&quot;;  package client.guide; // enclosing namespacemessage Request &#123; /* ... */ &#125;  message Response &#123; /* ... */ &#125;service ClientGuideService &#123;  rpc UnaryCall (Request) returns (Response);  rpc ServerStreaming (Request) returns (stream Response);&#125;
+
+生成的文件名会带有 .qpb.h 和 .grpc.qpb.h 的后缀。它们不仅包含了 Protobuf 消息的 C++ 类，更重要的是，生成的 gRPC Stub 和Service 基类，其所有方法都原生返回 Qt 的异步对象，并通过信号槽来通知结果。
+下面是生成Qt grpc中源码生成的示意图
+实践：一个纯 Qt 风格的体验现在，让我们看看 Qt 官方示例中的客户端代码是如何利用这些新工具的。
+clientguide.cpp (核心逻辑)
+1. 初始化：创建 Channel 和 Client Stub//引入Qt生成的头文件#include &quot;clientguide.qpb.h&quot;#include &quot;clientguide_client.grpc.qpb.h&quot;//! [gen-includes]#include &lt;QtGrpc/QGrpcHttp2Channel&gt;#include &lt;QtGrpc/QGrpcServerStream.h&gt;#include &lt;QtCore/QCommandLineParser&gt;#include &lt;QtCore/QCoreApplication&gt;#include &lt;QtCore/QDateTime&gt;#include &lt;QtCore/QProcess&gt;#include &lt;QtCore/QThread&gt;#include &lt;QtCore/QUrl&gt;#include &lt;limits&gt;#include &lt;memory&gt;using namespace client;void startServerProcess();QDebug operator&lt;&lt;(QDebug debug, const guide::Response &amp;response);class ClientGuide : public QObject&#123;public:    explicit ClientGuide(std::shared_ptr&lt;QAbstractGrpcChannel&gt; channel)    &#123;        // 将 Qt 的 Channel 附加到 Qt 生成的 Client Stub 上         // 这一步和原生 gRPC 类似，但 Channel 和 Client 都是 Qt gRPC 提供的类型。        m_client.attachChannel(std::move(channel));    &#125;    static guide::Request createRequest(int32_t num, bool fail = false)    &#123;        guide::Request request;        request.setNum(num);        request.setTime(fail ? std::numeric_limits&lt;int64_t&gt;::max()                             : QDateTime::currentMSecsSinceEpoch());        return request;    &#125;       void unaryCall(const guide::Request &amp;request)    &#123;        std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);        const auto *replyPtr = reply.get();        QObject::connect(            replyPtr, &amp;QGrpcCallReply::finished, replyPtr,            [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;                if (status.isOk()) &#123;                    if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                        qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;                    else                        qDebug(&quot;Client (UnaryCall) deserialization failed&quot;);                &#125; else &#123;                    qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;                &#125;            &#125;,            Qt::SingleShotConnection);    &#125;    void serverStreaming(const guide::Request &amp;initialRequest)    &#123;        std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);        const auto *streamPtr = stream.get();        QObject::connect(            streamPtr, &amp;QGrpcServerStream::finished, streamPtr,            [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;                if (status.isOk())                    qDebug(&quot;Client (ServerStreaming) finished&quot;);                else                    qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;            &#125;,            Qt::SingleShotConnection);        QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, streamPtr, [streamPtr] &#123;            if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())                qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;            else                qDebug(&quot;Client (ServerStream) deserialization failed&quot;);        &#125;);    &#125;private:    guide::ClientGuideService::Client m_client;&#125;;int main(int argc, char *argv[])&#123;    QCoreApplication app(argc, argv);    QCommandLineParser parser;    QCommandLineOption enableUnary(&quot;U&quot;, &quot;Enable UnaryCalls&quot;);    QCommandLineOption enableSStream(&quot;S&quot;, &quot;Enable ServerStream&quot;);    parser.addHelpOption();    parser.addOption(enableUnary);    parser.addOption(enableSStream);    parser.process(app);    bool defaultRun = !parser.isSet(enableUnary) &amp;&amp; !parser.isSet(enableSStream)        &amp;&amp; !parser.isSet(enableCStream) &amp;&amp; !parser.isSet(enableBStream);    qDebug(&quot;Welcome to the clientguide!&quot;);    qDebug(&quot;Starting the server process ...&quot;);    startServerProcess();    //! [basic-0]    auto channel = std::make_shared&lt;QGrpcHttp2Channel&gt;(        QUrl(&quot;http://localhost:50056&quot;)        /* without channel options. */    );    ClientGuide clientGuide(channel);        if (defaultRun || parser.isSet(enableUnary)) &#123;        clientGuide.unaryCall(ClientGuide::createRequest(1));        clientGuide.unaryCall(ClientGuide::createRequest(2, true)); // fail the RPC        clientGuide.unaryCall(ClientGuide::createRequest(3));    &#125;    if (defaultRun || parser.isSet(enableSStream)) &#123;        clientGuide.serverStreaming(ClientGuide::createRequest(3));    &#125;    return app.exec();&#125;
+
+2. Unary RPC (点对点调用)Qt生成的客户端可以让我们直接利用信号槽的机制，不必为了避免阻塞UI，自动手动处理线程
+void ClientGuide::unaryCall(const guide::Request &amp;request)  &#123;  // 调用 RPC 方法，不再返回 Status，而是返回一个 QGrpcCallReply 指针！  std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);    // QGrpcCallReply 是一个 QObject，我们可以连接它的 finished 信号！      QObject::connect(reply.get(), &amp;QGrpcCallReply::finished, this,          // Lambda 表达式作为槽函数          [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;              // 这个 Lambda 将在 Qt 的事件循环中被安全地调用，不会阻塞              if (status.isOk()) &#123;                  if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                      qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;              &#125; else &#123;                  qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;              &#125;          &#125;);  &#125;
+
+m_client.UnaryCall 立即返回一个 QGrpcCallReply 对象，完全不会阻塞。我们只需要连接它的 finished信号，就可以在未来的某个时刻，当 RPC 调用完成时，在槽函数中处理结果。整个过程是纯异步、事件驱动的，完美融入了 Qt 的体系。
+下面的是调用过程的示意图:
+3. Server Streaming (服务端流)处理流式数据也变得异常简单。调用流式 RPC 方法会返回一个 QGrpcServerStream 对象。
+void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#123;  // 调用流式 RPC，返回一个 QGrpcServerStream 指针  std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);  const auto *streamPtr = stream.get();    // 连接 finished 信号，处理流结束事件      QObject::connect(streamPtr, &amp;QGrpcServerStream::finished, this,          [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;              if (status.isOk())                  qDebug(&quot;Client (ServerStreaming) finished&quot;);              else                  qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;          &#125;);            // 连接 messageReceived 信号，处理每一条从服务端推送来的消息！      QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, this, [streamPtr] &#123;          if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())              qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;      &#125;);  &#125;
+
+我们无需编写 while 循环读取响应数据了，取而代之的是连接 messageReceived信号。每当服务端推送一条新消息，这个信号就会被发射一次，我们的槽函数就会被调用一次。这正是我们梦寐以求的、真正的事件驱动的流式数据处理方式！
+个人思考：Qt gRPC 封装的优雅之处Qt的接口设计和使用方式确实有很多可取之处,Qt gRPC 模块的封装，堪称教科书级别的“框架集成”：
+
+使用风格的统一： 将grpc的调用过程统一成信号槽的方式与Qt的控件使用完全一致。
+原生信号槽的胜利： 整个 gRPC 的生命周期——发起调用、收到消息、调用结束——都被映射成了 Qt 的信号。这使得 gRPC的异步事件能像按钮点击、鼠标移动一样，被无缝地集成到 Qt 的事件循环中。
+使用更加简单： 开发者不再需要关心线程问题，只需关注业务逻辑。Qt 将这一切都隐藏在了QGrpcCallReply 和 QGrpcServerStream 对象的背后，提供了极其简洁和符合直觉的 API。
+
+总结与展望本文，我们探索了 Qt 官方提供的 Qt Grpc 模块，见证了它如何将 gRPC 的强大功能与 Qt 优雅的信号槽机制完美结合。通过使用QGrpcCallReply 和 QGrpcServerStream，我们以一种纯异步、事件驱动的方式，轻松地实现了 Unary 和 Streaming RPC，彻底解决了在 GUI应用中进行网络通信的核心痛点。
+这无疑是 Qt C++ 开发者的一大福音。它极大地降低了在桌面和移动应用中使用 gRPC 的门槛，让我们能更专注于创造富有价值的应用本身。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>grpc实践之路:02.流的使用</title>
     <url>/2025/07/01/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:02.%E6%B5%81%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
     <content><![CDATA[前言在上一篇文章《gRPC 实践之路（一）：从一个项目需求谈起》中，我们成功地搭建了一个 gRPC 服务，并让客户端通过一次“请求-响应”式的 Unary RPC 调用，获取到了服务端的版本号。这就像是我们去前台问了个问题，前台给了我们一个确切的答案，然后对话就结束了。
@@ -400,57 +599,6 @@ reader-&gt;Read() 循环结束后，必须调用 reader-&gt;Finish() 来获取�
 我们深入了解了如何在 .proto 中定义流式服务，以及如何在 C++ 中实现流的服务端（ServerWriter）和客户端（ClientReader）。
 在下一篇文章中，我们将讲解 在Qt应用中如何直接集成Grpc
 最后，再次强调： 本系列文章是我个人的学习笔记和思考，而 gRPC 的官方文档和 grpc&#x2F;grpc GitHub 仓库中的例子是最好的、最权威的学习资料。官方文档和示例远比我写得好，强烈建议大家去阅读！ 希望我的文章能作为一个有益的补充和不同的视角。
-]]></content>
-      <categories>
-        <category>动手实践-三方库</category>
-        <category>grpc</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>grpc</tag>
-        <tag>进程间通信</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>grpc实践之路:03.Qt与grpc的集成使用</title>
-    <url>/2025/07/07/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:03.Qt%E4%B8%8Egrpc%E7%9A%84%E9%9B%86%E6%88%90%E4%BD%BF%E7%94%A8/</url>
-    <content><![CDATA[前言在之前的文章中，我们从一个Qt应用的角度出发，探讨了怎么使用grpc作为进程间通信的手段，进行点对点的调用，并且讲解了怎么处理服务端产生的流数据。但是，既然都没涉及到Qt相关的内容，本篇文章就讲解下在Qt中怎么去使用Grpc作为客户端的集成。
-Qt作为一个主要应用在GUI中的应用框架，在其中最大的挑战就是：如何避免阻塞 UI 主线程。当然可以利用QThread和信号槽的机制去解决这个问题，但是却有些繁琐，需要我们自己去进行线程管理和对象的生命周期。但是，好消息是自动 Qt6.9版本之后，Qt 官方已经正式提供了对 gRPC 的原生支持 (Qt Grpc 模块)。这意味着我们不再需要手动创建线程来包装gRPC 调用了。Qt 将 gRPC与它核心的事件循环和信号槽机制完美地融合在了一起。
-本文，我们将探索这个“官方解决方案”，看看如何利用 Qt Grpc 模块，以一种前所未有的、极其优雅的方式，在 Qt 应用中实践 gRPC 通信。
-
-准备工作：CMake 与 Qt gRPC 模块要使用 Qt 官方的 gRPC 支持，首先你需要确保在安装 Qt 时，已经勾选并安装了 Qt Protobuf 和 Qt Grpc 这两个模块，并且安装好了Grpc和Protobuf。
-并且Qt官方也提供了Grpc的函数去处理grpc的原生命令
-CMakeLists.txt
-cmake_minimum_required(VERSION 3.16)  project(MyGrpcQtProject)#配置你的项目,保证先安装了grpc和protobuf# 找到 Qt6，并确保 Protobuf 和 Grpc 组件可用  find_package(Qt6 REQUIRED COMPONENTS Protobuf Grpc)  qt_standard_project_setup()# 添加你的可执行文件  qt_add_executable(MyApp main.cpp clientguide.cpp) # 假设你的客户端逻辑在 clientguide.cpp# Qt 提供的 magic command，自动处理 .proto 文件！  # 它会调用 protoc 和 grpc_cpp_plugin 生成 Qt 风格的代码  qt_add_grpc(MyApp CLIENT # 或者 SERVER, BIDI  PROTO_FILES  path/to/your/service.proto  )# 链接到 Qt 提供的库  target_link_libraries(MyApp PRIVATE Qt6::Protobuf Qt6::Grpc)
-
-qt_add_grpc 这个命令了它会自动处理代码生成和编译，也不需要去手动处理proto文件的生成c代码了
-代码生成我们还是使用之前类似的 .proto 文件，但这次，由 qt_add_grpc 生成的文件会有些不同，它们是为 Qt 量身定做的。
-clientguide.proto
-syntax = &quot;proto3&quot;;  package client.guide; // enclosing namespacemessage Request &#123; /* ... */ &#125;  message Response &#123; /* ... */ &#125;service ClientGuideService &#123;  rpc UnaryCall (Request) returns (Response);  rpc ServerStreaming (Request) returns (stream Response);&#125;
-
-生成的文件名会带有 .qpb.h 和 .grpc.qpb.h 的后缀。它们不仅包含了 Protobuf 消息的 C++ 类，更重要的是，生成的 gRPC Stub 和Service 基类，其所有方法都原生返回 Qt 的异步对象，并通过信号槽来通知结果。
-下面是生成Qt grpc中源码生成的示意图
-实践：一个纯 Qt 风格的体验现在，让我们看看 Qt 官方示例中的客户端代码是如何利用这些新工具的。
-clientguide.cpp (核心逻辑)
-1. 初始化：创建 Channel 和 Client Stub//引入Qt生成的头文件#include &quot;clientguide.qpb.h&quot;#include &quot;clientguide_client.grpc.qpb.h&quot;//! [gen-includes]#include &lt;QtGrpc/QGrpcHttp2Channel&gt;#include &lt;QtGrpc/QGrpcServerStream.h&gt;#include &lt;QtCore/QCommandLineParser&gt;#include &lt;QtCore/QCoreApplication&gt;#include &lt;QtCore/QDateTime&gt;#include &lt;QtCore/QProcess&gt;#include &lt;QtCore/QThread&gt;#include &lt;QtCore/QUrl&gt;#include &lt;limits&gt;#include &lt;memory&gt;using namespace client;void startServerProcess();QDebug operator&lt;&lt;(QDebug debug, const guide::Response &amp;response);class ClientGuide : public QObject&#123;public:    explicit ClientGuide(std::shared_ptr&lt;QAbstractGrpcChannel&gt; channel)    &#123;        // 将 Qt 的 Channel 附加到 Qt 生成的 Client Stub 上         // 这一步和原生 gRPC 类似，但 Channel 和 Client 都是 Qt gRPC 提供的类型。        m_client.attachChannel(std::move(channel));    &#125;    static guide::Request createRequest(int32_t num, bool fail = false)    &#123;        guide::Request request;        request.setNum(num);        request.setTime(fail ? std::numeric_limits&lt;int64_t&gt;::max()                             : QDateTime::currentMSecsSinceEpoch());        return request;    &#125;       void unaryCall(const guide::Request &amp;request)    &#123;        std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);        const auto *replyPtr = reply.get();        QObject::connect(            replyPtr, &amp;QGrpcCallReply::finished, replyPtr,            [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;                if (status.isOk()) &#123;                    if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                        qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;                    else                        qDebug(&quot;Client (UnaryCall) deserialization failed&quot;);                &#125; else &#123;                    qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;                &#125;            &#125;,            Qt::SingleShotConnection);    &#125;    void serverStreaming(const guide::Request &amp;initialRequest)    &#123;        std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);        const auto *streamPtr = stream.get();        QObject::connect(            streamPtr, &amp;QGrpcServerStream::finished, streamPtr,            [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;                if (status.isOk())                    qDebug(&quot;Client (ServerStreaming) finished&quot;);                else                    qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;            &#125;,            Qt::SingleShotConnection);        QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, streamPtr, [streamPtr] &#123;            if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())                qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;            else                qDebug(&quot;Client (ServerStream) deserialization failed&quot;);        &#125;);    &#125;private:    guide::ClientGuideService::Client m_client;&#125;;int main(int argc, char *argv[])&#123;    QCoreApplication app(argc, argv);    QCommandLineParser parser;    QCommandLineOption enableUnary(&quot;U&quot;, &quot;Enable UnaryCalls&quot;);    QCommandLineOption enableSStream(&quot;S&quot;, &quot;Enable ServerStream&quot;);    parser.addHelpOption();    parser.addOption(enableUnary);    parser.addOption(enableSStream);    parser.process(app);    bool defaultRun = !parser.isSet(enableUnary) &amp;&amp; !parser.isSet(enableSStream)        &amp;&amp; !parser.isSet(enableCStream) &amp;&amp; !parser.isSet(enableBStream);    qDebug(&quot;Welcome to the clientguide!&quot;);    qDebug(&quot;Starting the server process ...&quot;);    startServerProcess();    //! [basic-0]    auto channel = std::make_shared&lt;QGrpcHttp2Channel&gt;(        QUrl(&quot;http://localhost:50056&quot;)        /* without channel options. */    );    ClientGuide clientGuide(channel);        if (defaultRun || parser.isSet(enableUnary)) &#123;        clientGuide.unaryCall(ClientGuide::createRequest(1));        clientGuide.unaryCall(ClientGuide::createRequest(2, true)); // fail the RPC        clientGuide.unaryCall(ClientGuide::createRequest(3));    &#125;    if (defaultRun || parser.isSet(enableSStream)) &#123;        clientGuide.serverStreaming(ClientGuide::createRequest(3));    &#125;    return app.exec();&#125;
-
-2. Unary RPC (点对点调用)Qt生成的客户端可以让我们直接利用信号槽的机制，不必为了避免阻塞UI，自动手动处理线程
-void ClientGuide::unaryCall(const guide::Request &amp;request)  &#123;  // 调用 RPC 方法，不再返回 Status，而是返回一个 QGrpcCallReply 指针！  std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);    // QGrpcCallReply 是一个 QObject，我们可以连接它的 finished 信号！      QObject::connect(reply.get(), &amp;QGrpcCallReply::finished, this,          // Lambda 表达式作为槽函数          [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;              // 这个 Lambda 将在 Qt 的事件循环中被安全地调用，不会阻塞              if (status.isOk()) &#123;                  if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                      qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;              &#125; else &#123;                  qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;              &#125;          &#125;);  &#125;
-
-m_client.UnaryCall 立即返回一个 QGrpcCallReply 对象，完全不会阻塞。我们只需要连接它的 finished信号，就可以在未来的某个时刻，当 RPC 调用完成时，在槽函数中处理结果。整个过程是纯异步、事件驱动的，完美融入了 Qt 的体系。
-下面的是调用过程的示意图:
-3. Server Streaming (服务端流)处理流式数据也变得异常简单。调用流式 RPC 方法会返回一个 QGrpcServerStream 对象。
-void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#123;  // 调用流式 RPC，返回一个 QGrpcServerStream 指针  std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);  const auto *streamPtr = stream.get();    // 连接 finished 信号，处理流结束事件      QObject::connect(streamPtr, &amp;QGrpcServerStream::finished, this,          [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;              if (status.isOk())                  qDebug(&quot;Client (ServerStreaming) finished&quot;);              else                  qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;          &#125;);            // 连接 messageReceived 信号，处理每一条从服务端推送来的消息！      QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, this, [streamPtr] &#123;          if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())              qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;      &#125;);  &#125;
-
-我们无需编写 while 循环读取响应数据了，取而代之的是连接 messageReceived信号。每当服务端推送一条新消息，这个信号就会被发射一次，我们的槽函数就会被调用一次。这正是我们梦寐以求的、真正的事件驱动的流式数据处理方式！
-个人思考：Qt gRPC 封装的优雅之处Qt的接口设计和使用方式确实有很多可取之处,Qt gRPC 模块的封装，堪称教科书级别的“框架集成”：
-
-使用风格的统一： 将grpc的调用过程统一成信号槽的方式与Qt的控件使用完全一致。
-原生信号槽的胜利： 整个 gRPC 的生命周期——发起调用、收到消息、调用结束——都被映射成了 Qt 的信号。这使得 gRPC的异步事件能像按钮点击、鼠标移动一样，被无缝地集成到 Qt 的事件循环中。
-使用更加简单： 开发者不再需要关心线程问题，只需关注业务逻辑。Qt 将这一切都隐藏在了QGrpcCallReply 和 QGrpcServerStream 对象的背后，提供了极其简洁和符合直觉的 API。
-
-总结与展望本文，我们探索了 Qt 官方提供的 Qt Grpc 模块，见证了它如何将 gRPC 的强大功能与 Qt 优雅的信号槽机制完美结合。通过使用QGrpcCallReply 和 QGrpcServerStream，我们以一种纯异步、事件驱动的方式，轻松地实现了 Unary 和 Streaming RPC，彻底解决了在 GUI应用中进行网络通信的核心痛点。
-这无疑是 Qt C++ 开发者的一大福音。它极大地降低了在桌面和移动应用中使用 gRPC 的门槛，让我们能更专注于创造富有价值的应用本身。
 ]]></content>
       <categories>
         <category>动手实践-三方库</category>
@@ -777,109 +925,79 @@ void EventLoop::loop()  &#123;    // ...    while (!quit_)    &#123;      active
       </tags>
   </entry>
   <entry>
-    <title>muduo源码剖析:02.事件的处理</title>
-    <url>/2025/05/30/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:02.%E4%BA%8B%E4%BB%B6%E7%9A%84%E5%A4%84%E7%90%86/</url>
-    <content><![CDATA[前言在上一篇文章《muduo 源码剖析（一）：深入 ‘One Loop Per Thread’ 与 EventLoop 的实现》中，我们分析了 muduo 如何通过 EventLoopThreadPool 和 EventLoopThread 实现 “One Loop Per Thread” 的并发模型，以及 EventLoop 如何通过 eventfd 机制支持跨线程的任务提交。这些是 muduo 事件驱动框架的基石。
-本文我们将聚焦于网络编程的核心——TCP 连接，以及陈硕大佬提出的“三个半事件”中的核心部分：新连接的建立与分发、连接上数据的接收与发送、以及连接的关闭与资源回收。我们将深入探讨在 muduo 中，这些事件是如何被优雅地融入其基于对象的事件驱动框架中的。
+    <title>muduo源码剖析:04.Buffer设计分析</title>
+    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
+在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
 
-EventLoop::loop()：事件处理的核心驱动在深入具体事件之前，我们首先需要理解 EventLoop 的主循环 loop() 是如何驱动事件处理的。其核心逻辑非常直观：
+假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
+如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
+在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
+在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
 
-调用 Poller::poll() (底层通常是 epoll_wait) 等待 I&#x2F;O 事件的发生，或者等待被 wakeupFd_ 唤醒。
-获取到活跃的 Channel 列表 (activeChannels_)。
-遍历 activeChannels_，对每个 Channel 调用其 handleEvent() 方法。
-执行所有通过 runInLoop 或 queueInLoop 提交的待处理任务 (doPendingFunctors())。
+这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
+在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
+本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
 
-void EventLoop::loop()  &#123;  assert(!looping_);  assertInLoopThread();  looping_ = true;  quit_ = false;  // FIXME: what if someone calls quit() before loop() ?  LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; start looping&quot;;while (!quit_)  &#123;  activeChannels_.clear();  // 1. 等待事件发生  pollReturnTime_ = poller_-&gt;poll(kPollTimeMs, &amp;activeChannels_);  ++iteration_;  if (Logger::logLevel() &lt;= Logger::TRACE)  &#123;  printActiveChannels();  &#125;  eventHandling_ = true;  // 2. 处理活跃 Channel 的事件  for (Channel* channel : activeChannels_)  &#123;  currentActiveChannel_ = channel;  currentActiveChannel_-&gt;handleEvent(pollReturnTime_);  &#125;  currentActiveChannel_ = NULL;  eventHandling_ = false;  // 3. 执行 EventLoop 内部任务队列中的任务  doPendingFunctors();  &#125;LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; stop looping&quot;;  looping_ = false;  &#125;  
+muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
++——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
 
-Poller (以 EPollPoller 为例) 的 poll() 方法负责调用 epoll_wait，并将返回的就绪事件填充到 activeChannels 列表中。
-// EPollPoller.cc  Timestamp EPollPoller::poll(int timeoutMs, ChannelList* activeChannels)  &#123;  LOG_TRACE &lt;&lt; &quot;fd total count &quot; &lt;&lt; channels_.size();  int numEvents = ::epoll_wait(epollfd_,  &amp;*events_.begin(), // events_ 是 epoll_event 数组  static_cast&lt;int&gt;(events_.size()),  timeoutMs);  int savedErrno = errno;  Timestamp now(Timestamp::now());  if (numEvents &gt; 0)  &#123;  LOG_TRACE &lt;&lt; numEvents &lt;&lt; &quot; events happened&quot;;  fillActiveChannels(numEvents, activeChannels); // 将就绪事件转换为 Channel  if (implicit_cast&lt;size_t&gt;(numEvents) == events_.size()) // 如果 epoll_event 数组满了，则扩容  &#123;  events_.resize(events_.size()*2);  &#125;  &#125;  else if (numEvents == 0)  &#123;  LOG_TRACE &lt;&lt; &quot;nothing happened&quot;;  &#125;  else // 出错处理  &#123;  if (savedErrno != EINTR)  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;EPollPoller::poll()&quot;;  &#125;  &#125;  return now;  &#125;void EPollPoller::fillActiveChannels(int numEvents,  ChannelList* activeChannels) const  &#123;  assert(implicit_cast&lt;size_t&gt;(numEvents) &lt;= events_.size());  for (int i = 0; i &lt; numEvents; ++i)  &#123;  // 注册时将 Channel* 存放在 epoll_event 的 data.ptr 中  Channel* channel = static_cast&lt;Channel*&gt;(events_[i].data.ptr);  // ... (省略 NDEBUG 下的断言检查) ...  channel-&gt;set_revents(events_[i].events); // 设置 Channel 实际发生的事件  activeChannels-&gt;push_back(channel);  &#125;  &#125;
+prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
+readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
+writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
 
-当 EventLoop 获取到活跃的 Channel 后，会调用 Channel::handleEvent()。这个方法是事件分发的枢纽，它根据 Channel 上实际发生的事件类型 (revents_)，调用相应的回调函数。
-// Channel.cc  void Channel::handleEvent(Timestamp receiveTime)  &#123;  std::shared_ptr&lt;void&gt; guard;  if (tied_) // 如果 Channel 与某个对象（通常是 TcpConnection）绑定了生命周期  &#123;  guard = tie_.lock(); // 尝试获取对象的 shared_ptr  if (guard) // 对象仍然存活  &#123;  handleEventWithGuard(receiveTime);  &#125;  // 如果 guard 为空，说明对象已销毁，Channel 不再处理事件  &#125;  else // 未绑定生命周期  &#123;  handleEventWithGuard(receiveTime);  &#125;  &#125;void Channel::handleEventWithGuard(Timestamp receiveTime)  &#123;  eventHandling_ = true;  LOG_TRACE &lt;&lt; reventsToString();  // 对端关闭连接 (POLLHUP)，并且没有可读数据 (POLLIN)  if ((revents_ &amp; POLLHUP) &amp;&amp; !(revents_ &amp; POLLIN))  &#123;  if (logHup_)  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLHUP&quot;;  &#125;  if (closeCallback_) closeCallback_(); // 执行关闭回调  &#125;if (revents_ &amp; POLLNVAL) // 无效的请求，通常是 fd 已关闭  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLNVAL&quot;;  &#125;// 错误事件 (POLLERR) 或无效请求 (POLLNVAL)  if (revents_ &amp; (POLLERR | POLLNVAL))  &#123;  if (errorCallback_) errorCallback_(); // 执行错误回调  &#125;  // 可读事件 (POLLIN)、高优先级可读 (POLLPRI)、对端关闭连接且仍有数据可读 (POLLRDHUP)  if (revents_ &amp; (POLLIN | POLLPRI | POLLRDHUP))  &#123;  if (readCallback_) readCallback_(receiveTime); // 执行读回调  &#125;  // 可写事件 (POLLOUT)  if (revents_ &amp; POLLOUT)  &#123;  if (writeCallback_) writeCallback_(); // 执行写回调  &#125;  eventHandling_ = false;  &#125;
-
-下面的就是loop事件循环的时序图:
-
-理解了 EventLoop 的核心驱动逻辑和 Channel 的事件分发机制后，我们就可以具体分析“三个半事件”的处理了。
-事件一：新连接的建立与分发学习过 Linux 网络编程的都知道，服务器接受新连接的基本流程是 socket -&gt; bind -&gt; listen -&gt; accept。muduo 将这个过程优雅地封装在 Acceptor 和 TcpServer 类中。
-1. Acceptor：新连接的接收者TcpServer 在构造时会创建一个 Acceptor 对象，并将其与主 EventLoop 关联。Acceptor 负责创建监听套接字、绑定地址、并设置当有新连接到来时（监听套接字可读）的回调函数为 Acceptor::handleRead。
-// TcpServer.cc (构造函数部分)  TcpServer::TcpServer(EventLoop* loop,  const InetAddress&amp; listenAddr,  const string&amp; nameArg,  Option option)  : loop_(CHECK_NOTNULL(loop)),  acceptor_(new Acceptor(loop, listenAddr, option == kReusePort)),  // ...  &#123;  acceptor_-&gt;setNewConnectionCallback(  std::bind(&amp;TcpServer::newConnection, this, _1, _2));  &#125;// Acceptor.cc (构造函数部分)Acceptor::Acceptor(EventLoop* loop, const InetAddress&amp; listenAddr, bool reuseport): loop_(loop),  acceptSocket_(sockets::createNonblockingOrDie(listenAddr.family())),  acceptChannel_(loop, acceptSocket_.fd()), // 为监听套接字创建 Channel  // ...  &#123;  // ...  acceptSocket_.bindAddress(listenAddr);  acceptChannel_.setReadCallback(  std::bind(&amp;Acceptor::handleRead, this)); // 设置 Channel 的读回调  &#125;  
-
-调用TcpServer::start() 时，会通过 loop_-&gt;runInLoop() 调用 Acceptor::listen()，该方法会调用 listen() 系统调用并使 acceptChannel_ 开始关注读事件。
-// Acceptor.cc  void Acceptor::listen()  &#123;  loop_-&gt;assertInLoopThread();  listenning_ = true;  acceptSocket_.listen();  acceptChannel_.enableReading(); // 将 acceptChannel_ 加入 Poller 监听  &#125;
-
-当新连接到达时，acceptChannel_ 的 handleRead 被触发：
-// Acceptor.cc  void Acceptor::handleRead()  &#123;  loop_-&gt;assertInLoopThread();  InetAddress peerAddr;  int connfd = acceptSocket_.accept(&amp;peerAddr); // 接受新连接  if (connfd &gt;= 0)  &#123;  if (newConnectionCallback_)  &#123;  newConnectionCallback_(connfd, peerAddr); // 调用 TcpServer::newConnection  &#125;  else  &#123;  sockets::close(connfd);  &#125;  &#125;  // ... (错误处理和 EMFILE 处理) ...  &#125;
-
-2. TcpServer::newConnection：连接的分发Acceptor 将新接受的 connfd 和对端地址传递给 TcpServer::newConnection。此方法的核心职责是：
-
-从 EventLoopThreadPool 中通过轮询选择一个 I&#x2F;O EventLoop。
-为新连接创建一个 TcpConnection 对象，并将选择的 I&#x2F;O EventLoop 传递给它。
-设置 TcpConnection 的各种回调（连接状态、消息到达、写完成、关闭）。
-将 TcpConnection::connectEstablished 方法提交到选定的 I&#x2F;O EventLoop 中执行。
-
-// TcpServer.cc  void TcpServer::newConnection(int sockfd, const InetAddress&amp; peerAddr)  &#123;  loop_-&gt;assertInLoopThread(); // 确保在主 EventLoop 中  EventLoop* ioLoop = threadPool_-&gt;getNextLoop(); // 轮询选择 I/O Loop  // ... (生成连接名 connName) ...  TcpConnectionPtr conn(new TcpConnection(ioLoop, // 将 ioLoop 传递给 TcpConnection  connName,  sockfd,  localAddr,  peerAddr));  connections_[connName] = conn; // 保存连接  // ... (设置各种回调) ...  conn-&gt;setCloseCallback(  std::bind(&amp;TcpServer::removeConnection, this, _1));  // 将连接建立的后续操作交给 ioLoop 执行  ioLoop-&gt;runInLoop(std::bind(&amp;TcpConnection::connectEstablished, conn));  &#125;
-
-3. TcpConnection::connectEstablished：连接的最终建立此方法在选定的 I&#x2F;O EventLoop 线程中执行，完成连接的最后步骤：
-// TcpConnection.cc  void TcpConnection::connectEstablished()  &#123;  loop_-&gt;assertInLoopThread(); // 确保在 ioLoop 中  assert(state_ == kConnecting);  setState(kConnected);  channel_-&gt;tie(shared_from_this()); // 绑定生命周期  channel_-&gt;enableReading(); // 开始关注该连接上的读事件  connectionCallback_(shared_from_this()); // 调用用户设置的连接建立回调  &#125;
-
-至此，新连接的建立和分发完成，后续该连接上的所有 I&#x2F;O 事件都将在其被分配到的 I&#x2F;O EventLoop 线程中处理。
-这是建立连接的时序图：
-
-事件二：收到消息 (MessageCallback)当客户端发送数据时，TcpConnection 对应的 channel_ 会触发读事件，进而调用 TcpConnection::handleRead。
-// TcpConnection.cc (构造函数中设置)  channel_-&gt;setReadCallback(  std::bind(&amp;TcpConnection::handleRead, this, _1));// TcpConnection.cc  void TcpConnection::handleRead(Timestamp receiveTime)  &#123;  loop_-&gt;assertInLoopThread();  int savedErrno = 0;  ssize_t n = inputBuffer_.readFd(channel_-&gt;fd(), &amp;savedErrno); // 从 socket 读取数据到 inputBuffer_  if (n &gt; 0)  &#123;  // 调用用户在 TcpServer 中设置的 messageCallback_  messageCallback_(shared_from_this(), &amp;inputBuffer_, receiveTime);  &#125;  else if (n == 0) // 对端关闭  &#123;  handleClose();  &#125;  else // 错误  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleRead&quot;;  handleError(); // 通常也会调用 handleClose  &#125;  &#125;
+这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
+核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
+class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
 
 
-用户通过 TcpServer::setMessageCallback 设置的回调函数会在这里被调用，参数包括 TcpConnectionPtr、存有接收数据的 Buffer* 以及时间戳。用户可以在回调中从 Buffer 中取出数据进行业务处理。
-这是处理读事件的时序图:
+buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
+readerIndex_: size_t 类型，标记可读数据的起始位置。
+writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
 
-事件三：消息发送完成 (WriteCompleteCallback)当用户调用 TcpConnection::send() 发送数据时：
+通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
+size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
 
-如果当前线程不是连接所属的 ioLoop，则将发送任务 sendInLoop 提交到 ioLoop 执行。
-sendInLoop 会尝试直接 write() 数据到 socket。
-如果数据一次性全部写完，且用户设置了 writeCompleteCallback_，则将其提交到 ioLoop 的任务队列中执行。
-如果数据没有一次性写完（例如内核发送缓冲区满），则将剩余数据存入 outputBuffer_，并使 channel_ 开始关注写事件 (enableWriting())。
+基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
+void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
 
+核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
+2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
+void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
 
-当 socket 变为可写时，channel_ 的写事件回调 TcpConnection::handleWrite 被触发。
-handleWrite 会继续从 outputBuffer_ 中发送数据。如果所有数据都发送完毕，则取消对写事件的关注 (disableWriting())，并调用 writeCompleteCallback_。
+在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
+空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
 
-// TcpConnection.cc (sendInLoop 核心逻辑)  void TcpConnection::sendInLoop(const void* data, size_t len)  &#123;  loop_-&gt;assertInLoopThread();  ssize_t nwrote = 0;  size_t remaining = len;  bool faultError = false;  if (state_ == kDisconnected) &#123; /* ... return ... */ &#125;// 如果输出队列为空，尝试直接发送  if (!channel_-&gt;isWriting() &amp;&amp; outputBuffer_.readableBytes() == 0)  &#123;  nwrote = sockets::write(channel_-&gt;fd(), data, len);  if (nwrote &gt;= 0)  &#123;  remaining = len - nwrote;  if (remaining == 0 &amp;&amp; writeCompleteCallback_) // 全部发送完毕  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  &#125;  else // nwrote &lt; 0 (错误)  &#123;  // ... 错误处理 ...  &#125;  &#125;if (!faultError &amp;&amp; remaining &gt; 0) // 如果还有数据未发送  &#123;  // ... (检查高水位回调 HighWaterMarkCallback) ...  outputBuffer_.append(static_cast&lt;const char*&gt;(data)+nwrote, remaining); // 存入输出缓冲区  if (!channel_-&gt;isWriting())  &#123;  channel_-&gt;enableWriting(); // 开始关注写事件  &#125;  &#125;  &#125;// TcpConnection.cc (构造函数中设置)  channel_-&gt;setWriteCallback(  std::bind(&amp;TcpConnection::handleWrite, this));// TcpConnection.cc  void TcpConnection::handleWrite()  &#123;  loop_-&gt;assertInLoopThread();  if (channel_-&gt;isWriting())  &#123;  ssize_t n = sockets::write(channel_-&gt;fd(),  outputBuffer_.peek(),  outputBuffer_.readableBytes());  if (n &gt; 0)  &#123;  outputBuffer_.retrieve(n);  if (outputBuffer_.readableBytes() == 0) // 输出缓冲区已空  &#123;  channel_-&gt;disableWriting(); // 不再关注写事件  if (writeCompleteCallback_)  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  if (state_ == kDisconnecting) // 如果正在关闭连接  &#123;  shutdownInLoop();  &#125;  &#125;  &#125;  else  &#123;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleWrite&quot;;  &#125;  &#125;  else  &#123;  LOG_TRACE &lt;&lt; &quot;Connection fd = &quot; &lt;&lt; channel_-&gt;fd()  &lt;&lt; &quot; is down, no more writing&quot;;  &#125;  &#125;
+内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
+外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
 
-“消息发送完成”这个“半个事件”是通过 WriteCompleteCallback 来体现的，它在输出缓冲区的数据全部成功写入内核后被调用。
-因为写数据是用户关注的，如果一次性写完成就不必关心了，写不完就先放到buffer中，等到可写的时候，处理下写事件，将数据再次发送，发送完就不必关注了，这样也可以避免busyloop了
-这是上述过程的时序图
+void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
 
-事件四：连接关闭连接关闭的触发点有多种：对端关闭（handleRead 读到 EOF）、本地主动关闭（用户调用 TcpConnection::shutdown()）、或发生错误（handleError） 。这些路径通常都会汇聚到 TcpConnection::handleClose()。
-TcpConnection 在构造时设置了其 channel_ 的关闭回调为 handleClose。
-// TcpConnection.cc (构造函数中设置)  channel_-&gt;setCloseCallback(  std::bind(&amp;TcpConnection::handleClose, this));  
+这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
+高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
+ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
 
-handleClose() 的核心逻辑：  
+readFd 的设计有几个显著优点：  
 
-断言在正确的 ioLoop 中执行。  
-将连接状态设为 kDisconnected。  
-调用 channel_-&gt;disableAll()，使该 Channel 不再关注任何事件。  
-调用用户设置的 connectionCallback_（此时连接状态已变为 kDisconnected）。  
-调用 closeCallback_（在 TcpServer::newConnection 中被绑定到 TcpServer::removeConnection）。
+减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
+避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
+避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
+栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
 
-// TcpConnection.cc  void TcpConnection::handleClose()  &#123;  loop_-&gt;assertInLoopThread();  LOG_TRACE &lt;&lt; &quot;fd = &quot; &lt;&lt; channel_-&gt;fd() &lt;&lt; &quot; state = &quot; &lt;&lt; stateToString();  assert(state_ == kConnected || state_ == kDisconnecting);  setState(kDisconnected);  channel_-&gt;disableAll(); // 如果是那种建立过连接的文件描述符，在这一步就会被从poller移除了TcpConnectionPtr guardThis(shared_from_this()); // 确保回调期间对象存活  connectionCallback_(guardThis);  closeCallback_(guardThis); // 调用 TcpServer::removeConnection  &#125;  
-TcpServer::removeConnection 会将实际的移除操作（从 connections_ map 中删除）提交到 TcpServer 的主 EventLoop 中执行（removeConnectionInLoop），以保证线程安全。之后，它会将最终的销毁操作 TcpConnection::connectDestroyed 提交回该连接所属的 I&#x2F;O EventLoop 中执行。
-// TcpServer.cc  void TcpServer::removeConnection(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;runInLoop(std::bind(&amp;TcpServer::removeConnectionInLoop, this, conn));  &#125;void TcpServer::removeConnectionInLoop(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;assertInLoopThread();  LOG_INFO &lt;&lt; &quot;TcpServer::removeConnectionInLoop [&quot; &lt;&lt; name_  &lt;&lt; &quot;] - connection &quot; &lt;&lt; conn-&gt;name();  connections_.erase(conn-&gt;name()); // 从 TcpServer 管理的 map 中移除  EventLoop* ioLoop = conn-&gt;getLoop();  // 将最后的清理工作交给连接所属的 ioLoop  ioLoop-&gt;queueInLoop(  std::bind(&amp;TcpConnection::connectDestroyed, conn));  &#125;  
-TcpConnection::connectDestroyed 负责将 Channel 从其 EventLoop 的 Poller 中移除。
-// TcpConnection.cc  void TcpConnection::connectDestroyed()  &#123;  loop_-&gt;assertInLoopThread();  if (state_ == kConnected) // 如果之前是连接状态，则先更新状态并调用回调  &#123;  setState(kDisconnected);  channel_-&gt;disableAll();  connectionCallback_(shared_from_this());  &#125;  channel_-&gt;remove(); // 从 Poller 中移除 Channel  &#125;// Channel.cc  void Channel::remove()  &#123;  assert(isNoneEvent());  addedToLoop_ = false;  loop_-&gt;removeChannel(this); // 通知 EventLoop 从 Poller 中移除  &#125;
+其他实用特性
+网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
+头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
+查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
 
-EventLoop::removeChannel 会调用 Poller::removeChannel，最终通过 epoll_ctl(EPOLL_CTL_DEL, …) 将文件描述符从 epoll 实例中移除。
-这是关闭连接的时序图:
-当 TcpConnectionPtr 的最后一个 shared_ptr 引用（通常是在 connectDestroyed 的 std::bind 对象析构时）消失后，TcpConnection 对象及其拥有的 Socket（会在析构时关闭 fd）和 Channel 对象会被自动析构，完成资源的彻底回收。
-这一套精心设计的流程，严格遵守了“对象生命周期管理”和“线程封闭”的原则，确保了连接关闭的正确性和资源的有效释放。
-总结通过对 muduo 中新连接建立、数据收发、连接关闭这“三个半事件”处理流程的分析，我们可以看到陈硕大佬是如何将这些网络编程中的核心操作，优雅地融入其基于对象的事件驱动框架中的。
+总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
+其核心设计启示包括：
 
-事件的统一处理入口： EventLoop::loop() 是所有事件处理的起点。
-Channel 作为事件分发的核心： 它封装了文件描述符和相关的事件回调。
-职责明确的类设计： Acceptor 专注于接受新连接，TcpServer 负责管理和分发连接，TcpConnection 负责处理单个连接的生命周期和业务逻辑。
-线程安全的保证： 通过 “One Loop Per Thread” 和 runInLoop&#x2F;queueInLoop 机制，确保了所有对象的操作都在其所属的线程中执行。
-回调机制的广泛应用： 将具体的业务逻辑与框架逻辑解耦，提高了灵活性和可扩展性。
+空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
+减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
+设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
+接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
 
-通过这些操作，在遵循陈硕大佬的 基于对象 的理念的前提下，完成了对“三个半事件”的处理。
+理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
 ]]></content>
       <categories>
         <category>源码分析</category>
@@ -1009,79 +1127,109 @@ std::set 管理定时器： 利用 std::set&lt;std::pair&lt;Timestamp, Timer*&gt
       </tags>
   </entry>
   <entry>
-    <title>muduo源码剖析:04.Buffer设计分析</title>
-    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
-    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
-在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
+    <title>muduo源码剖析:02.事件的处理</title>
+    <url>/2025/05/30/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:02.%E4%BA%8B%E4%BB%B6%E7%9A%84%E5%A4%84%E7%90%86/</url>
+    <content><![CDATA[前言在上一篇文章《muduo 源码剖析（一）：深入 ‘One Loop Per Thread’ 与 EventLoop 的实现》中，我们分析了 muduo 如何通过 EventLoopThreadPool 和 EventLoopThread 实现 “One Loop Per Thread” 的并发模型，以及 EventLoop 如何通过 eventfd 机制支持跨线程的任务提交。这些是 muduo 事件驱动框架的基石。
+本文我们将聚焦于网络编程的核心——TCP 连接，以及陈硕大佬提出的“三个半事件”中的核心部分：新连接的建立与分发、连接上数据的接收与发送、以及连接的关闭与资源回收。我们将深入探讨在 muduo 中，这些事件是如何被优雅地融入其基于对象的事件驱动框架中的。
 
-假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
-如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
-在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
-在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
+EventLoop::loop()：事件处理的核心驱动在深入具体事件之前，我们首先需要理解 EventLoop 的主循环 loop() 是如何驱动事件处理的。其核心逻辑非常直观：
 
-这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
-在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
-本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
+调用 Poller::poll() (底层通常是 epoll_wait) 等待 I&#x2F;O 事件的发生，或者等待被 wakeupFd_ 唤醒。
+获取到活跃的 Channel 列表 (activeChannels_)。
+遍历 activeChannels_，对每个 Channel 调用其 handleEvent() 方法。
+执行所有通过 runInLoop 或 queueInLoop 提交的待处理任务 (doPendingFunctors())。
 
-muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
-+——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
+void EventLoop::loop()  &#123;  assert(!looping_);  assertInLoopThread();  looping_ = true;  quit_ = false;  // FIXME: what if someone calls quit() before loop() ?  LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; start looping&quot;;while (!quit_)  &#123;  activeChannels_.clear();  // 1. 等待事件发生  pollReturnTime_ = poller_-&gt;poll(kPollTimeMs, &amp;activeChannels_);  ++iteration_;  if (Logger::logLevel() &lt;= Logger::TRACE)  &#123;  printActiveChannels();  &#125;  eventHandling_ = true;  // 2. 处理活跃 Channel 的事件  for (Channel* channel : activeChannels_)  &#123;  currentActiveChannel_ = channel;  currentActiveChannel_-&gt;handleEvent(pollReturnTime_);  &#125;  currentActiveChannel_ = NULL;  eventHandling_ = false;  // 3. 执行 EventLoop 内部任务队列中的任务  doPendingFunctors();  &#125;LOG_TRACE &lt;&lt; &quot;EventLoop &quot; &lt;&lt; this &lt;&lt; &quot; stop looping&quot;;  looping_ = false;  &#125;  
 
-prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
-readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
-writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
+Poller (以 EPollPoller 为例) 的 poll() 方法负责调用 epoll_wait，并将返回的就绪事件填充到 activeChannels 列表中。
+// EPollPoller.cc  Timestamp EPollPoller::poll(int timeoutMs, ChannelList* activeChannels)  &#123;  LOG_TRACE &lt;&lt; &quot;fd total count &quot; &lt;&lt; channels_.size();  int numEvents = ::epoll_wait(epollfd_,  &amp;*events_.begin(), // events_ 是 epoll_event 数组  static_cast&lt;int&gt;(events_.size()),  timeoutMs);  int savedErrno = errno;  Timestamp now(Timestamp::now());  if (numEvents &gt; 0)  &#123;  LOG_TRACE &lt;&lt; numEvents &lt;&lt; &quot; events happened&quot;;  fillActiveChannels(numEvents, activeChannels); // 将就绪事件转换为 Channel  if (implicit_cast&lt;size_t&gt;(numEvents) == events_.size()) // 如果 epoll_event 数组满了，则扩容  &#123;  events_.resize(events_.size()*2);  &#125;  &#125;  else if (numEvents == 0)  &#123;  LOG_TRACE &lt;&lt; &quot;nothing happened&quot;;  &#125;  else // 出错处理  &#123;  if (savedErrno != EINTR)  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;EPollPoller::poll()&quot;;  &#125;  &#125;  return now;  &#125;void EPollPoller::fillActiveChannels(int numEvents,  ChannelList* activeChannels) const  &#123;  assert(implicit_cast&lt;size_t&gt;(numEvents) &lt;= events_.size());  for (int i = 0; i &lt; numEvents; ++i)  &#123;  // 注册时将 Channel* 存放在 epoll_event 的 data.ptr 中  Channel* channel = static_cast&lt;Channel*&gt;(events_[i].data.ptr);  // ... (省略 NDEBUG 下的断言检查) ...  channel-&gt;set_revents(events_[i].events); // 设置 Channel 实际发生的事件  activeChannels-&gt;push_back(channel);  &#125;  &#125;
 
-这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
-核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
-class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
+当 EventLoop 获取到活跃的 Channel 后，会调用 Channel::handleEvent()。这个方法是事件分发的枢纽，它根据 Channel 上实际发生的事件类型 (revents_)，调用相应的回调函数。
+// Channel.cc  void Channel::handleEvent(Timestamp receiveTime)  &#123;  std::shared_ptr&lt;void&gt; guard;  if (tied_) // 如果 Channel 与某个对象（通常是 TcpConnection）绑定了生命周期  &#123;  guard = tie_.lock(); // 尝试获取对象的 shared_ptr  if (guard) // 对象仍然存活  &#123;  handleEventWithGuard(receiveTime);  &#125;  // 如果 guard 为空，说明对象已销毁，Channel 不再处理事件  &#125;  else // 未绑定生命周期  &#123;  handleEventWithGuard(receiveTime);  &#125;  &#125;void Channel::handleEventWithGuard(Timestamp receiveTime)  &#123;  eventHandling_ = true;  LOG_TRACE &lt;&lt; reventsToString();  // 对端关闭连接 (POLLHUP)，并且没有可读数据 (POLLIN)  if ((revents_ &amp; POLLHUP) &amp;&amp; !(revents_ &amp; POLLIN))  &#123;  if (logHup_)  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLHUP&quot;;  &#125;  if (closeCallback_) closeCallback_(); // 执行关闭回调  &#125;if (revents_ &amp; POLLNVAL) // 无效的请求，通常是 fd 已关闭  &#123;  LOG_WARN &lt;&lt; &quot;fd = &quot; &lt;&lt; fd_ &lt;&lt; &quot; Channel::handle_event() POLLNVAL&quot;;  &#125;// 错误事件 (POLLERR) 或无效请求 (POLLNVAL)  if (revents_ &amp; (POLLERR | POLLNVAL))  &#123;  if (errorCallback_) errorCallback_(); // 执行错误回调  &#125;  // 可读事件 (POLLIN)、高优先级可读 (POLLPRI)、对端关闭连接且仍有数据可读 (POLLRDHUP)  if (revents_ &amp; (POLLIN | POLLPRI | POLLRDHUP))  &#123;  if (readCallback_) readCallback_(receiveTime); // 执行读回调  &#125;  // 可写事件 (POLLOUT)  if (revents_ &amp; POLLOUT)  &#123;  if (writeCallback_) writeCallback_(); // 执行写回调  &#125;  eventHandling_ = false;  &#125;
+
+下面的就是loop事件循环的时序图:
+
+理解了 EventLoop 的核心驱动逻辑和 Channel 的事件分发机制后，我们就可以具体分析“三个半事件”的处理了。
+事件一：新连接的建立与分发学习过 Linux 网络编程的都知道，服务器接受新连接的基本流程是 socket -&gt; bind -&gt; listen -&gt; accept。muduo 将这个过程优雅地封装在 Acceptor 和 TcpServer 类中。
+1. Acceptor：新连接的接收者TcpServer 在构造时会创建一个 Acceptor 对象，并将其与主 EventLoop 关联。Acceptor 负责创建监听套接字、绑定地址、并设置当有新连接到来时（监听套接字可读）的回调函数为 Acceptor::handleRead。
+// TcpServer.cc (构造函数部分)  TcpServer::TcpServer(EventLoop* loop,  const InetAddress&amp; listenAddr,  const string&amp; nameArg,  Option option)  : loop_(CHECK_NOTNULL(loop)),  acceptor_(new Acceptor(loop, listenAddr, option == kReusePort)),  // ...  &#123;  acceptor_-&gt;setNewConnectionCallback(  std::bind(&amp;TcpServer::newConnection, this, _1, _2));  &#125;// Acceptor.cc (构造函数部分)Acceptor::Acceptor(EventLoop* loop, const InetAddress&amp; listenAddr, bool reuseport): loop_(loop),  acceptSocket_(sockets::createNonblockingOrDie(listenAddr.family())),  acceptChannel_(loop, acceptSocket_.fd()), // 为监听套接字创建 Channel  // ...  &#123;  // ...  acceptSocket_.bindAddress(listenAddr);  acceptChannel_.setReadCallback(  std::bind(&amp;Acceptor::handleRead, this)); // 设置 Channel 的读回调  &#125;  
+
+调用TcpServer::start() 时，会通过 loop_-&gt;runInLoop() 调用 Acceptor::listen()，该方法会调用 listen() 系统调用并使 acceptChannel_ 开始关注读事件。
+// Acceptor.cc  void Acceptor::listen()  &#123;  loop_-&gt;assertInLoopThread();  listenning_ = true;  acceptSocket_.listen();  acceptChannel_.enableReading(); // 将 acceptChannel_ 加入 Poller 监听  &#125;
+
+当新连接到达时，acceptChannel_ 的 handleRead 被触发：
+// Acceptor.cc  void Acceptor::handleRead()  &#123;  loop_-&gt;assertInLoopThread();  InetAddress peerAddr;  int connfd = acceptSocket_.accept(&amp;peerAddr); // 接受新连接  if (connfd &gt;= 0)  &#123;  if (newConnectionCallback_)  &#123;  newConnectionCallback_(connfd, peerAddr); // 调用 TcpServer::newConnection  &#125;  else  &#123;  sockets::close(connfd);  &#125;  &#125;  // ... (错误处理和 EMFILE 处理) ...  &#125;
+
+2. TcpServer::newConnection：连接的分发Acceptor 将新接受的 connfd 和对端地址传递给 TcpServer::newConnection。此方法的核心职责是：
+
+从 EventLoopThreadPool 中通过轮询选择一个 I&#x2F;O EventLoop。
+为新连接创建一个 TcpConnection 对象，并将选择的 I&#x2F;O EventLoop 传递给它。
+设置 TcpConnection 的各种回调（连接状态、消息到达、写完成、关闭）。
+将 TcpConnection::connectEstablished 方法提交到选定的 I&#x2F;O EventLoop 中执行。
+
+// TcpServer.cc  void TcpServer::newConnection(int sockfd, const InetAddress&amp; peerAddr)  &#123;  loop_-&gt;assertInLoopThread(); // 确保在主 EventLoop 中  EventLoop* ioLoop = threadPool_-&gt;getNextLoop(); // 轮询选择 I/O Loop  // ... (生成连接名 connName) ...  TcpConnectionPtr conn(new TcpConnection(ioLoop, // 将 ioLoop 传递给 TcpConnection  connName,  sockfd,  localAddr,  peerAddr));  connections_[connName] = conn; // 保存连接  // ... (设置各种回调) ...  conn-&gt;setCloseCallback(  std::bind(&amp;TcpServer::removeConnection, this, _1));  // 将连接建立的后续操作交给 ioLoop 执行  ioLoop-&gt;runInLoop(std::bind(&amp;TcpConnection::connectEstablished, conn));  &#125;
+
+3. TcpConnection::connectEstablished：连接的最终建立此方法在选定的 I&#x2F;O EventLoop 线程中执行，完成连接的最后步骤：
+// TcpConnection.cc  void TcpConnection::connectEstablished()  &#123;  loop_-&gt;assertInLoopThread(); // 确保在 ioLoop 中  assert(state_ == kConnecting);  setState(kConnected);  channel_-&gt;tie(shared_from_this()); // 绑定生命周期  channel_-&gt;enableReading(); // 开始关注该连接上的读事件  connectionCallback_(shared_from_this()); // 调用用户设置的连接建立回调  &#125;
+
+至此，新连接的建立和分发完成，后续该连接上的所有 I&#x2F;O 事件都将在其被分配到的 I&#x2F;O EventLoop 线程中处理。
+这是建立连接的时序图：
+
+事件二：收到消息 (MessageCallback)当客户端发送数据时，TcpConnection 对应的 channel_ 会触发读事件，进而调用 TcpConnection::handleRead。
+// TcpConnection.cc (构造函数中设置)  channel_-&gt;setReadCallback(  std::bind(&amp;TcpConnection::handleRead, this, _1));// TcpConnection.cc  void TcpConnection::handleRead(Timestamp receiveTime)  &#123;  loop_-&gt;assertInLoopThread();  int savedErrno = 0;  ssize_t n = inputBuffer_.readFd(channel_-&gt;fd(), &amp;savedErrno); // 从 socket 读取数据到 inputBuffer_  if (n &gt; 0)  &#123;  // 调用用户在 TcpServer 中设置的 messageCallback_  messageCallback_(shared_from_this(), &amp;inputBuffer_, receiveTime);  &#125;  else if (n == 0) // 对端关闭  &#123;  handleClose();  &#125;  else // 错误  &#123;  errno = savedErrno;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleRead&quot;;  handleError(); // 通常也会调用 handleClose  &#125;  &#125;
 
 
-buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
-readerIndex_: size_t 类型，标记可读数据的起始位置。
-writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
+用户通过 TcpServer::setMessageCallback 设置的回调函数会在这里被调用，参数包括 TcpConnectionPtr、存有接收数据的 Buffer* 以及时间戳。用户可以在回调中从 Buffer 中取出数据进行业务处理。
+这是处理读事件的时序图:
 
-通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
-size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
+事件三：消息发送完成 (WriteCompleteCallback)当用户调用 TcpConnection::send() 发送数据时：
 
-基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
-void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
+如果当前线程不是连接所属的 ioLoop，则将发送任务 sendInLoop 提交到 ioLoop 执行。
+sendInLoop 会尝试直接 write() 数据到 socket。
+如果数据一次性全部写完，且用户设置了 writeCompleteCallback_，则将其提交到 ioLoop 的任务队列中执行。
+如果数据没有一次性写完（例如内核发送缓冲区满），则将剩余数据存入 outputBuffer_，并使 channel_ 开始关注写事件 (enableWriting())。
 
-核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
-2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
-void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
 
-在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
-空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
+当 socket 变为可写时，channel_ 的写事件回调 TcpConnection::handleWrite 被触发。
+handleWrite 会继续从 outputBuffer_ 中发送数据。如果所有数据都发送完毕，则取消对写事件的关注 (disableWriting())，并调用 writeCompleteCallback_。
 
-内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
-外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
+// TcpConnection.cc (sendInLoop 核心逻辑)  void TcpConnection::sendInLoop(const void* data, size_t len)  &#123;  loop_-&gt;assertInLoopThread();  ssize_t nwrote = 0;  size_t remaining = len;  bool faultError = false;  if (state_ == kDisconnected) &#123; /* ... return ... */ &#125;// 如果输出队列为空，尝试直接发送  if (!channel_-&gt;isWriting() &amp;&amp; outputBuffer_.readableBytes() == 0)  &#123;  nwrote = sockets::write(channel_-&gt;fd(), data, len);  if (nwrote &gt;= 0)  &#123;  remaining = len - nwrote;  if (remaining == 0 &amp;&amp; writeCompleteCallback_) // 全部发送完毕  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  &#125;  else // nwrote &lt; 0 (错误)  &#123;  // ... 错误处理 ...  &#125;  &#125;if (!faultError &amp;&amp; remaining &gt; 0) // 如果还有数据未发送  &#123;  // ... (检查高水位回调 HighWaterMarkCallback) ...  outputBuffer_.append(static_cast&lt;const char*&gt;(data)+nwrote, remaining); // 存入输出缓冲区  if (!channel_-&gt;isWriting())  &#123;  channel_-&gt;enableWriting(); // 开始关注写事件  &#125;  &#125;  &#125;// TcpConnection.cc (构造函数中设置)  channel_-&gt;setWriteCallback(  std::bind(&amp;TcpConnection::handleWrite, this));// TcpConnection.cc  void TcpConnection::handleWrite()  &#123;  loop_-&gt;assertInLoopThread();  if (channel_-&gt;isWriting())  &#123;  ssize_t n = sockets::write(channel_-&gt;fd(),  outputBuffer_.peek(),  outputBuffer_.readableBytes());  if (n &gt; 0)  &#123;  outputBuffer_.retrieve(n);  if (outputBuffer_.readableBytes() == 0) // 输出缓冲区已空  &#123;  channel_-&gt;disableWriting(); // 不再关注写事件  if (writeCompleteCallback_)  &#123;  loop_-&gt;queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));  &#125;  if (state_ == kDisconnecting) // 如果正在关闭连接  &#123;  shutdownInLoop();  &#125;  &#125;  &#125;  else  &#123;  LOG_SYSERR &lt;&lt; &quot;TcpConnection::handleWrite&quot;;  &#125;  &#125;  else  &#123;  LOG_TRACE &lt;&lt; &quot;Connection fd = &quot; &lt;&lt; channel_-&gt;fd()  &lt;&lt; &quot; is down, no more writing&quot;;  &#125;  &#125;
 
-void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
+“消息发送完成”这个“半个事件”是通过 WriteCompleteCallback 来体现的，它在输出缓冲区的数据全部成功写入内核后被调用。
+因为写数据是用户关注的，如果一次性写完成就不必关心了，写不完就先放到buffer中，等到可写的时候，处理下写事件，将数据再次发送，发送完就不必关注了，这样也可以避免busyloop了
+这是上述过程的时序图
 
-这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
-高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
-ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
+事件四：连接关闭连接关闭的触发点有多种：对端关闭（handleRead 读到 EOF）、本地主动关闭（用户调用 TcpConnection::shutdown()）、或发生错误（handleError） 。这些路径通常都会汇聚到 TcpConnection::handleClose()。
+TcpConnection 在构造时设置了其 channel_ 的关闭回调为 handleClose。
+// TcpConnection.cc (构造函数中设置)  channel_-&gt;setCloseCallback(  std::bind(&amp;TcpConnection::handleClose, this));  
 
-readFd 的设计有几个显著优点：  
+handleClose() 的核心逻辑：  
 
-减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
-避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
-避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
-栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
+断言在正确的 ioLoop 中执行。  
+将连接状态设为 kDisconnected。  
+调用 channel_-&gt;disableAll()，使该 Channel 不再关注任何事件。  
+调用用户设置的 connectionCallback_（此时连接状态已变为 kDisconnected）。  
+调用 closeCallback_（在 TcpServer::newConnection 中被绑定到 TcpServer::removeConnection）。
 
-其他实用特性
-网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
-头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
-查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
+// TcpConnection.cc  void TcpConnection::handleClose()  &#123;  loop_-&gt;assertInLoopThread();  LOG_TRACE &lt;&lt; &quot;fd = &quot; &lt;&lt; channel_-&gt;fd() &lt;&lt; &quot; state = &quot; &lt;&lt; stateToString();  assert(state_ == kConnected || state_ == kDisconnecting);  setState(kDisconnected);  channel_-&gt;disableAll(); // 如果是那种建立过连接的文件描述符，在这一步就会被从poller移除了TcpConnectionPtr guardThis(shared_from_this()); // 确保回调期间对象存活  connectionCallback_(guardThis);  closeCallback_(guardThis); // 调用 TcpServer::removeConnection  &#125;  
+TcpServer::removeConnection 会将实际的移除操作（从 connections_ map 中删除）提交到 TcpServer 的主 EventLoop 中执行（removeConnectionInLoop），以保证线程安全。之后，它会将最终的销毁操作 TcpConnection::connectDestroyed 提交回该连接所属的 I&#x2F;O EventLoop 中执行。
+// TcpServer.cc  void TcpServer::removeConnection(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;runInLoop(std::bind(&amp;TcpServer::removeConnectionInLoop, this, conn));  &#125;void TcpServer::removeConnectionInLoop(const TcpConnectionPtr&amp; conn)  &#123;  loop_-&gt;assertInLoopThread();  LOG_INFO &lt;&lt; &quot;TcpServer::removeConnectionInLoop [&quot; &lt;&lt; name_  &lt;&lt; &quot;] - connection &quot; &lt;&lt; conn-&gt;name();  connections_.erase(conn-&gt;name()); // 从 TcpServer 管理的 map 中移除  EventLoop* ioLoop = conn-&gt;getLoop();  // 将最后的清理工作交给连接所属的 ioLoop  ioLoop-&gt;queueInLoop(  std::bind(&amp;TcpConnection::connectDestroyed, conn));  &#125;  
+TcpConnection::connectDestroyed 负责将 Channel 从其 EventLoop 的 Poller 中移除。
+// TcpConnection.cc  void TcpConnection::connectDestroyed()  &#123;  loop_-&gt;assertInLoopThread();  if (state_ == kConnected) // 如果之前是连接状态，则先更新状态并调用回调  &#123;  setState(kDisconnected);  channel_-&gt;disableAll();  connectionCallback_(shared_from_this());  &#125;  channel_-&gt;remove(); // 从 Poller 中移除 Channel  &#125;// Channel.cc  void Channel::remove()  &#123;  assert(isNoneEvent());  addedToLoop_ = false;  loop_-&gt;removeChannel(this); // 通知 EventLoop 从 Poller 中移除  &#125;
 
-总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
-其核心设计启示包括：
+EventLoop::removeChannel 会调用 Poller::removeChannel，最终通过 epoll_ctl(EPOLL_CTL_DEL, …) 将文件描述符从 epoll 实例中移除。
+这是关闭连接的时序图:
+当 TcpConnectionPtr 的最后一个 shared_ptr 引用（通常是在 connectDestroyed 的 std::bind 对象析构时）消失后，TcpConnection 对象及其拥有的 Socket（会在析构时关闭 fd）和 Channel 对象会被自动析构，完成资源的彻底回收。
+这一套精心设计的流程，严格遵守了“对象生命周期管理”和“线程封闭”的原则，确保了连接关闭的正确性和资源的有效释放。
+总结通过对 muduo 中新连接建立、数据收发、连接关闭这“三个半事件”处理流程的分析，我们可以看到陈硕大佬是如何将这些网络编程中的核心操作，优雅地融入其基于对象的事件驱动框架中的。
 
-空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
-减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
-设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
-接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
+事件的统一处理入口： EventLoop::loop() 是所有事件处理的起点。
+Channel 作为事件分发的核心： 它封装了文件描述符和相关的事件回调。
+职责明确的类设计： Acceptor 专注于接受新连接，TcpServer 负责管理和分发连接，TcpConnection 负责处理单个连接的生命周期和业务逻辑。
+线程安全的保证： 通过 “One Loop Per Thread” 和 runInLoop&#x2F;queueInLoop 机制，确保了所有对象的操作都在其所属的线程中执行。
+回调机制的广泛应用： 将具体的业务逻辑与框架逻辑解耦，提高了灵活性和可扩展性。
 
-理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
+通过这些操作，在遵循陈硕大佬的 基于对象 的理念的前提下，完成了对“三个半事件”的处理。
 ]]></content>
       <categories>
         <category>源码分析</category>
@@ -1200,69 +1348,6 @@ RAII + 智能指针是 C++ 的精髓
       </tags>
   </entry>
   <entry>
-    <title>spdlog源码阅读:01.异步机制解析</title>
-    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
-    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
-
-spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
-跨平台： 支持windows,linux,android等多个平台
-功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
-阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
-
-从demo出发：追踪日志消息的产生，处理和输出路径
-梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
-分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
-可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
-
-以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
-注：本文分析的源码为spdlog的v1.15.1版本
-spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
-我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
-日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
-日志生产
-logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
-log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
-在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
-在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
-
-日志消费
-线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
-在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
-spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
-以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
-上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
-
-可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
-强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
-spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
-//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
-线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
-spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
-thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
-
-主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
-formatter：格式化日志消息的基类
-sink: 日志输出的基类
-spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
-mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
-template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
-通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
-一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>spdlog</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>spdlog</tag>
-        <tag>日志系统</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>spdlog源码阅读:02.sink分析</title>
     <url>/2025/04/29/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/</url>
     <content><![CDATA[引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。
@@ -1331,6 +1416,69 @@ rotating_file_sink
 磁盘空间控制
 
 
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:01.异步机制解析</title>
+    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
+    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
+
+spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
+跨平台： 支持windows,linux,android等多个平台
+功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
+阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
+
+从demo出发：追踪日志消息的产生，处理和输出路径
+梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
+分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
+可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
+
+以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
+注：本文分析的源码为spdlog的v1.15.1版本
+spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
+我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
+日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
+日志生产
+logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
+log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
+在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
+在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
+
+日志消费
+线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
+在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
+spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
+以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
+上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
+
+可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
+强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
+spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
+//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
+线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
+spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
+thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
+
+主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
+formatter：格式化日志消息的基类
+sink: 日志输出的基类
+spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
+mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
+template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
+通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
+一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
 ]]></content>
       <categories>
         <category>源码分析</category>
