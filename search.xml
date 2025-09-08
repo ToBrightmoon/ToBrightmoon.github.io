@@ -1,6 +1,138 @@
 <?xml version="1.0" encoding="utf-8"?>
 <search>
   <entry>
+    <title>coredump的那些事:01.coredump的启动</title>
+    <url>/2025/08/19/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/</url>
+    <content><![CDATA[前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候，
+一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。
+注：本文的一些终端操作均在ubuntu22.04下进行
+
+coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册
+The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 whichcause a process to dump core can be found in signal(7)....
+上面的英文，使用中文简单总结就是:
+当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息
+从上面的介绍中可以得到一些信息:
+
+没有处理一些信号会导致进程终止并产生coredump文件
+coredump是操作系统产生的
+coredump可以供gdb调试器使用
+
+核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。
+产生coredump生成的信号那么到底那些信号会导致coredump的产生呢? 我们使用 man 7 signal 这个命令去查看信号的手册，在 Standard signals 小节中有着相关的内容，相关的内容如下
+Standard signals      Linux  supports  the  standard signals listed below.        ......      Signal      Standard   Action   Comment      ────────────────────────────────────────────────────────────────────────      SIGABRT      P1990      Core    Abort signal from abort(3)      SIGBUS       P2001      Core    Bus error (bad memory access)      SIGFPE       P1990      Core    Floating-point exception      SIGILL       P1990      Core    Illegal Instruction      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT      SIGQUIT      P1990      Core    Quit from keyboard      SIGSEGV      P1990      Core    Invalid memory reference      SIGSYS       P2001      Core    Bad system call (SVr4);                                      see also seccomp(2)      SIGTRAP      P2001      Core    Trace/breakpoint trap      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);                                      see setrlimit(2)      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);                                      see setrlimit(2)
+这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。
+具体的coredump的产生的细节，可以参考知乎上的一篇文章
+coredump的配置之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。
+coredump生成的限制Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 man 5 core这个命令去查看coredump的手册，去找到相关的内容:
+    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐    nal; see getrlimit(2) for details.    There are various circumstances in which a core dump file is not produced:    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumpedcore, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be createdis not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.    ......
+
+将手册中的内容简单使用中文总结就是:
+有多种情况会导致 不生成 core dump 文件：
+
+进程没有权限写 core 文件（默认文件名为 core 或 core.pid，存放在当前工作目录）。
+目标文件已存在并有多个硬链接。
+文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。
+目录不存在。
+RLIMIT_CORE 或 RLIMIT_FSIZE 被设置为 0。
+可执行文件没有读取权限（安全措施）。
+程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 prctl(2) PR_SET_DUMPABLE 和 /proc/sys/fs/suid_dumpable 允许）。
+/proc/sys/kernel/core_pattern 为空 且 /proc/sys/kernel/core_uses_pid &#x3D; 0。
+内核编译时未启用 CONFIG_COREDUMP（Linux 3.7+）。
+进程使用了 madvise(MADV_DONTDUMP) 屏蔽了部分地址空间。
+在 systemd 系统中，core dump 可能由 systemd-coredump(8) 接管。
+
+那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:
+针对系统本身:
+
+磁盘空间足够，支持生成coredump。
+生成coredump的大小在受限范围内。
+生成文件的目录存在。
+
+针对进程：
+
+进程未被systemd接管，没有屏蔽 地址空间
+有相关位置的读写权限。
+
+我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。
+此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容
+操作步骤临时开启linux提供了ulimit这个命令去修改coredump的限制，相关的内容可以通过 man ulimit去查阅。
+## 打开终端,修改系统限制为不限制 coredumop大小## 不要关闭终端，因为ulimit命令只在当前终端下生效。ulimit -c unlimited## 将当前的coredump输出目录修改成你的进程有权限读写的位置## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符sudo bash -c &#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下
+长久开启想要长久的配置coredump文件的启动，需要修改 /etc/security/limits.conf和 /etc/sysctl.conf 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效
+# 使用gedit工具打开limits.conf文件 sudo gedit /etc/security/limits.conf # 在文件的最后一行增加如下内容,注意*不能省略*               soft    core            unlimited # 编辑/etc/sysctl.conf文件sudo gedit /etc/sysctl.conf# 在文件的最后一行增加如下内容kernel.core_pattern=/path/%e-%p.core
+
+配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用
+创建服务文件:
+sudo gedit /etc/systemd/system/sysctl-reload.service
+
+文件内容如下所示
+[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target
+
+执行如下命令配置服务
+# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+配套的脚本读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够知其然,也知其所以然,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。
+这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 ~/coredump 目录下。
+#!/bin/bash# 获取当前用户的用户名USERNAME=$(whoami)CORE_PATH=&quot;/home/$USERNAME/coredump&quot;# 创建coredump存储目录mkdir -p $CORE_PATH# 定义新脚本的文件名和路径SCRIPT_PATH=&quot;$CORE_PATH/rename_core.sh&quot;# 使用重定向符号将内容写入新脚本cat &lt;&lt; EOF &gt; $SCRIPT_PATH#!/bin/bashCOREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;EOFcat &lt;&lt; &#x27;EOF&#x27; &gt;&gt; $SCRIPT_PATHTIMESTAMP=&quot;$(date +%Y-%m-%d-%H-%M-%S)&quot;COREFILE_NAME=&quot;$&#123;1&#125;-$&#123;2&#125;-$TIMESTAMP.core&quot;# 创建coredump文件cat &gt; &quot;$COREFILE_DIR/$COREFILE_NAME&quot;EOFchmod +x $SCRIPT_PATH# 永久设置coredump文件大小限制sudo bash -c  &#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;sudo bash -c &#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;# 确保设置在重启后仍然有效echo &quot;Making changes persistent...&quot;sudo bash -c &#x27;echo &quot;kernel.core_pattern=|&#x27;$SCRIPT_PATH&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;SERVICE=&quot;/etc/systemd/system/sysctl-reload.service&quot;sudo bash -c &#x27;echo &quot;[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target&quot; &gt; &#x27;$SERVICE&#x27;&#x27;# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
+
+相关部分的部分内核源码解读之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。
+这个函数的位置是 linux内核中的 fs/coredump.c中。我查看的源码的分支是 v6.9,读者也可以从 https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635 这个网址查看。
+初始化参数struct mm_struct *mm = current-&gt;mm; // 进程的内存描述符，保存了进程的虚拟内存信息struct linux_binfmt * binfmt;......struct coredump_params cprm = &#123;	.siginfo = siginfo,	.limit = rlimit(RLIMIT_CORE), // coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）	.mm_flags = mm-&gt;flags,	.vma_meta = NULL,	.cpu = raw_smp_processor_id(),&#125;;
+
+这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制
+简单的检查如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败
+binfmt = mm-&gt;binfmt;if (!binfmt || !binfmt-&gt;core_dump)	goto fail;if (!__get_dumpable(cprm.mm_flags))	goto fail;
+
+输出方式的决定如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入
+ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);if (ispipe) &#123;   ......    /* 管道模式，把 core dump 交给用户态程序处理 */    sub_info = call_usermodehelper_setup(helper_argv[0],                        helper_argv, NULL, GFP_KERNEL,                        umh_pipe_setup, NULL, &amp;cprm);    retval = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);&#125; else &#123;    .....    // 检查文件的大小和suid模式下是否是绝对路径    if (cprm.limit &lt; binfmt-&gt;min_coredump)			goto fail_unlock;		if (need_suid_safe &amp;&amp; cn.corename[0] != &#x27;/&#x27;) &#123;			printk(KERN_WARNING &quot;Pid %d(%s) can only dump core &quot;\				&quot;to fully qualified path!\n&quot;,				task_tgid_vnr(current), current-&gt;comm);			printk(KERN_WARNING &quot;Skipping core dump\n&quot;);			goto fail_unlock;		&#125;    /* 文件模式，直接写入 core 文件 */    cprm.file = filp_open(cn.corename, open_flags, 0600);&#125;
+
+static int format_corename(struct core_name *cn, struct coredump_params *cprm,			   size_t **argv, int *argc)&#123;	....	int ispipe = (*pat_ptr == &#x27;|&#x27;); // 就是通过core_pattern 是否是| 决定的	bool was_space = false;	.....	// 一些coredump name的输出配置	while (*pat_ptr) &#123;		...		if (*pat_ptr != &#x27;%&#x27;) &#123;			err = cn_printf(cn, &quot;%c&quot;, *pat_ptr++);		&#125; else &#123;			switch (*++pat_ptr) &#123;			/* single % at the end, drop that */			case 0:				goto out;			/* Double percent, output one percent */			case &#x27;%&#x27;:				err = cn_printf(cn, &quot;%c&quot;, &#x27;%&#x27;);				break;			/* pid */			case &#x27;p&#x27;:				pid_in_pattern = 1;				err = cn_printf(cn, &quot;%d&quot;,					      task_tgid_vnr(current));				break;			...		&#125;		....	&#125;out:    ......	return ispipe;&#125;
+这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”
+写入内存镜像遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中
+if (!dump_vma_snapshot(&amp;cprm))		goto close_fail;	file_start_write(cprm.file);	core_dumped = binfmt-&gt;core_dump(&amp;cprm);	if (cprm.to_skip) &#123;		cprm.to_skip--;		dump_emit(&amp;cprm, &quot;&quot;, 1);	&#125;	file_end_write(cprm.file);	free_vma_snapshot(&amp;cprm);
+
+收尾关闭一些文件,回收些资源
+if (cprm.file)filp_close(cprm.file, NULL);coredump_finish(core_dumped);revert_creds(old_cred);put_cred(cred);
+
+总结本文围绕 coredump 的生成与配置 展开，主要内容如下：
+
+coredump 的本质
+
+操作系统在进程异常退出时生成的内存镜像文件
+可用于 gdb 等工具还原程序当时的运行状态
+
+
+生成条件与限制
+
+信号触发：SIGSEGV、SIGABRT、SIGBUS 等
+限制因素：RLIMIT_CORE、权限、文件系统、core_pattern 等
+
+
+配置方法
+
+临时配置：ulimit -c unlimited + 修改 /proc/sys/kernel/core_pattern
+长期配置：编辑 /etc/security/limits.conf、/etc/sysctl.conf，配合 systemd 保持生效
+
+
+内核实现
+
+do_coredump() 是核心函数
+负责检查限制、解析 core_pattern、最终写入 core 文件
+从源码角度验证了手册与实际操作的正确性
+
+
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>coredump</category>
+      </categories>
+      <tags>
+        <tag>coredump</tag>
+        <tag>linux</tag>
+        <tag>问题分析</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>coredump的那些事:02.coredump的分析</title>
     <url>/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:02.%20coredump%E7%9A%84%E5%88%86%E6%9E%90/</url>
     <content><![CDATA[前言在上一篇文章中，我们讲解了 如何配置 Linux 系统，让程序在崩溃时生成 coredump 文件。
@@ -131,138 +263,6 @@ gdb 结合 LOAD 段和 DWARF 调试信息，重建调用栈和变量信息。
 一句话总结：
 
 coredump 是进程在崩溃瞬间的“冻结快照”，NOTE 段提供状态，LOAD 段提供内存，调试器则负责把这些还原成人类可理解的源码现场。
-
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>coredump</category>
-      </categories>
-      <tags>
-        <tag>coredump</tag>
-        <tag>linux</tag>
-        <tag>问题分析</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>coredump的那些事:01.coredump的启动</title>
-    <url>/2025/08/19/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/</url>
-    <content><![CDATA[前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候，
-一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。
-注：本文的一些终端操作均在ubuntu22.04下进行
-
-coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册
-The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This image can be used in a debugger (e.g., gdb(1)) to inspect the state of the program at the time that it terminated.	 A list of the	signals	 whichcause a process to dump core can be found in signal(7)....
-上面的英文，使用中文简单总结就是:
-当一个程序没有处理收到的信号导致异常退出时，操作系统会生成一个该进程的内存镜像，这个内存镜像中保存着可以供gdb调试器调试的信息
-从上面的介绍中可以得到一些信息:
-
-没有处理一些信号会导致进程终止并产生coredump文件
-coredump是操作系统产生的
-coredump可以供gdb调试器使用
-
-核心信息是内存镜像（栈、寄存器、堆等状态），它的体积可能非常大，所以系统默认不开启。
-产生coredump生成的信号那么到底那些信号会导致coredump的产生呢? 我们使用 man 7 signal 这个命令去查看信号的手册，在 Standard signals 小节中有着相关的内容，相关的内容如下
-Standard signals      Linux  supports  the  standard signals listed below.        ......      Signal      Standard   Action   Comment      ────────────────────────────────────────────────────────────────────────      SIGABRT      P1990      Core    Abort signal from abort(3)      SIGBUS       P2001      Core    Bus error (bad memory access)      SIGFPE       P1990      Core    Floating-point exception      SIGILL       P1990      Core    Illegal Instruction      SIGIOT         -        Core    IOT trap. A synonym for SIGABRT      SIGQUIT      P1990      Core    Quit from keyboard      SIGSEGV      P1990      Core    Invalid memory reference      SIGSYS       P2001      Core    Bad system call (SVr4);                                      see also seccomp(2)      SIGTRAP      P2001      Core    Trace/breakpoint trap      SIGUNUSED      -        Core    Synonymous with SIGSYS[已经废弃]      SIGXCPU      P2001      Core    CPU time limit exceeded (4.2BSD);                                      see setrlimit(2)      SIGXFSZ      P2001      Core    File size limit exceeded (4.2BSD);                                      see setrlimit(2)
-这些信号的默认处理方式就是 Core Dump，比如 SIGSEGV（非法内存访问）、SIGABRT（abort 触发），而 SIGKILL、SIGTERM 等则不会生成 core dump。
-具体的coredump的产生的细节，可以参考知乎上的一篇文章
-coredump的配置之前的部分介绍了coredump的信息，这个部分正式进入本篇文章的主题，介绍如何生成修改Linux中的相关配置。
-coredump生成的限制Linux系统默认情况下一个进程崩掉的时候，是不会产生coredump文件，至于具体原因，可以同样使用 man 5 core这个命令去查看coredump的手册，去找到相关的内容:
-    A process can set its soft RLIMIT_CORE resource limit to place an upper limit on the size of the core dump file that will be produced if it receives a &quot;core dump&quot; sig‐    nal; see getrlimit(2) for details.    There are various circumstances in which a core dump file is not produced:    *  The process does not have permission to write the core file.	(By default, the core file is called core or core.pid, where pid is the ID of the process that	dumpedcore, and is created in the current working directory.  See below for details on naming.)  Writing the core file fails if the directory in which it is to be createdis not writable, or if a file with the same name exists and is not writable or is not a regular file (e.g., it is a directory or a symbolic link).    *  A (writable, regular) file with the same name as would be used for the core dump already exists, but there is more than one hard link to that file.    ......
-
-将手册中的内容简单使用中文总结就是:
-有多种情况会导致 不生成 core dump 文件：
-
-进程没有权限写 core 文件（默认文件名为 core 或 core.pid，存放在当前工作目录）。
-目标文件已存在并有多个硬链接。
-文件系统写满 &#x2F; inode 用尽 &#x2F; 挂载为只读 &#x2F; 用户超出磁盘配额。
-目录不存在。
-RLIMIT_CORE 或 RLIMIT_FSIZE 被设置为 0。
-可执行文件没有读取权限（安全措施）。
-程序以 set-user-ID &#x2F; set-group-ID 或带有文件 capabilities 运行（除非通过 prctl(2) PR_SET_DUMPABLE 和 /proc/sys/fs/suid_dumpable 允许）。
-/proc/sys/kernel/core_pattern 为空 且 /proc/sys/kernel/core_uses_pid &#x3D; 0。
-内核编译时未启用 CONFIG_COREDUMP（Linux 3.7+）。
-进程使用了 madvise(MADV_DONTDUMP) 屏蔽了部分地址空间。
-在 systemd 系统中，core dump 可能由 systemd-coredump(8) 接管。
-
-那么想要修改操作系统中的配置，让进程崩溃时能够产生coredump文件简单的说就是要让进程运行的环境中避免这种限制:
-针对系统本身:
-
-磁盘空间足够，支持生成coredump。
-生成coredump的大小在受限范围内。
-生成文件的目录存在。
-
-针对进程：
-
-进程未被systemd接管，没有屏蔽 地址空间
-有相关位置的读写权限。
-
-我们大部分时候需要操作的，就是修改下系统的coredump大小限制和coredump的生成位置(&#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern)，保证进程有权限在相关的位置下进行读写。更加复杂的情况，请读者根据手册上的相关内容自行探索。
-此外，linux还支持通过自定义coredump的name和利用管道对coredump进行相关操作，相关的内容
-操作步骤临时开启linux提供了ulimit这个命令去修改coredump的限制，相关的内容可以通过 man ulimit去查阅。
-## 打开终端,修改系统限制为不限制 coredumop大小## 不要关闭终端，因为ulimit命令只在当前终端下生效。ulimit -c unlimited## 将当前的coredump输出目录修改成你的进程有权限读写的位置## 其中 %e和%p 是linux默认支持的将coredump的文件名命名为 程序名和进程id的占位符sudo bash -c &#x27;echo &quot;/path/%e-%p.core&quot; &gt; /proc/sys/kernel/core_pattern&#x27;## 在此终端中的启动的进程输出的coredump就会最终保存在你设置的路径下
-长久开启想要长久的配置coredump文件的启动，需要修改 /etc/security/limits.conf和 /etc/sysctl.conf 文件，并且配置一个systemd服务，保证系统重启的时候依旧有效
-# 使用gedit工具打开limits.conf文件 sudo gedit /etc/security/limits.conf # 在文件的最后一行增加如下内容,注意*不能省略*               soft    core            unlimited # 编辑/etc/sysctl.conf文件sudo gedit /etc/sysctl.conf# 在文件的最后一行增加如下内容kernel.core_pattern=/path/%e-%p.core
-
-配置启动服务，每次开机后使得&#x2F;etc&#x2F;sysctl.conf配置文件发挥作用
-创建服务文件:
-sudo gedit /etc/systemd/system/sysctl-reload.service
-
-文件内容如下所示
-[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target
-
-执行如下命令配置服务
-# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
-
-配套的脚本读到这里的时候，我相信其实你已经基本知道了coredump配置的基本原理，能够知其然,也知其所以然,针对自己需要的情况进行配置。但是为了方便读者使用，本文提供了一个脚本去开启本机的coreumdp设置。
-这个脚本能够长久的配置coredump文件以 程序名-进程id-coredump产生时间的格式保留在 ~/coredump 目录下。
-#!/bin/bash# 获取当前用户的用户名USERNAME=$(whoami)CORE_PATH=&quot;/home/$USERNAME/coredump&quot;# 创建coredump存储目录mkdir -p $CORE_PATH# 定义新脚本的文件名和路径SCRIPT_PATH=&quot;$CORE_PATH/rename_core.sh&quot;# 使用重定向符号将内容写入新脚本cat &lt;&lt; EOF &gt; $SCRIPT_PATH#!/bin/bashCOREFILE_DIR=&quot;/home/$USERNAME/coredump&quot;EOFcat &lt;&lt; &#x27;EOF&#x27; &gt;&gt; $SCRIPT_PATHTIMESTAMP=&quot;$(date +%Y-%m-%d-%H-%M-%S)&quot;COREFILE_NAME=&quot;$&#123;1&#125;-$&#123;2&#125;-$TIMESTAMP.core&quot;# 创建coredump文件cat &gt; &quot;$COREFILE_DIR/$COREFILE_NAME&quot;EOFchmod +x $SCRIPT_PATH# 永久设置coredump文件大小限制sudo bash -c  &#x27;echo &quot;* hard core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;sudo bash -c &#x27;echo &quot;* soft core unlimited&quot; &gt;&gt; /etc/security/limits.conf&#x27;# 确保设置在重启后仍然有效echo &quot;Making changes persistent...&quot;sudo bash -c &#x27;echo &quot;kernel.core_pattern=|&#x27;$SCRIPT_PATH&#x27; %e %p&quot; &gt;&gt; /etc/sysctl.conf&#x27;SERVICE=&quot;/etc/systemd/system/sysctl-reload.service&quot;sudo bash -c &#x27;echo &quot;[Unit]Description=Reload sysctl settings after all services have startedAfter=network.target[Service]Type=oneshotExecStart=/sbin/sysctl -p /etc/sysctl.confRemainAfterExit=yes[Install]WantedBy=multi-user.target&quot; &gt; &#x27;$SERVICE&#x27;&#x27;# 确保服务可以开机自动启动sudo systemctl enable sysctl-reload.service# 重新加载“systemd”配置sudo systemctl daemon-reload# 启动服务sudo systemctl start sysctl-reload.service# 查看服务启动的结果sudo systemctl status sysctl-reload.service
-
-相关部分的部分内核源码解读之前查看手册看了那么多coredump生成的限制和，coredump生成的修改方式，这一小节我们就从源码中看一下，Linux内核中负责生成coredump的函数 do_coredump到底做了生成。
-这个函数的位置是 linux内核中的 fs/coredump.c中。我查看的源码的分支是 v6.9,读者也可以从 https://elixir.bootlin.com/linux/v6.9/source/fs/coredump.c#L635 这个网址查看。
-初始化参数struct mm_struct *mm = current-&gt;mm; // 进程的内存描述符，保存了进程的虚拟内存信息struct linux_binfmt * binfmt;......struct coredump_params cprm = &#123;	.siginfo = siginfo,	.limit = rlimit(RLIMIT_CORE), // coredump 文件大小限制，来自 RLIMIT_CORE（也就是 ulimit -c 设置的值）	.mm_flags = mm-&gt;flags,	.vma_meta = NULL,	.cpu = raw_smp_processor_id(),&#125;;
-
-这一段代码初始化了生成coredump需要的一些基础信息，rlimit这个函数会读取当前任务的coredump大小的限制
-简单的检查如果进程没有合法的 binfmt，或者没有实现 core_dump 方法，直接失败
-binfmt = mm-&gt;binfmt;if (!binfmt || !binfmt-&gt;core_dump)	goto fail;if (!__get_dumpable(cprm.mm_flags))	goto fail;
-
-输出方式的决定如果 &#x2F;proc&#x2F;sys&#x2F;kernel&#x2F;core_pattern 以 | 开头，那么内核会通过管道把 core dump 交给用户态的 helper 程序处理。 否则，就会直接在文件系统里创建一个 core 文件并写入
-ispipe = format_corename(&amp;cn, &amp;cprm, &amp;argv, &amp;argc);if (ispipe) &#123;   ......    /* 管道模式，把 core dump 交给用户态程序处理 */    sub_info = call_usermodehelper_setup(helper_argv[0],                        helper_argv, NULL, GFP_KERNEL,                        umh_pipe_setup, NULL, &amp;cprm);    retval = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);&#125; else &#123;    .....    // 检查文件的大小和suid模式下是否是绝对路径    if (cprm.limit &lt; binfmt-&gt;min_coredump)			goto fail_unlock;		if (need_suid_safe &amp;&amp; cn.corename[0] != &#x27;/&#x27;) &#123;			printk(KERN_WARNING &quot;Pid %d(%s) can only dump core &quot;\				&quot;to fully qualified path!\n&quot;,				task_tgid_vnr(current), current-&gt;comm);			printk(KERN_WARNING &quot;Skipping core dump\n&quot;);			goto fail_unlock;		&#125;    /* 文件模式，直接写入 core 文件 */    cprm.file = filp_open(cn.corename, open_flags, 0600);&#125;
-
-static int format_corename(struct core_name *cn, struct coredump_params *cprm,			   size_t **argv, int *argc)&#123;	....	int ispipe = (*pat_ptr == &#x27;|&#x27;); // 就是通过core_pattern 是否是| 决定的	bool was_space = false;	.....	// 一些coredump name的输出配置	while (*pat_ptr) &#123;		...		if (*pat_ptr != &#x27;%&#x27;) &#123;			err = cn_printf(cn, &quot;%c&quot;, *pat_ptr++);		&#125; else &#123;			switch (*++pat_ptr) &#123;			/* single % at the end, drop that */			case 0:				goto out;			/* Double percent, output one percent */			case &#x27;%&#x27;:				err = cn_printf(cn, &quot;%c&quot;, &#x27;%&#x27;);				break;			/* pid */			case &#x27;p&#x27;:				pid_in_pattern = 1;				err = cn_printf(cn, &quot;%d&quot;,					      task_tgid_vnr(current));				break;			...		&#125;		....	&#125;out:    ......	return ispipe;&#125;
-这部分源码解释了为什么 core_pattern 的配置能决定 core dump 的“去向”
-写入内存镜像遍历进程的虚拟内存映射，收集要写的内存段（堆、栈、代码段等,并且使用core_dump这个方法将coredump文件按照需要的格式保存到文件中
-if (!dump_vma_snapshot(&amp;cprm))		goto close_fail;	file_start_write(cprm.file);	core_dumped = binfmt-&gt;core_dump(&amp;cprm);	if (cprm.to_skip) &#123;		cprm.to_skip--;		dump_emit(&amp;cprm, &quot;&quot;, 1);	&#125;	file_end_write(cprm.file);	free_vma_snapshot(&amp;cprm);
-
-收尾关闭一些文件,回收些资源
-if (cprm.file)filp_close(cprm.file, NULL);coredump_finish(core_dumped);revert_creds(old_cred);put_cred(cred);
-
-总结本文围绕 coredump 的生成与配置 展开，主要内容如下：
-
-coredump 的本质
-
-操作系统在进程异常退出时生成的内存镜像文件
-可用于 gdb 等工具还原程序当时的运行状态
-
-
-生成条件与限制
-
-信号触发：SIGSEGV、SIGABRT、SIGBUS 等
-限制因素：RLIMIT_CORE、权限、文件系统、core_pattern 等
-
-
-配置方法
-
-临时配置：ulimit -c unlimited + 修改 /proc/sys/kernel/core_pattern
-长期配置：编辑 /etc/security/limits.conf、/etc/sysctl.conf，配合 systemd 保持生效
-
-
-内核实现
-
-do_coredump() 是核心函数
-负责检查限制、解析 core_pattern、最终写入 core 文件
-从源码角度验证了手册与实际操作的正确性
-
-
 
 ]]></content>
       <categories>
@@ -411,6 +411,123 @@ GDB 在 dwarf2read.c 中解析调试信息，构建 DIE 树，支持 bt、print�
 
 
 一句话总结：-g 参数是 gdb 从“只能看十六进制地址”到“直接跳到源码行”的根本原因，背后依赖的就是 DWARF 格式调试信息。
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>coredump</category>
+      </categories>
+      <tags>
+        <tag>coredump</tag>
+        <tag>linux</tag>
+        <tag>问题分析</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>coredump的那些事:04.多线程程序的调试</title>
+    <url>/2025/09/08/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:04.%20%E5%A4%9A%E7%BA%BF%E7%A8%8B%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%B0%83%E8%AF%95/</url>
+    <content><![CDATA[前言在之前的文章中，我们依次讲解了
+
+coredump的配置与生成
+gdb使用coredump进行调试
+DWARF调试信息的生成与使用
+
+但是之前的程序都是简单的单线程程序，但是实际中我们面临的更多的是多线程下的崩溃问题，相比于单线程程序多线程因为以下原因更加复杂:
+
+程序在不同线程中同时执行
+崩溃的线程可能与另一个线程的状态相关
+竞态问题导致的问题在调试中难以复现
+
+因此这篇文章我们就来进入更复杂主题：多线程程序的调试
+基础知识linux线程模型
+linux中的线程不是特殊的对象，线程与进程都是 task_struct 这个结构
+区别在于线程独占调用堆栈与寄存器，但是与父进程共享地址空间，文件描述符等资源
+
+coredump与线程
+某个线程的崩溃会导致整个进程coreudmp
+coredump发生时，内核会遍历整个task_struct，将每个线程的寄存器，上下文与栈信息都写入文件中
+
+当我们在 gdb 中使用 info threads，看到的每一个线程，背后就是内核在 coredump 里写下的 task_struct → 内核栈 + 用户栈 的信息
+gdb多线程下的常用命令查看线程列表info threads
+列出当前进程（或 core 文件）里的所有线程gdb 会显示每个线程的 ID、状态、当前执行的函数位置
+切换到指定线程thread N
+切换到第 N 个线程（注意：gdb 的线程号与系统 ps -L 看到的 LWP 不同，但可以通过 info threads 映射）
+打印所有线程的堆栈thread apply all bt
+对所有线程执行 bt（backtrace），快速查看全局状态在排查死锁和卡住的情况时非常有用
+只对部分线程操作thread apply 3 5 bt
+只对线程 3 和 5 打印堆栈
+查看某线程的局部变量thread 3btframe 2info locals
+条件断点break &lt;function&gt; if &lt;condition&gt;
+在调试竞态或复杂多线程问题时，条件断点非常有用
+跟踪线程切换set print thread-events on
+程序运行时，gdb 会提示线程的创建&#x2F;销毁情况
+注意线程号与 LWP 映射：gdb 内部编号与系统 LWP 不同。可以通过 info threads 查看 LWP，再用 ps -L -p &lt;PID&gt; 对照。
+多线程问题调试示例这一章节我们通过3个经典的问题去试验下多线程下gdb的使用
+崩溃问题流程演示//crash_demo.cpp#include &lt;iostream&gt;#include &lt;thread&gt;#include &lt;chrono&gt;void thread_func_normal() &#123;    int counter = 0;    while (true) &#123;        std::cout &lt;&lt; &quot;[Thread A] counter = &quot; &lt;&lt; counter++ &lt;&lt; std::endl;        std::this_thread::sleep_for(std::chrono::seconds(1));    &#125;&#125;void thread_func_crash() &#123;    std::this_thread::sleep_for(std::chrono::seconds(2));    std::cout &lt;&lt; &quot;[Thread B] about to crash...&quot; &lt;&lt; std::endl;    int* p = nullptr;    *p = 42;  // 故意制造段错误 (SIGSEGV)&#125;int main() &#123;    std::thread t1(thread_func_normal);    std::thread t2(thread_func_crash);    t1.join();    t2.join();    return 0;&#125;
+使用如下命令去产生coredump文件
+g++ -g -O0 -pthread -o crash_demo crash_demo.cppulimit -c unlimitedecho &quot;/tmp/%e.core&quot; | sudo tee /proc/sys/kernel/core_pattern./crash_demogdb ./crash_demo core
+此时的页面可能如下所示，gdb调试器会直接进入崩溃的线程，可以使用print命令打印变量的值
+print p # 打印变量的值
+
+info locals # 查看所有的局部变量
+查看所有的局部变量就可以直接发现是局部变量被修改成空指针了，然后可以去继续调查局部变量为什么修改的原因，这个时候就可以去看代码了，定位到这里基本就可以辅助去调查问题了
+过程小结
+定位崩溃时的堆栈gdb调试器会自动停在触发崩溃信号的线程上,此时就能看到崩溃现场bt
+查看局部变量和寄存器info localsprint p
+如果是空指针或者野指针，就可以确定原因了
+
+如果是越界问题，顺便打印上下文
+
+查看其他线程的状态有时候崩溃的线程只是受害者, 其实是别的线程修改了相关的内存thread apply all bt
+配合其他工具使用如果怀疑内存被破坏，可以配合工具Valgrind memcheck等工具。
+
+死锁问题当一段程序没有崩溃，但是卡住的时候，大概是死锁问题。
+流程演示&#x2F;&#x2F;deadlock_demo.cpp
+#include &lt;iostream&gt;#include &lt;thread&gt;#include &lt;mutex&gt;#include &lt;chrono&gt;std::mutex mtx1;std::mutex mtx2;void thread_func_A() &#123;    std::lock_guard&lt;std::mutex&gt; lockA(mtx1);    std::this_thread::sleep_for(std::chrono::seconds(1));    std::lock_guard&lt;std::mutex&gt; lockB(mtx2); // 死锁    std::cout &lt;&lt; &quot;Thread A acquired both locks\n&quot;;&#125;void thread_func_B() &#123;    std::lock_guard&lt;std::mutex&gt; lockB(mtx2);    std::this_thread::sleep_for(std::chrono::seconds(1));    std::lock_guard&lt;std::mutex&gt; lockA(mtx1); // 死锁    std::cout &lt;&lt; &quot;Thread B acquired both locks\n&quot;;&#125;int main() &#123;    std::thread t1(thread_func_A);    std::thread t2(thread_func_B);    t1.join();    t2.join();    return 0;&#125;
+
+g++ -g -O0 -pthread -o deadlock_demo deadlock_demo.cppecho 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope # 允许系统去通过gdb接管进程./deadlock_demo   # 程序卡住gdb ./deadlock_demo &lt;PID&gt; # pid 可以通过 ps -ef | grep deadlock_demo 命令查询
+此时进入gdb展示如下内容;展示此时的所有线程的堆栈:
+thread apply all bt
+重点看futex_wait系统调用，发现线程3在 thread_func_B 中一直在等待 mtx1,线程2在 thread_func_A 中一直等待 mtx2;确定之后就查看是怎么加锁的，分析逻辑
+过程小结
+首先利用  gdb -p &lt;PID&gt; attach到进程
+然后打印所有线程的堆栈thread apply all bt
+如果发现有多个线程都卡在 futex_wait,说明都在等锁
+逐一分析栈帧查看每个线程持有的锁和等待的锁
+判断是否形成了循环等待
+确认死锁如果有环路并且相关的线程都卡在 futex_wait,就都是死锁
+
+小trick
+跟踪 futex 系统调用，因为多线程的加锁&#x2F;等待会进入此系统命令catch syscall futexcontinue
+查看 mutex owner(gdb) p ((pthread_mutex_t*)&amp;mtx1)-&gt;__data.__owner
+
+竞态问题当结果一会准确一会错误的时候，很有可能是竞态问题
+流程演示// race_demo.cpp#include &lt;iostream&gt;#include &lt;thread&gt;int global_counter = 0;void thread_func() &#123;    for (int i = 0; i &lt; 1&#x27;000&#x27;000; i++) &#123;        global_counter++; // 无锁写入 → 数据竞争    &#125;&#125;int main() &#123;    std::thread t1(thread_func);    std::thread t2(thread_func);    t1.join();    t2.join();    std::cout &lt;&lt; &quot;Final counter = &quot; &lt;&lt; global_counter &lt;&lt; std::endl;    return 0;&#125;
+实际上竞态问题使用gdb调试不是一个很好的选择，可以使用更好的工具,比如 Valgrind和 TSAN,这里使用 valgrind演示
+g++ -g -O0 -pthread -o race_demo race_demo.cppvalgrind  --tool=helgrind ./race_demo
+注意查找 Locks held: none 字样，找到可能的问题所在
+自动化与工程化技巧收集线程栈gdb -p &lt;PID&gt; -batch -ex &quot;set pagination off&quot; -ex &quot;thread apply all bt full&quot; &gt; stacks.txt
+线程命名在代码里加：
+pthread_setname_np(pthread_self(), &quot;worker-1&quot;);
+这个方法只在linux上有效，并且是拓展不是标准
+总结多线程的调试比单线程复杂的多，典型问题包括:
+
+崩溃：gdb 自动停在故障线程，重点分析指针与内存。
+
+死锁：通过 thread apply all bt 和 futex 等系统调用判断循环等待。
+
+竞态：gdb 不擅长，推荐使用 Helgrind &#x2F; TSAN 等工具检测。
+
+
+一个好的流程是：
+
+分析出问题的大致类型
+先利用gdb快速定位问题
+然后使用专业工具（Valgrind, TSAN）去验证补充信息
+
+个人认为最好的手段:
+
+给出充分的时间进行设计，从线程模型和锁设计层面反思，避免出现此类问题（逃）
 
 ]]></content>
       <categories>
@@ -1348,6 +1465,69 @@ RAII + 智能指针是 C++ 的精髓
       </tags>
   </entry>
   <entry>
+    <title>spdlog源码阅读:01.异步机制解析</title>
+    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
+    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
+
+spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
+跨平台： 支持windows,linux,android等多个平台
+功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
+阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
+
+从demo出发：追踪日志消息的产生，处理和输出路径
+梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
+分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
+可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
+
+以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
+注：本文分析的源码为spdlog的v1.15.1版本
+spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
+我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
+日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
+日志生产
+logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
+log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
+在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
+在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
+
+日志消费
+线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
+在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
+spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
+以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
+上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
+
+可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
+强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
+spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
+//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
+线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
+spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
+thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
+
+主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
+formatter：格式化日志消息的基类
+sink: 日志输出的基类
+spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
+mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
+template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
+通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
+一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>spdlog源码阅读:02.sink分析</title>
     <url>/2025/04/29/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/</url>
     <content><![CDATA[引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。
@@ -1416,69 +1596,6 @@ rotating_file_sink
 磁盘空间控制
 
 
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>spdlog</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>spdlog</tag>
-        <tag>日志系统</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>spdlog源码阅读:01.异步机制解析</title>
-    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
-    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
-
-spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
-跨平台： 支持windows,linux,android等多个平台
-功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
-阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
-
-从demo出发：追踪日志消息的产生，处理和输出路径
-梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
-分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
-可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
-
-以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
-注：本文分析的源码为spdlog的v1.15.1版本
-spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
-我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
-日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
-日志生产
-logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
-log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
-在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
-在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
-
-日志消费
-线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
-在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
-spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
-以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
-上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
-
-可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
-强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
-spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
-//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
-线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
-spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
-thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
-
-主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
-formatter：格式化日志消息的基类
-sink: 日志输出的基类
-spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
-mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
-template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
-通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
-一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
 ]]></content>
       <categories>
         <category>源码分析</category>
