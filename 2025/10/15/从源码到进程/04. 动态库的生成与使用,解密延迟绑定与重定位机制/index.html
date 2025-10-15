@@ -1,0 +1,398 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制 | ToBrightMoon的计算机世界</title><meta name="author" content="ToBrightMoon"><meta name="copyright" content="ToBrightMoon"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="动态库的生成与使用,解密延迟绑定与重定位机制前言在之前的文章中，我们讲解了实际静态库的生成与使用，说明了目标文件是怎么生成静态库的，并且说明了一个程序是怎么连接使用静态库的。 在实际的开发中，我们还会经常使用另一种文件 .so 文件，也就是动态库，本文就讲继续讲解动态库是生成与使用的,你将学会：  为什么动态库解决静态库的痛点。  如何生成、链接和运行时加载 .so。  GOT&#x2F;PLT">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制">
+<meta property="og:url" content="https://tobrightmoon.github.io/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/index.html">
+<meta property="og:site_name" content="ToBrightMoon的计算机世界">
+<meta property="og:description" content="动态库的生成与使用,解密延迟绑定与重定位机制前言在之前的文章中，我们讲解了实际静态库的生成与使用，说明了目标文件是怎么生成静态库的，并且说明了一个程序是怎么连接使用静态库的。 在实际的开发中，我们还会经常使用另一种文件 .so 文件，也就是动态库，本文就讲继续讲解动态库是生成与使用的,你将学会：  为什么动态库解决静态库的痛点。  如何生成、链接和运行时加载 .so。  GOT&#x2F;PLT">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://tobrightmoon.github.io/images/cover/coredump_cover.jpeg">
+<meta property="article:published_time" content="2025-10-15T16:00:00.000Z">
+<meta property="article:modified_time" content="2025-10-15T22:57:14.585Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="linux">
+<meta property="article:tag" content="C++">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://tobrightmoon.github.io/images/cover/coredump_cover.jpeg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制",
+  "url": "https://tobrightmoon.github.io/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/",
+  "image": "https://tobrightmoon.github.io/images/cover/coredump_cover.jpeg",
+  "datePublished": "2025-10-15T16:00:00.000Z",
+  "dateModified": "2025-10-15T22:57:14.585Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "ToBrightMoon",
+      "url": "https://tobrightmoon.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/images/cpp.png"><link rel="canonical" href="https://tobrightmoon.github.io/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 7.3.0"></head><body><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/images/cover/coredump_cover.jpeg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><img class="site-icon" src="/images/cpp.png" alt="Logo"><span class="site-name">ToBrightMoon的计算机世界</span></a><a class="nav-page-title" href="/"><span class="site-name">从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"></div></nav><div id="post-info"><h1 class="post-title">从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2025-10-15T16:00:00.000Z" title="发表于 2025-10-16 00:00:00">2025-10-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2025-10-15T22:57:14.585Z" title="更新于 2025-10-16 06:57:14">2025-10-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%A8%8B%E5%BA%8F%E5%91%98%E7%9A%84%E8%87%AA%E6%88%91%E4%BF%AE%E5%85%BB/">程序员的自我修养</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%A8%8B%E5%BA%8F%E5%91%98%E7%9A%84%E8%87%AA%E6%88%91%E4%BF%AE%E5%85%BB/%E4%BB%8E%E7%A8%8B%E5%BA%8F%E5%88%B0%E8%BF%9B%E7%A8%8B/">从程序到进程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="动态库的生成与使用-解密延迟绑定与重定位机制"><a href="#动态库的生成与使用-解密延迟绑定与重定位机制" class="headerlink" title="动态库的生成与使用,解密延迟绑定与重定位机制"></a>动态库的生成与使用,解密延迟绑定与重定位机制</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>在之前的文章中，我们讲解了实际静态库的生成与使用，说明了目标文件是怎么生成静态库的，并且说明了一个程序是怎么连接使用静态库的。</p>
+<p>在实际的开发中，我们还会经常使用另一种文件 <code>.so</code> 文件，也就是动态库，本文就讲继续讲解动态库是生成与使用的,你将学会：</p>
+<ul>
+<li><p><strong>为什么动态库解决静态库的痛点。</strong></p>
+</li>
+<li><p><strong>如何生成、链接和运行时加载 .so。</strong></p>
+</li>
+<li><p><strong>GOT&#x2F;PLT 和重定位表的“幕后英雄”作用。</strong></p>
+</li>
+</ul>
+<p>通过了解动态库实现动态链接的方法，可以将这种想法应用到自己的需要的系统热更新功能</p>
+<h2 id="动态库的引出"><a href="#动态库的引出" class="headerlink" title="动态库的引出"></a>动态库的引出</h2><p>有了静态库不够吗？我们为什么要使用动态库？</p>
+<p>静态库确实能够做到程序复用，但是却存在几个问题</p>
+<p><strong>体积膨胀</strong>: 静态库在链接的时候，就将需要的符号链接进可执行文件中了，相当于包含了库的副版本。如果是多个团队协同开发程序，都使用了同一个库，比如sqlite，那么肯定是会造成程序的体积膨胀<br><strong>更新困难</strong>: 静态库如果提供方更新了，每次使用者都需要重新生成可执行文件，重新连接库<br><strong>编译成本高</strong>：对于很多稍微大型一点的项目，编译的成本巨大，重新编译的时间过长，相信自己编译过类似<code>chromium</code>等项目的同学深有体会。</p>
+<p>因此，我们需要一种机制: <strong>将链接过程延迟到程序运行时，让库能够被独立的加载，共享和替换</strong></p>
+<p>这样就能做到，当库更新的时候，我们不需要去重新编译整个可执行程序,只需要将动态库的文件进行更新就可以了</p>
+<h2 id="动态库实现的原理"><a href="#动态库实现的原理" class="headerlink" title="动态库实现的原理"></a>动态库实现的原理</h2><h3 id="动态库的设计思想"><a href="#动态库的设计思想" class="headerlink" title="动态库的设计思想"></a>动态库的设计思想</h3><p>一个库文件，实际上对外提供的都是两种东西<strong>变量和函数</strong>，本质上都是我们之前提到的“符号（symbol）”。</p>
+<p>对于一个库而言，实际上只要保证了在库变化的时候，只要库的符号是稳定的，或者说<strong>保证能继续提供之前保证提供的符号</strong>，那么库的更新实际上就可以做到无感的，让应用程序直接替换库。</p>
+<p>动态库实现的核心思想就是:</p>
+<blockquote>
+<p>不在链接的时候就将调用符号的地址写死，只是记录依赖，而在运行时真正生成这个符号的地址，也就是<strong>延迟绑定（lazy Binding）</strong>。</p>
+</blockquote>
+<p>简单来说就是两点:</p>
+<ul>
+<li><strong>链接库的时候让可执行程序知道自己依赖什么库，依赖库中的什么符号</strong></li>
+<li><strong>在运行的时候，找到对应的库，从库中找到自己的依赖的符号，并且生成这个符号的真正地址</strong></li>
+</ul>
+<p>这个“重新计算地址”的动作，依靠两张重要的重定位表完成：</p>
+<table>
+<thead>
+<tr>
+<th>段名</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>.rela.dyn</code></td>
+<td>记录全局变量等静态数据的修正方式</td>
+</tr>
+<tr>
+<td><code>.rela.plt</code></td>
+<td>记录外部函数调用的修正方式（延迟绑定）</td>
+</tr>
+</tbody></table>
+<p>等到程序运行起来的时候，这两张表就为动态链接器提供了重新计算符号地址的关键信息，告诉它：</p>
+<ul>
+<li>哪个地址需要修正；</li>
+<li>修正哪个符号；</li>
+<li>修正的计算方式（加上偏移、取相对地址等）。</li>
+</ul>
+<p>而 <code>.dynsym</code> 则是符号表的动态版本，告诉动态链接器“有哪些符号需要动态解析”。</p>
+<h3 id="动态库的生成"><a href="#动态库的生成" class="headerlink" title="动态库的生成"></a>动态库的生成</h3><p>动态库的生成静态库的生成（<code>.a</code>）非常类似，都是在于利用目标文件 <code>.o</code> 区别在于编译与链接参数。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">gcc -fPIC -shared -o libmylib.so a.o b.o c.o</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>-fPIC</code> 生成 <strong>位置无关代码（Position Independent Code）</strong>，让库能被加载到任意地址。</li>
+<li><code>-shared</code> 告诉链接器生成一个共享对象，而不是可执行文件。</li>
+</ul>
+<p><strong>位置无关性（PIC）</strong> 是动态库的关键：<br>因为动态库在不同进程中被加载到的地址往往不同，如果代码里直接写死绝对地址，会导致运行时错误。<br>因此，编译器会把所有外部符号的引用通过一层间接表（GOT）来访问。</p>
+<h3 id="链接时的约定"><a href="#链接时的约定" class="headerlink" title="链接时的约定"></a>链接时的约定</h3><p>当主程序在链接阶段依赖一个动态库时（例如链接 <code>-lmylib</code>），链接器会：</p>
+<ol>
+<li>在 ELF 文件中记录下程序依赖的库（放在 <code>.dynamic</code> 段中）；</li>
+<li>把那些属于动态库的符号标记为“需要运行时解析”的符号；</li>
+<li>生成对应的 <strong>PLT &#x2F; GOT 表结构</strong>；</li>
+<li>生成 <code>.rela.dyn</code> 和 <code>.rela.plt</code> 段，保存符号修正规则。</li>
+</ol>
+<p>这样，生成的可执行文件就知道自己依赖哪些动态库、哪些符号需要运行时解析。</p>
+<h3 id="运行时的动态加载"><a href="#运行时的动态加载" class="headerlink" title="运行时的动态加载"></a>运行时的动态加载</h3><p>程序启动时，操作系统在加载elf文件的时候，将扫描依赖的动态库，此时会进入内核态，系统的 <strong>动态链接器（<code>ld-linux.so</code>）</strong> 会介入整个加载过程。</p>
+<h3 id="1-全局变量的重定位：-rela-dyn"><a href="#1-全局变量的重定位：-rela-dyn" class="headerlink" title="1. 全局变量的重定位：.rela.dyn"></a>1. 全局变量的重定位：<code>.rela.dyn</code></h3><p>动态链接器首先扫描 <code>.rela.dyn</code>：</p>
+<ul>
+<li>读取每条重定位项；</li>
+<li>找到对应的符号；</li>
+<li>将其真实地址填入 GOT 表或数据段；</li>
+<li>这样程序访问全局变量时，地址已经正确。</li>
+</ul>
+<p>这部分修正是 <strong>在程序启动阶段就完成的</strong>。</p>
+<h3 id="2-函数的延迟绑定：-rela-plt"><a href="#2-函数的延迟绑定：-rela-plt" class="headerlink" title="2. 函数的延迟绑定：.rela.plt"></a>2. 函数的延迟绑定：<code>.rela.plt</code></h3><p>对于函数调用，情况稍微复杂：</p>
+<ul>
+<li>程序调用外部函数时，会先跳转到 <strong>PLT（Procedure Linkage Table）</strong>。</li>
+<li>PLT 再通过 GOT 查找函数地址。</li>
+<li>如果是第一次调用，GOT 里存的是动态链接器的入口地址，程序会“陷入”动态链接器。</li>
+<li>动态链接器查找 <code>.rela.plt</code> 中的符号修正规则，解析出真实的函数地址，并把它写回 GOT。</li>
+<li>之后再调用同一个函数时，PLT 直接通过 GOT 跳到真实地址，不再触发解析。</li>
+</ul>
+<p>这就是 <strong>延迟绑定（Lazy Binding）</strong> 的原理。</p>
+<p>用一句话总结整个动态链接过程：</p>
+<blockquote>
+<p>编译阶段记录符号，链接阶段生成重定位表，运行时动态链接器根据 <code>.rela.dyn</code> 和 <code>.rela.plt</code> 修正 GOT，程序通过 GOT 访问变量和函数的真实地址。</p>
+</blockquote>
+<p>下面就是实际一个动态库加载与使用过程的流程图:<br><img src="/images/p_to_p/so_load.png" alt="so-load"></p>
+<h2 id="动态库加载与符号解析过程演示"><a href="#动态库加载与符号解析过程演示" class="headerlink" title="动态库加载与符号解析过程演示"></a>动态库加载与符号解析过程演示</h2><p>下面我们通过一个完整实验，直观展示 <strong>动态库函数调用从“延迟绑定”到“真实地址解析”的全过程</strong>。</p>
+<h3 id="实验源码"><a href="#实验源码" class="headerlink" title="实验源码"></a>实验源码</h3><p><strong>文件结构：</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">.</span><br><span class="line">├── add.cpp</span><br><span class="line">├── add.h</span><br><span class="line">├── main.cpp</span><br></pre></td></tr></table></figure>
+
+<p><strong>add.h</strong></p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">pragma</span> once</span></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">add</span><span class="params">(<span class="type">int</span> a, <span class="type">int</span> b)</span></span>;</span><br></pre></td></tr></table></figure>
+<p><strong>add.cpp</strong></p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;add.h&quot;</span></span></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">add</span><span class="params">(<span class="type">int</span> a, <span class="type">int</span> b)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">return</span> a + b;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>main.cpp</strong></p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;iostream&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&quot;add.h&quot;</span></span></span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">main</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    std::cout &lt;&lt; <span class="string">&quot;3 + 4 = &quot;</span> &lt;&lt; <span class="built_in">add</span>(<span class="number">3</span>,<span class="number">4</span>) &lt;&lt; std::endl;</span><br><span class="line">    std::cout &lt;&lt; <span class="string">&quot;3 + 4 = &quot;</span> &lt;&lt; <span class="built_in">add</span>(<span class="number">3</span>,<span class="number">4</span>) &lt;&lt; std::endl;</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h3 id="构建可执行文件与动态库"><a href="#构建可执行文件与动态库" class="headerlink" title="构建可执行文件与动态库"></a>构建可执行文件与动态库</h3><p>执行的时候注意，因为现代编译器为了安全默认关闭了延迟绑定，直接生成了函数的地址，但是间接寻址的方式没有变化，所以必须严格按照脚本生成可执行文件</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 生成动态库 libmath.so</span></span><br><span class="line">g++ -fPIC -shared -o libmath.so add.cpp</span><br><span class="line"></span><br><span class="line"><span class="comment"># 生成可执行文件</span></span><br><span class="line">g++ main.cpp -L. -lmath -no-pie -Wl,-z,lazy -g -o main</span><br></pre></td></tr></table></figure>
+
+<h3 id="验证-ELF-依赖关系"><a href="#验证-ELF-依赖关系" class="headerlink" title="验证 ELF 依赖关系"></a>验证 ELF 依赖关系</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">readelf -d main | grep NEEDED</span><br></pre></td></tr></table></figure>
+
+<p>输出类似：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">0x0000000000000001 (NEEDED)             Shared library: [libmath.so]</span><br></pre></td></tr></table></figure>
+
+<p>说明：程序运行时依赖 <code>libmath.so</code>。</p>
+<hr>
+<h3 id="查看-PLT-GOT-重定位表结构"><a href="#查看-PLT-GOT-重定位表结构" class="headerlink" title="查看 PLT &#x2F; GOT &#x2F; 重定位表结构"></a>查看 PLT &#x2F; GOT &#x2F; 重定位表结构</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">readelf -r main</span><br></pre></td></tr></table></figure>
+
+<p>可以看到类似：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">000000403ff8  000100000007 R_X86_64_JUMP_SLOT  add@Base + 0</span><br></pre></td></tr></table></figure>
+
+<p>这条记录就说明：</p>
+<blockquote>
+<p>“add 函数在运行时需要被修正，它的真实地址会被写入 GOT 表的对应槽位。”</p>
+</blockquote>
+<hr>
+<h3 id="用-GDB-验证延迟绑定"><a href="#用-GDB-验证延迟绑定" class="headerlink" title="用 GDB 验证延迟绑定"></a>用 GDB 验证延迟绑定</h3><p>现在我们来观察 <strong>第一次调用 add() 时 GOT&#x2F;PLT 的变化过程</strong>。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">gdb ./main</span><br></pre></td></tr></table></figure>
+
+<p>在 GDB 中执行以下命令：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">(gdb) start</span><br><span class="line">Temporary breakpoint 1, main () at main.cpp:5</span><br><span class="line">5	    std::cout &lt;&lt; &quot;3 + 4 = &quot; &lt;&lt; add(3,4) &lt;&lt; std::endl;</span><br><span class="line"></span><br><span class="line">(gdb) info functions add</span><br><span class="line">All functions matching regular expression &quot;add&quot;:</span><br><span class="line">.....</span><br><span class="line">0x0000000000401070  add(int, int)@plt</span><br><span class="line">0x00007ffff7fb70f9  add(int, int)</span><br></pre></td></tr></table></figure>
+
+<p>你可以看到：</p>
+<ul>
+<li><code>add@plt</code> 是主程序中的“跳板”；</li>
+<li><code>add</code> 是动态库中真实函数的地址。</li>
+</ul>
+<h3 id="反汇编查看-PLT-跳转"><a href="#反汇编查看-PLT-跳转" class="headerlink" title="反汇编查看 PLT 跳转"></a>反汇编查看 PLT 跳转</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">(gdb) disassemble 0x0000000000401070</span><br><span class="line">Dump of assembler code for function _Z3addii@plt:</span><br><span class="line">   0x0000000000401070 &lt;+0&gt;:	endbr64</span><br><span class="line">   0x0000000000401074 &lt;+4&gt;:	bnd jmp *0x2f9d(%rip)        # 0x404018 &lt;_Z3addii@got.plt&gt;</span><br><span class="line">   0x000000000040107b &lt;+11&gt;:	nopl   0x0(%rax,%rax,1)</span><br><span class="line">End of assembler dump.</span><br><span class="line"></span><br></pre></td></tr></table></figure>
+
+<p>可以看到：</p>
+<blockquote>
+<p>调用 <code>add(int, int)@plt</code> 实际上是先 <code>jmp</code> 到 <code>.got.plt</code> 中对应的槽位。</p>
+</blockquote>
+<h3 id="打印-GOT-槽位的值（第一次调用前）"><a href="#打印-GOT-槽位的值（第一次调用前）" class="headerlink" title="打印 GOT 槽位的值（第一次调用前）"></a>打印 GOT 槽位的值（第一次调用前）</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">(gdb) x/gx 0x404018</span><br><span class="line">0x404018 &lt;_Z3addii@got.plt&gt;:	0x0000000000401030</span><br></pre></td></tr></table></figure>
+
+<p>此时 GOT 中的地址指向动态链接器（<code>ld-linux.so</code>），意味着还没绑定真实地址。</p>
+<h3 id="运行第一次调用"><a href="#运行第一次调用" class="headerlink" title="运行第一次调用"></a>运行第一次调用</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">(gdb) n</span><br><span class="line">3 + 4 = 7</span><br></pre></td></tr></table></figure>
+
+<p>此时触发了 <strong>lazy binding</strong>，动态链接器解析出 <code>add</code> 的真实地址并写回 GOT。</p>
+<h3 id="再次查看-GOT-槽位"><a href="#再次查看-GOT-槽位" class="headerlink" title="再次查看 GOT 槽位"></a>再次查看 GOT 槽位</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">(gdb) x/gx 0x404018</span><br><span class="line">0x404018 &lt;_Z3addii@got.plt&gt;:	0x00007ffff7fb70f9</span><br></pre></td></tr></table></figure>
+
+<p>可以看到地址已经变了，对应于动态库中 <code>add</code> 的实现地址！</p>
+<h3 id="再次调用时"><a href="#再次调用时" class="headerlink" title="再次调用时"></a>再次调用时</h3><p>第二次执行：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">(gdb) n</span><br><span class="line">3 + 4 = 7</span><br></pre></td></tr></table></figure>
+<p>这时不再进入链接器，直接通过 GOT 中保存的真实地址跳转，完成调用。</p>
+<h3 id="验证总结图"><a href="#验证总结图" class="headerlink" title="验证总结图"></a>验证总结图</h3><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>GOT 内容</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>程序启动</td>
+<td>指向动态链接器 <code>_dl_runtime_resolve</code></td>
+<td>还未绑定</td>
+</tr>
+<tr>
+<td>第一次调用 add()</td>
+<td>调用 PLT → 链接器解析符号并修正 GOT</td>
+<td>完成重定位</td>
+</tr>
+<tr>
+<td>第二次调用 add()</td>
+<td>GOT 中是 add 的真实地址</td>
+<td>直接跳转执行</td>
+</tr>
+</tbody></table>
+<hr>
+<h3 id="总结性说明"><a href="#总结性说明" class="headerlink" title="总结性说明"></a>总结性说明</h3><p>通过这次实验你验证了动态链接中的关键事实：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>延迟绑定</strong></td>
+<td>函数第一次调用才解析符号地址</td>
+</tr>
+<tr>
+<td><strong>PLT 表</strong></td>
+<td>作为中间跳板，负责函数跳转</td>
+</tr>
+<tr>
+<td><strong>GOT 表</strong></td>
+<td>保存最终解析的函数真实地址</td>
+</tr>
+<tr>
+<td><strong>动态链接器</strong></td>
+<td>运行时修改 GOT，实现符号解析</td>
+</tr>
+</tbody></table>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>动态库的出现，解决了静态库的三个根本问题：</p>
+<ol>
+<li><strong>可独立更新</strong>：接口不变即可替换库文件。</li>
+<li><strong>共享与复用</strong>：多个进程共用同一个 <code>.so</code> 文件，节省内存。</li>
+<li><strong>启动与执行高效</strong>：延迟绑定减少启动开销。</li>
+</ol>
+<p>而在机制层面上，它的核心就是以下三张表的配合：</p>
+<table>
+<thead>
+<tr>
+<th>表 &#x2F; 段名</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>GOT（Global Offset Table）</strong></td>
+<td>存储符号的运行时真实地址</td>
+</tr>
+<tr>
+<td><strong>PLT（Procedure Linkage Table）</strong></td>
+<td>函数调用跳板，实现延迟绑定</td>
+</tr>
+<tr>
+<td><strong><code>.rela.dyn</code> &#x2F; <code>.rela.plt</code></strong></td>
+<td>动态链接器的“施工图”，记录如何修正符号地址</td>
+</tr>
+</tbody></table>
+<p>整个动态链接过程，就是在利用动态链接器去重新生成符号地址的过程：</p>
+<blockquote>
+<p>程序只负责声明“我需要这些符号”，而动态链接器根据 <code>.rela.*</code> 的“图纸”，把符号的真实地址在内存中重新接好，完成加载与执行。</p>
+</blockquote>
+<p>就是在 “库的实现发生了变化”中找到了“符号不应该变化”，通过引入一层间接访问机制（PLT &#x2F; GOT），让程序可以在运行时灵活地解析、更新与共享符号，实现了真正意义上的“可替换模块化”。<br>这正应了计算机科学中那句著名的论断：</p>
+<blockquote>
+<p>“All problems in computer science can be solved by another level of indirection.”<br>——David Wheeler</p>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://tobrightmoon.github.io">ToBrightMoon</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://tobrightmoon.github.io/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/">https://tobrightmoon.github.io/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://tobrightmoon.github.io" target="_blank">ToBrightMoon的计算机世界</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/linux/">linux</a><a class="post-meta__tags" href="/tags/C/">C++</a></div><div class="post-share"><div class="social-share" data-image="/images/cover/coredump_cover.jpeg" data-sites="facebook,twitter,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2025/10/09/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/03.%E9%9D%99%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8/" title="从源码到进程:03.静态库的生成与使用"><img class="cover" src="/images/cover/coredump_cover.jpeg" onerror="onerror=null;src='/img/404.jpg'" alt="cover of next post"><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">从源码到进程:03.静态库的生成与使用</div></div><div class="info-2"><div class="info-item-1">从目标文件到静态库：符号索引与链接的秘密前言在前一篇文章中，我们讲解了目标文件（Object File, .o）的生成过程，理解了编译器如何将源代码翻译成机器可读的中间产物，以及目标文件的内部结构。 然而，在实际的软件开发中，我们很少直接使用 .o 文件。大多数情况下，这些目标文件会被进一步打包成 静态库（.a） 或 动态库（.so），然后被可执行文件引用。 本篇文章将深入讲解：  目标文件是如何被打包成静态库的；静态库在链接阶段是如何被使用的；以及符号索引表在其中扮演的关键角色。   静态库合成的原理.o 文件的回顾每个 .o 文件都是编译器生成的 可重定位目标文件（Relocatable Object File）。它仍然是一个标准的 ELF（Executable and Linkable Format） 文件，通常包含以下关键节区：    节区 说明    .text 机器指令区（代码）   .data &#x2F; .bss 全局变量与静态变量   .rodata 只读常量区   .symtab 符号表，记录所有定义与引用的符号   .rel.text &#x2F; .re...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2025/09/18/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/01.%E7%A8%8B%E5%BA%8F%E7%9A%84%E9%A2%84%E5%A4%84%E7%90%86/" title="从源码到进程:01.程序的预处理"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-09-19</div><div class="info-item-2">从源码到进程:01.程序的预处理</div></div><div class="info-2"><div class="info-item-1">前言在这个系列中，我们准备从 源码到进程 这个角度去分析，在 Linux 平台下，一个项目的文件，究竟是怎么一步步变成可执行文件，然后最终变成一个进程的。 开篇我们从最简单、大家最熟悉的一个阶段说起：预处理。 从编译四步走说起一个广为认知的理论是： 1预处理 → 编译 → 汇编 → 链接  这是 C++ 程序变成可执行文件的四个主要阶段。 其中，预处理（Preprocessing）是 C++ 编译的第一个阶段。编译器（如 gcc&#x2F;clang）会先将整个项目组织起来，进行文本级的处理，生成一份“纯净”的中间代码（.i 文件）。 在预处理中，主要进行了三件事：  宏替换：简单的文本替换。 文件包含：头文件的展开。 条件宏处理：条件编译，避免头文件循环包含，支持跨平台代码。  通过预处理，我们可以实现：  跨平台的项目开发（条件编译） 避免头文件重复包含 简单的符号替换和调试增强  GCC 官方文档对预处理器的完整说明在这里：https://gcc.gnu.org/onlinedocs/cpp/ 你可以查阅其中关于宏、条件编译、头文件包含的更详细介绍。 一个简单的例子先来看一...</div></div></div></a><a class="pagination-related" href="/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/" title="从源码到进程:02.目标文件的生成"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-09-26</div><div class="info-item-2">从源码到进程:02.目标文件的生成</div></div><div class="info-2"><div class="info-item-1">前言在之前的文章中，我们初步讲解了从源码到进程这个主题的预处理部分，在这篇文章中，我们将讲解目标文件(.o)的生成过程。 通过了解 .o文件，可以帮助我们:  定位 undefined reference &#x2F; multiple definition 等链接错误的根源 理解重定位失败与对齐问题导致的运行时崩溃 掌控编译器、汇编器与链接器之间的契约（ABI &#x2F; ELF &#x2F; linker script）。 为什么很多编码规范中，不允许在头文件中定义或者声明全局变量  核心理论什么是目标文件？目标文件（.o）是编译器将源码转化为机器码的中间产物，遵循 ELF（Executable and Linkable Format）格式。它包含代码、数据和元信息（如符号表、重定位表），但还不是可执行程序，需要链接器进一步处理。生成目标文件是编译过程的第三步，位于以下流程中：  预处理：展开宏和头文件，生成 .i 文件。 编译：将源码转为汇编代码（.s 文件），并优化。 汇编：将汇编代码转为机器码，打包为 .o 文件。 链接：合并多个 .o 文件和库，生成可执行文件。  ...</div></div></div></a><a class="pagination-related" href="/2025/10/09/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/03.%E9%9D%99%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8/" title="从源码到进程:03.静态库的生成与使用"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-10-10</div><div class="info-item-2">从源码到进程:03.静态库的生成与使用</div></div><div class="info-2"><div class="info-item-1">从目标文件到静态库：符号索引与链接的秘密前言在前一篇文章中，我们讲解了目标文件（Object File, .o）的生成过程，理解了编译器如何将源代码翻译成机器可读的中间产物，以及目标文件的内部结构。 然而，在实际的软件开发中，我们很少直接使用 .o 文件。大多数情况下，这些目标文件会被进一步打包成 静态库（.a） 或 动态库（.so），然后被可执行文件引用。 本篇文章将深入讲解：  目标文件是如何被打包成静态库的；静态库在链接阶段是如何被使用的；以及符号索引表在其中扮演的关键角色。   静态库合成的原理.o 文件的回顾每个 .o 文件都是编译器生成的 可重定位目标文件（Relocatable Object File）。它仍然是一个标准的 ELF（Executable and Linkable Format） 文件，通常包含以下关键节区：    节区 说明    .text 机器指令区（代码）   .data &#x2F; .bss 全局变量与静态变量   .rodata 只读常量区   .symtab 符号表，记录所有定义与引用的符号   .rel.text &#x2F; .re...</div></div></div></a><a class="pagination-related" href="/2025/08/19/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:01.%20coredump%E7%9A%84%E5%90%AF%E5%8A%A8/" title="coredump的那些事:01.coredump的启动"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-08-20</div><div class="info-item-2">coredump的那些事:01.coredump的启动</div></div><div class="info-2"><div class="info-item-1">前言在使用c&#x2F;c++进行程序开发，或者类型IL2CPP这种将Unity的应用编译成原生应用的时候，不管开发人员多么小心，不可避免的会出现的 段错误 导致的死机现象。当出现这种问题的时候， 一个最常用的手段就是利用coredump辅助日志文件进行问题分析，这篇文章就来讲一讲如何修改Linux中的一些配置，让你的系统可以产生coredump文件以及相关的知识。 注：本文的一些终端操作均在ubuntu22.04下进行  coredump介绍coredump简介关于coredump的介绍， 可以使用 man 5 core 命令，在终端 shell中查看 coredump 的手册 123456The  default  action of certain signals is to cause a process to terminate and produce a core dump file, a file containing an image of the process&#x27;s memory at the timeof termination.	This imag...</div></div></div></a><a class="pagination-related" href="/2025/08/28/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:02.%20coredump%E7%9A%84%E5%88%86%E6%9E%90/" title="coredump的那些事:02.coredump的分析"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-08-29</div><div class="info-item-2">coredump的那些事:02.coredump的分析</div></div><div class="info-2"><div class="info-item-1">前言在上一篇文章中，我们讲解了 如何配置 Linux 系统，让程序在崩溃时生成 coredump 文件。 那么，生成了 coredump 之后，我们该如何使用它来定位问题？ 在这一篇文章里，我们就来回答这个问题,在本文中你会了解到：  gdb 调试器的基本使用 coredump 文件的二进制细节 为什么 coredump 能够辅助调试器重建现场 内核源码如何生成 coredump  1. 从实验开始：生成并使用 coredump我们先写一个最简单的崩溃程序，模拟空指针异常： 123456789101112// heap_crash.cppvoid corrupt_heap()&#123;    int *p = nullptr;    *p = 10;   // 崩溃点&#125;int main()&#123;    corrupt_heap();    return 0;&#125;  编译并加上 -g 保留调试信息： 1g++ -g -o heap_crash heap_crash.cpp  启用 coredump： 12ulimit -c unlimitedecho &q...</div></div></div></a><a class="pagination-related" href="/2025/09/03/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:03.%20%E8%B0%83%E8%AF%95%E4%BF%A1%E6%81%AF%E7%9A%84%E7%94%9F%E6%88%90/" title="coredump的那些事:03.调试信息的生成"><img class="cover" src="/images/cover/coredump_cover.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-09-04</div><div class="info-item-2">coredump的那些事:03.调试信息的生成</div></div><div class="info-2"><div class="info-item-1">前言在之前的文章中，我们已经深入的的讲解了coredump文件的生成过程以及coredump的使用。我们也得到了一个核心的结论：调试程序的时候，只需要个三个关键的信息  可执行的程序 coredump文件 调试信息  针对其中的coredump的相关内容，我们已经进行了详细的讲解，这篇文章我们将详细的讲解关于调试信息的相关内容。 在本篇文章中你将了解到:  DWARF调试格式 为什么strip之后gdb什么都看不到 调试信息的生成与使用  注:本文使用的Linux是ubuntu22.04，gcc版本是13.1 问题的引出无符号问题现在很多同学都会遇到这种情况,自己本地写程序，出现死机问题了，直接IDE本地调试，然后去查IDE为什么能调试，知道是使用了 gdb，也了解了coredump。 等到工作了，遇到了这种 coredump问题，被安排去练手，因为有coredump文件的问题其实难度是比较低的，然后根据自己的经验使用 gdb调试，结果发现：  没有源码行号  没有调用栈  没有变量名   一脸懵逼，甚至怀疑自己用的是“假的 gdb”。 实际上，这并不是 gdb 的问题，而是因为...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/images/avatar.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">ToBrightMoon</div><div class="author-info-description">记录我的开发与成长，分享自己在计算机世界的点点滴滴</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">26</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">11</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">9</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/ToBrightmoon"><i class="fab fa-github"></i><span>Follow Me</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/ToBrightmoon" target="_blank" title="Github"><i class="fab fa-github" style="color: #24292e;"></i></a><a class="social-icon" href="https://www.zhihu.com/people/meng-zhong-ren-5-90" target="_blank" title="知乎"><i class="fab fa-zhihu" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">个人博客</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8-%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">动态库的生成与使用,解密延迟绑定与重定位机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E5%BC%95%E5%87%BA"><span class="toc-number">1.2.</span> <span class="toc-text">动态库的引出</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E5%AE%9E%E7%8E%B0%E7%9A%84%E5%8E%9F%E7%90%86"><span class="toc-number">1.3.</span> <span class="toc-text">动态库实现的原理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%80%9D%E6%83%B3"><span class="toc-number">1.3.1.</span> <span class="toc-text">动态库的设计思想</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90"><span class="toc-number">1.3.2.</span> <span class="toc-text">动态库的生成</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%93%BE%E6%8E%A5%E6%97%B6%E7%9A%84%E7%BA%A6%E5%AE%9A"><span class="toc-number">1.3.3.</span> <span class="toc-text">链接时的约定</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%BF%90%E8%A1%8C%E6%97%B6%E7%9A%84%E5%8A%A8%E6%80%81%E5%8A%A0%E8%BD%BD"><span class="toc-number">1.3.4.</span> <span class="toc-text">运行时的动态加载</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E5%85%A8%E5%B1%80%E5%8F%98%E9%87%8F%E7%9A%84%E9%87%8D%E5%AE%9A%E4%BD%8D%EF%BC%9A-rela-dyn"><span class="toc-number">1.3.5.</span> <span class="toc-text">1. 全局变量的重定位：.rela.dyn</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E5%87%BD%E6%95%B0%E7%9A%84%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%EF%BC%9A-rela-plt"><span class="toc-number">1.3.6.</span> <span class="toc-text">2. 函数的延迟绑定：.rela.plt</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8A%A8%E6%80%81%E5%BA%93%E5%8A%A0%E8%BD%BD%E4%B8%8E%E7%AC%A6%E5%8F%B7%E8%A7%A3%E6%9E%90%E8%BF%87%E7%A8%8B%E6%BC%94%E7%A4%BA"><span class="toc-number">1.4.</span> <span class="toc-text">动态库加载与符号解析过程演示</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%E6%BA%90%E7%A0%81"><span class="toc-number">1.4.1.</span> <span class="toc-text">实验源码</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9E%84%E5%BB%BA%E5%8F%AF%E6%89%A7%E8%A1%8C%E6%96%87%E4%BB%B6%E4%B8%8E%E5%8A%A8%E6%80%81%E5%BA%93"><span class="toc-number">1.4.2.</span> <span class="toc-text">构建可执行文件与动态库</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%AA%8C%E8%AF%81-ELF-%E4%BE%9D%E8%B5%96%E5%85%B3%E7%B3%BB"><span class="toc-number">1.4.3.</span> <span class="toc-text">验证 ELF 依赖关系</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9F%A5%E7%9C%8B-PLT-GOT-%E9%87%8D%E5%AE%9A%E4%BD%8D%E8%A1%A8%E7%BB%93%E6%9E%84"><span class="toc-number">1.4.4.</span> <span class="toc-text">查看 PLT &#x2F; GOT &#x2F; 重定位表结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%94%A8-GDB-%E9%AA%8C%E8%AF%81%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A"><span class="toc-number">1.4.5.</span> <span class="toc-text">用 GDB 验证延迟绑定</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%8D%E6%B1%87%E7%BC%96%E6%9F%A5%E7%9C%8B-PLT-%E8%B7%B3%E8%BD%AC"><span class="toc-number">1.4.6.</span> <span class="toc-text">反汇编查看 PLT 跳转</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%89%93%E5%8D%B0-GOT-%E6%A7%BD%E4%BD%8D%E7%9A%84%E5%80%BC%EF%BC%88%E7%AC%AC%E4%B8%80%E6%AC%A1%E8%B0%83%E7%94%A8%E5%89%8D%EF%BC%89"><span class="toc-number">1.4.7.</span> <span class="toc-text">打印 GOT 槽位的值（第一次调用前）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%BF%90%E8%A1%8C%E7%AC%AC%E4%B8%80%E6%AC%A1%E8%B0%83%E7%94%A8"><span class="toc-number">1.4.8.</span> <span class="toc-text">运行第一次调用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%86%8D%E6%AC%A1%E6%9F%A5%E7%9C%8B-GOT-%E6%A7%BD%E4%BD%8D"><span class="toc-number">1.4.9.</span> <span class="toc-text">再次查看 GOT 槽位</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%86%8D%E6%AC%A1%E8%B0%83%E7%94%A8%E6%97%B6"><span class="toc-number">1.4.10.</span> <span class="toc-text">再次调用时</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%AA%8C%E8%AF%81%E6%80%BB%E7%BB%93%E5%9B%BE"><span class="toc-number">1.4.11.</span> <span class="toc-text">验证总结图</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%80%BB%E7%BB%93%E6%80%A7%E8%AF%B4%E6%98%8E"><span class="toc-number">1.4.12.</span> <span class="toc-text">总结性说明</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.5.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item"><a class="thumbnail" href="/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/" title="从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制"><img src="/images/cover/coredump_cover.jpeg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制"/></a><div class="content"><a class="title" href="/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/" title="从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制">从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制</a><time datetime="2025-10-15T16:00:00.000Z" title="发表于 2025-10-16 00:00:00">2025-10-16</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2025/10/09/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/03.%E9%9D%99%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8/" title="从源码到进程:03.静态库的生成与使用"><img src="/images/cover/coredump_cover.jpeg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="从源码到进程:03.静态库的生成与使用"/></a><div class="content"><a class="title" href="/2025/10/09/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/03.%E9%9D%99%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8/" title="从源码到进程:03.静态库的生成与使用">从源码到进程:03.静态库的生成与使用</a><time datetime="2025-10-09T16:00:00.000Z" title="发表于 2025-10-10 00:00:00">2025-10-10</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/" title="从源码到进程:02.目标文件的生成"><img src="/images/cover/coredump_cover.jpeg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="从源码到进程:02.目标文件的生成"/></a><div class="content"><a class="title" href="/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/" title="从源码到进程:02.目标文件的生成">从源码到进程:02.目标文件的生成</a><time datetime="2025-09-25T16:00:00.000Z" title="发表于 2025-09-26 00:00:00">2025-09-26</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2025/09/18/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/01.%E7%A8%8B%E5%BA%8F%E7%9A%84%E9%A2%84%E5%A4%84%E7%90%86/" title="从源码到进程:01.程序的预处理"><img src="/images/cover/coredump_cover.jpeg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="从源码到进程:01.程序的预处理"/></a><div class="content"><a class="title" href="/2025/09/18/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/01.%E7%A8%8B%E5%BA%8F%E7%9A%84%E9%A2%84%E5%A4%84%E7%90%86/" title="从源码到进程:01.程序的预处理">从源码到进程:01.程序的预处理</a><time datetime="2025-09-18T16:00:00.000Z" title="发表于 2025-09-19 00:00:00">2025-09-19</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2025/09/08/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:04.%20%E5%A4%9A%E7%BA%BF%E7%A8%8B%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%B0%83%E8%AF%95/" title="coredump的那些事:04.多线程程序的调试"><img src="/images/cover/coredump_cover.jpeg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="coredump的那些事:04.多线程程序的调试"/></a><div class="content"><a class="title" href="/2025/09/08/coredump%E7%9A%84%E5%88%86%E6%9E%90/coredump%E7%9A%84%E9%82%A3%E4%BA%9B%E4%BA%8B:04.%20%E5%A4%9A%E7%BA%BF%E7%A8%8B%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%B0%83%E8%AF%95/" title="coredump的那些事:04.多线程程序的调试">coredump的那些事:04.多线程程序的调试</a><time datetime="2025-09-08T16:00:00.000Z" title="发表于 2025-09-09 00:00:00">2025-09-09</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 By ToBrightMoon</span><span class="framework-info"><span>框架 </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 7.3.0</a><span class="footer-separator">|</span><span>主题 </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.4.3</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js"></script><script src="/js/main.js"></script><div class="js-pjax"></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
