@@ -2810,4 +2810,155 @@ PLT（Procedure Linkage Table）
         <tag>C++</tag>
       </tags>
   </entry>
+  <entry>
+    <title>从源码到进程:05.可执行程序的装载与启动</title>
+    <url>/2025/10/22/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/05.%E5%8F%AF%E6%89%A7%E8%A1%8C%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%A3%85%E8%BD%BD%E4%B8%8E%E5%90%AF%E5%8A%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们详细讲解了linux系统下动态库的实现机制，并且通过gdb调试验证了动态库加载的过程。
+在这篇文章中，我们将继续从源码到进程这个主题，详细讲解linux下，一个磁盘上的可执行文件，是怎么变成运行在内存上的进程的,也就是可执行程序的装载过程。
+Linux中的进程要理解这个装载的过程，首就要对进程本身有一个理解。
+在Linux中，进程到底是什么？
+它不是一个程序，也不是代码。在内核的视角里，一个进程本质上只是一个数据结构，即大名鼎鼎的task_struct，也就是咱们在课本上经常听的**进程控制块(Process Control Block, PCB)**。
+这个结构体是内核管理和调度一切的抓手，它记录了进程的PID、状态、权限、打开的文件、信号处理器，以及最重要的——它指向的内存映像（mm_struct）。
+进程如何“跑”起来？
+进程的执行依赖于两个核心概念：
+
+**虚拟地址空间 (Virtual Address Space)**：每个进程都拥有自己独立的、从0开始的虚拟地址空间。这是一个“沙盒”，让进程以为自己独占了整个内存。
+**页管理 (Paging)**：CPU的内存管理单元（MMU）负责将进程访问的“虚拟地址”翻译成“物理内存地址”。内核通过维护一张 页表(Page Table) 来实现这种映射。
+
+因此，“加载一个程序”的本质，就是内核去填充这个task_struct，并为其建立一套全新的虚拟地址空间和对应的页表映射，将ELF文件中的内容（代码、数据）“映射”到这个地址空间中。
+进程的构建过程申请资源当我们在shell中执行./hello时，fork()创建了一个子进程（几乎是父进程的克隆），然后这个子进程调用execve(&quot;./hello&quot;, ...)系统调用。这个系统调用，就是程序开始装载的开始。
+execve的使命是：丢弃当前的内存映像，换上一个全新的程序。
+内核此时会：
+
+查找并验证格式：内核会读取文件头部，通过x7fELF魔数识别出这是一个ELF文件，并找到对应的处理器binfmt_elf。
+销毁旧世界：内核会毫不留情地释放当前进程的旧虚拟地址空间（解散旧的mm_struct和所有VMA）。
+创建新骨架：内核会创建一个新的mm_struct（内存描述符）和task_struct中的相关字段，为新程序准备一个干净的“沙盒”。
+
+至此，我们有了一个“空”的进程骨架，得到了我们用来描述的资源。
+填充内容现在，内核需要按照ELF这张“蓝图”，将代码和数据填充到这个新的虚拟地址空间中。
+程序想跑，至少要知道在哪里跑？
+这就是ELF文件“执行视图”（Program Headers）的用武之地。内核会遍历readelf -l看到的每一个PT_LOAD段：
+
+代码段（.text, .rodata, …）：内核看到一个PT_LOAD段，它标记为可读、可执行（R E）。内核会在虚拟地址空间中创建一块区域（VMA, vm_area_struct），并将其权限设置为VM_READ | VM_EXEC。
+数据段（.data, .bss）：内核看到另一个PT_LOAD段，它标记为可读、可写（RW）。内核会创建另一块VMA，并将其权限设置为VM_READ | VM_WRITE。
+
+关键机制：延迟加载（Demand Paging）
+内核在这一步并不会真的去从磁盘读取G字节的数据。它只是建立了“映射关系”。它在页表中将这些虚拟地址标记为“存在”，但“不在物理内存中”。
+当CPU第一次尝试执行位于代码段的某条指令时，MMU发现这个虚拟地址没有对应的物理内存，就会触发一个 缺页异常 (Page Fault) 。
+此时内核才会被唤醒，它检查这个地址是否合法（是否在某个VMA内），然后才去磁盘上读取那一页（通常是4KB）的代码，将其加载到物理内存，更新页表，然后让CPU重新执行那条指令。
+这就是为什么即使是G字节大小的程序，启动也可能非常快的原因。
+对于.bss段（未初始化的全局变量），它在文件中不占空间（FileSiz &lt; MemSiz）。内核会为这部分多出来的虚拟内存映射一个特殊的、全零的“匿名页”，实现了C&#x2F;C++标准中“全局变量默认初始化为0”的承诺。
+设置入口点内核已经把内存空间准备好了。现在，它必须设置一个“入口点”，告诉CPU从哪里开始执行第一条指令。
+这个入口点 不是main ，而是ELF头中指定的e_entry地址。
+此时，控制权交给了 C运行时库 (glibc) 。这里分为两种情况：
+情况一：静态链接_start函数（来自crt1.o）被直接链接到程序中。它就是e_entry。_start的任务很单纯：
+
+从堆栈上准备好argc, argv, envp。
+调用__libc_start_main函数。
+
+情况二：动态链接（现代C++程序的常态）
+内核在解析Program Headers时，会发现一个PT_INTERP段，它指向一个程序：/lib64/ld-linux-x86-64.so.2。
+内核的入口点：内核会将动态链接器 (ld.so) 加载到内存，并将e_entry设置为ld.so的入口点。
+ld.so接管：ld.so首先开始运行。它负责：
+加载程序所依赖的所有共享库（如libstdc++.so, libc.so）。
+对所有跨库的函数调用进行“重定位”（Relocation），填平.got.plt表。
+完成所有库的加载后，ld.so才会跳转到程序自己的e_entry（即_start）。
+
+
+
+无论哪种情况，最终都会调用到glibc中的__libc_start_main。
+C++的特殊性：.init_array的执行__libc_start_main是进入main前最后的处理函数。它除了初始化线程、I&#x2F;O等，还必须处理C++的特殊需求。
+C++允许我们定义具有复杂构造函数的全局对象：
+std::ofstream log_file(&quot;global.log&quot;); // 需要在main之前运行int main() &#123;    log_file &lt;&lt; &quot;Main started&quot; &lt;&lt; std::endl;&#125;
+
+log_file的构造函数必须在main之前执行。编译器和链接器如何实现这一点？
+它们会将这个构造函数的指针（或一个调用它的辅助函数指针）放入一个特殊的、只读的节：**.init_array**。
+__libc_start_main在调用main之前，会执行一个循环，遍历.init_array中的每一个函数指针并调用它们，确保所有全局对象都按顺序被正确构造。
+在main返回后，__libc_start_main还会去遍历.fini_array，执行全局对象的析构函数。
+实验演示与源码剖析gdb调试让我们用GDB来亲眼见证这个过程。elf_load_test.cpp:
+#include &lt;iostream&gt;struct GlobalInitializer &#123;    GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global constructor (.init_array) running!&quot; &lt;&lt; std::endl;    &#125;    ~GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global destructor (.fini_array) running!&quot; &lt;&lt; std::endl;    &#125;&#125;;GlobalInitializer g_init; // .init_array 将包含调用其构造函数的代码int main() &#123;    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;    return 0;&#125;
+
+g++ -g -o main elf_load_test.cpp
+
+使用GDB调试：
+
+查看入口点：
+
+# 启动gdb调试gdb ./main# 查看入口信息(gdb) info file## 会出现类似的信息Entry point: 0x10a0 #这是 _start 的地址，不是 main0x0000000000000318 - 0x0000000000000334 is .interp.....0x0000000000003d88 - 0x0000000000003d98 is .init_array
+
+
+在入口点和main打断点：
+
+(gdb) b _startBreakpoint 1 at 0x10a0(gdb) b __libc_start_main_implFunction &quot;__libc_start_main_impl&quot; not defined.Make breakpoint pending on future shared library load? (y or [n]) yBreakpoint 2 (__libc_start_main_impl) pending.(gdb) b mainBreakpoint 3 at 0x1191: file elf_load_test.cpp, line 15.
+
+
+执行起来：
+
+可以看到类似的输出
+(gdb) rStarting program: Breakpoint 1, 0x00007ffff7fe3290 in _start () from /lib64/ld-linux-x86-64.so.2(gdb) cContinuing.[Thread debugging using libthread_db enabled]Using host libthread_db library &quot;/lib/x86_64-linux-gnu/libthread_db.so.1&quot;.Breakpoint 1, 0x00005555555550a0 in _start ()(gdb) cContinuing.Breakpoint 2, __libc_start_main_impl (main=0x555555555189 &lt;main()&gt;, argc=1, argv=0x7fffffffd998, init=0x0, fini=0x0, rtld_fini=0x7ffff7fc9040 &lt;_dl_fini&gt;, stack_end=0x7fffffffd988) at ../csu/libc-start.c:242242	../csu/libc-start.c: 没有那个文件或目录.(gdb) cContinuing.Global constructor (.init_array) running!Breakpoint 3, main () at elf_load_test.cpp:1515	    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;(gdb) cContinuing.main() function running!Global destructor (.fini_array) running!
+
+这清晰地证明了执行顺序：_start -&gt; __libc_start_main -&gt; .init_array (全局构造) -&gt; main的过程。
+linux内核源码剖析之前讲解的理论部分，在现代的Linux内核中都有体现。在Linux内核中的fs/binfmt_elf.c文件就实现了相关的部分，其核心函数是load_elf_binary。
+让我们来看看它（基于现代内核，已简化）的关键步骤：
+
+验证ELF头：
+
+内核首先把bprm-&gt;buf（已经由用户态execve()传来的文件头缓冲区）当作ELF头结构elfhdr读取，并做一系列基本一致性检查：
+struct elfhdr *elf_ex = (struct elfhdr *)bprm-&gt;buf;// 检查魔数（ELF 标识）是否匹配，若不匹配直接返回-ENOEXEC（不是ELF）if (memcmp(elf_ex-&gt;e_ident, ELFMAG, SELFMAG) != 0)    goto out;//只接受 ET_EXEC（普通可执行文件）或 ET_DYN（位置无关可执行/共享对象，如 PIE / 动态解释器本身），其它类型拒绝。if (elf_ex-&gt;e_type != ET_EXEC &amp;&amp; elf_ex-&gt;e_type != ET_DYN)    goto out;    // 体系结构检查（是否为当前 CPU / 内核支持的 ABI）if (!elf_check_arch(elf_ex))    goto out;    // 检查是否为 FDPIC（特定 ABI），若不支持则拒绝if (elf_check_fdpic(elf_ex))    goto out;    // 确保内核可以对该文件做 mmap（以后要用 mmap 映射段），否则拒绝if (!bprm-&gt;file-&gt;f_op-&gt;mmap)    goto out;
+
+这些检查保证内核只在能正确处理的 ELF 文件上继续后续流程
+
+解析程序头表（Program Headers）：
+
+内核会读取ELF文件中的程序头表。
+// load_elf_phdrs() 从 ELF 文件中读取并返回程序头表（struct elf_phdr[]）。内核把程序头表拷贝到内核空间（elf_phdata），方便后续逐段处理。若读取失败则返回错误。elf_phdata = load_elf_phdrs(elf_ex, bprm-&gt;file);if (!elf_phdata)    goto out;
+
+程序头表包含 PT_LOAD, PT_INTERP, PT_PHDR, PT_GNU_STACK 等条目，后续流程就是基于这些 header 做决策与映射。
+
+寻找PT_INTERP（动态链接器）：
+
+elf_ppnt = elf_phdata;for (i = 0; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type == PT_GNU_PROPERTY) &#123;        elf_property_phdata = elf_ppnt;        continue;    &#125;    if (elf_ppnt-&gt;p_type != PT_INTERP)        continue;    // 读取 p_filesz 字节作为解释器路径（例如 /lib/ld-linux.so.2 或 /lib64/ld-linux-x86-64.so.2），并确保以 &#x27;\0&#x27; 结尾。    if (elf_ppnt-&gt;p_filesz &gt; PATH_MAX || elf_ppnt-&gt;p_filesz &lt; 2)        goto out_free_ph;    elf_interpreter = kmalloc(elf_ppnt-&gt;p_filesz, GFP_KERNEL);    retval = elf_read(bprm-&gt;file, elf_interpreter, elf_ppnt-&gt;p_filesz,                      elf_ppnt-&gt;p_offset);    if (retval &lt; 0)        goto out_free_interp;    if (elf_interpreter[elf_ppnt-&gt;p_filesz - 1] != &#x27;\0&#x27;)        goto out_free_interp;        //打开该解释器文件    interpreter = open_exec(elf_interpreter);    kfree(elf_interpreter);    if (IS_ERR(interpreter))        goto out_free_ph;    would_dump(bprm, interpreter);    interp_elf_ex = kmalloc(sizeof(*interp_elf_ex), GFP_KERNEL);        // 读取解释器本身的 ELF 头（interp_elf_ex），以便后续验证和加载解释器的段    retval = elf_read(interpreter, interp_elf_ex, sizeof(*interp_elf_ex), 0);    if (retval &lt; 0)        goto out_free_dentry;    break;&#125;
+
+
+创建新的内存映像：
+
+这是execve的核心步骤之一，内核会为进程创建新的内存上下文。
+在正式映射之前，内核需要做一系列准备工作:
+// 解析 PT_GNU_PROPERTY（如果有），并把平台/ABI相关信息填到 arch_stateretval = parse_elf_properties(interpreter ?: bprm-&gt;file,                              elf_property_phdata, &amp;arch_state);if (retval)    goto out_free_dentry;// 允许架构特定代码（arch）基于 ELF 和 interpreter 判断是否接受执行，或进行一些架构检查retval = arch_check_elf(elf_ex, !!interpreter, interp_elf_ex, &amp;arch_state);if (retval)    goto out_free_dentry;// 清除当前进程的执行上下文（关闭旧 mm 的执行凭证、释放旧地址空间的某些资源等），为新程序“重新上发条”retval = begin_new_exec(bprm);if (retval)    goto out_free_dentry;// 根据 ELF header 设置进程 persona（兼容/ABI 标志）SET_PERSONALITY2(*elf_ex, &amp;arch_state);// 根据可执行栈标志调整 READ_IMPLIES_EXEC，并根据进程 persona/randomize 标志设置 PF_RANDOMIZE（决定后续地址随机化）。if (elf_read_implies_exec(*elf_ex, executable_stack))    current-&gt;personality |= READ_IMPLIES_EXEC;if (!(current-&gt;personality &amp; ADDR_NO_RANDOMIZE) &amp;&amp; randomize_va_space)    current-&gt;flags |= PF_RANDOMIZE;    // 为进程设置新的 mm、构造用户栈上的 argv/envp/auxv（setup_arg_pages也可能需要STACK_TOP` 位置，受 personality 影响）setup_new_exec(bprm);retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP), executable_stack);if (retval &lt; 0)    goto out_free_dentry;
+
+这些步骤把进程状态配置成可以安全地把新的 ELF 映射进来，并把用户栈准备好5.  核心：mmap映射PT_LOAD段：
+这段是 load_elf_binary() 的核心：遍历所有 PT_LOAD 段并把它们 mmap 到进程地址空间:
+elf_brk = 0;start_code = ~0UL;end_code = 0;start_data = 0;end_data = 0;for (i = 0, elf_ppnt = elf_phdata; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type != PT_LOAD)        continue;    // 把 ELF 段的 p_flags（读/写/执行）与架构状态转换为内核所需的 PROT_READ/PROT_WRITE/PROT_EXEC 权限集合（并处理特殊架构要求）    elf_prot = make_prot(elf_ppnt-&gt;p_flags, &amp;arch_state, !!interpreter, false);        // elf_flags 初始为 MAP_PRIVATE，再根据首次加载、ET_EXEC / ET_DYN、是否已有解释器等条件加上 MAP_FIXED_NOREPLACE 或 MAP_FIXED。    elf_flags = MAP_PRIVATE;    vaddr = elf_ppnt-&gt;p_vaddr;    ......        // 实际把文件（或文件某段）映射到内存并处理 .bss 区（零填充）/文件大小 vs 内存大小差异。返回值可能是映射的起始地址或错误    error = elf_load(bprm-&gt;file, load_bias + vaddr, elf_ppnt, elf_prot, elf_flags, total_size);    if (BAD_ADDR(error)) &#123; retval = IS_ERR_VALUE(error) ? PTR_ERR((void*)error) : -EINVAL; goto out_free_dentry; &#125;    // 首次映射后调整 load_bias（对 ET_DYN），确保后续基址计算正确，reloc_func_desc 也在此填充（用于某些平台函数描述符重定位）。    if (first_pt_load) &#123;        first_pt_load = 0;        if (elf_ex-&gt;e_type == ET_DYN) &#123;            load_bias += error - ELF_PAGESTART(load_bias + vaddr);            reloc_func_desc = load_bias;        &#125;    &#125;    /* 计算 phdr 地址（phdr_addr）、start_code/end_code、elf_brk */    if (elf_ppnt-&gt;p_offset &lt;= elf_ex-&gt;e_phoff &amp;&amp;        elf_ex-&gt;e_phoff &lt; elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_filesz) &#123;        phdr_addr = elf_ex-&gt;e_phoff - elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_vaddr;    &#125;    k = elf_ppnt-&gt;p_vaddr;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; k &lt; start_code)        start_code = k;    if (start_data &lt; k)        start_data = k;    /* 安全检查 p_memsz / TASK_SIZE */    if (BAD_ADDR(k) || elf_ppnt-&gt;p_filesz &gt; elf_ppnt-&gt;p_memsz ||        elf_ppnt-&gt;p_memsz &gt; TASK_SIZE ||        TASK_SIZE - elf_ppnt-&gt;p_memsz &lt; k) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;        // 检查 p_filesz &lt;= p_memsz、p_memsz &lt;= TASK_SIZE、避免地址溢出（防止构造恶意 ELF 导致内核映射超出允许范围）。    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_filesz;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; end_code &lt; k)        end_code = k;    if (end_data &lt; k)        end_data = k;    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_memsz;    if (k &gt; elf_brk)        elf_brk = k;&#125;
+
+
+加载动态链接器（如果存在）：
+
+如果interpreter不为NULL，内核会打开这个文件（ld.so），并加载它。ld.so本身也是一个ELF文件。
+// 在映射完主 ELF 的 PT_LOAD 段后，把所有计算累加 load_bias（基址偏移）以得到真实的地址空间位置，并把 mm-&gt;brk（程序 break/heap 初始位置）设置为 ELF_PAGEALIGN(elf_brk)e_entry = elf_ex-&gt;e_entry + load_bias;phdr_addr += load_bias;elf_brk += load_bias;start_code += load_bias;end_code += load_bias;start_data += load_bias;end_data += load_bias;current-&gt;mm-&gt;start_brk = current-&gt;mm-&gt;brk = ELF_PAGEALIGN(elf_brk);if (interpreter) &#123;    // 加载解释器，调整e_entry入口地址    elf_entry = load_elf_interp(interp_elf_ex,                                interpreter,                                load_bias, interp_elf_phdata,                                &amp;arch_state);                                    if (!IS_ERR_VALUE(elf_entry)) &#123;        interp_load_addr = elf_entry;        elf_entry += interp_elf_ex-&gt;e_entry;    &#125;    if (BAD_ADDR(elf_entry)) &#123;        retval = IS_ERR_VALUE(elf_entry) ? (int)elf_entry : -EINVAL;        goto out_free_dentry;    &#125;    reloc_func_desc = interp_load_addr;        // 对解释器做 allow_write_access()（之前打开时可能为 open_exec() 把文件设为只读/不可写，加载完成后恢复写权限），fput() 释放文件句柄    allow_write_access(interpreter);    fput(interpreter);    kfree(interp_elf_ex);    kfree(interp_elf_phdata);&#125; else &#123;    elf_entry = e_entry;    if (BAD_ADDR(elf_entry)) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;&#125;
+
+设置入口点，让用户态接管：
+
+//释放临时分配的 elf_phdata。kfree(elf_phdata);// 设置当前进程的二进制格式处理器为 ELF（内核内跟踪）set_binfmt(&amp;elf_format);.....// 在用户栈上创建 auxv / ELF program headers 的副本（让动态链接器/用户程序可以访问到 phdr 地址、entry、base 等信息），这一步会把 AT_PHDR/AT_ENTRY/AT_BASE 等 auxv 放到栈上。retval = create_elf_tables(bprm, elf_ex, interp_load_addr, e_entry, phdr_addr);if (retval &lt; 0)    goto out;//更新 mm 的 start_code/end_code/start_data/end_data/start_stack，这些记录对调试器和内存限制有用mm = current-&gt;mm;mm-&gt;end_code = end_code;mm-&gt;start_code = start_code;mm-&gt;start_data = start_data;mm-&gt;end_data = end_data;mm-&gt;start_stack = bprm-&gt;p;/* brk 随机化（ASLR） */if ((current-&gt;flags &amp; PF_RANDOMIZE) &amp;&amp; (randomize_va_space &gt; 1)) &#123;   ......&#125;......regs = current_pt_regs();......//做最终的清理，例如把临时文件名、文件描述符替换为新映像等（bprm 层面的善后）。finalize_exec(bprm);// 实际把 rip/eip/pc 设置为 elf_entry 并切换到用户态开始执行用户程序（/ 动态链接器的入口，如果有 interpreter，则先由解释器接管再加载 libc/程序）START_THREAD(elf_ex, regs, elf_entry, bprm-&gt;p);retval = 0;
+
+至此，用户态程序被“放生”到 CPU 上。内核返回 0 表示 exec 成功（但函数实际上在 START_THREAD 之后不会返回到用户态前继续执行内核路径)
+
+总结将一个 ELF 文件转变为一个运行中的进程，是内核态与用户态运行时精密协作的结果，清晰地体现了 Linux 在设计上的分层与解耦。
+
+内核（binfmt_elf） 负责执行最基础和通用的装载任务。它的核心职责是解析 ELF 程序头（Program Headers），创建进程核心的内存管理结构（mm_struct），并建立虚拟地址空间（VMA）。它通过 mmap 和缺页异常（Demand Paging）机制，高效地将文件的代码和数据段“映射”到这片地址空间，实现了延迟加载。
+
+用户态运行时（ld.so 和 glibc） 负责处理后续特定于语言和链接的复杂逻辑。内核在完成基础映射后，根据 PT_INTERP 段（动态链接）或 e_entry（静态链接）移交控制权。用户态的动态链接器或 C 运行时库接管后续工作，包括加载所有共享库、执行符号重定位（填充 GOT&#x2F;PLT），以及在 main 函数执行前调用 C++ 的全局构造函数（.init_array）。
+
+
+这种分层设计，使得内核保持了极高的灵活性和稳定性，它无需关心你用的是C++、Go还是Python，只要你符合ELF规范。而C++的复杂运行时环境，则被优雅地交给了用户态的libstdc++和glibc去管理。
+最终，一个静态的文件被赋予了生命，成为了一个在虚拟内存中奔跑的、受内核调度的独立进程。
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>从程序到进程</category>
+      </categories>
+      <tags>
+        <tag>linux</tag>
+        <tag>C++</tag>
+      </tags>
+  </entry>
 </search>
