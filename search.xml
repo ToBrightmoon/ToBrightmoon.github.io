@@ -215,7 +215,7 @@ mmap: 对那些“大且短命”的分配（如临时缓冲区），考虑绕�
     <title>Linux下的内存管理:02.深入jemalloc,多线程内存分配器的结构与算法</title>
     <url>/2025/11/07/Linux%E4%B8%8B%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/%E6%B7%B1%E5%85%A5%20jemalloc%EF%BC%9A%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E5%99%A8%E7%9A%84%E7%BB%93%E6%9E%84%E4%B8%8E%E7%AE%97%E6%B3%95/</url>
     <content><![CDATA[前言在上一篇《从 malloc 到缺页中断》中，我们深入探索了 malloc 与内核的“垂直”交互：程序如何通过 brk&#x2F;mmap 申请虚拟内存（VMA），以及如何在第一次写入时触发“缺页中断”(Page Fault)，最终获得物理内存。
-在这篇文章洪总，我们将讲解jemalloc这个被redis，Firefox等著名项目默认使用的现代的内存分配器，了解这个项目是怎么在多线程情况下的获取更高性能的分配效果。
+在这篇文章洪总，我们将讲解jemalloc这个被redis，Firefox等著名项目默认使用的现代的内存分配器，了解这个项目是怎么在多线程情况下获取更高性能的分配效果。
 我们将从它的核心设计（数据结构+算法）出发，深入探究 jemalloc 使用什么样的数据结构来管理内存，以及在 malloc 和 free 时执行了怎样的算法流程。最终，我们将通过关键路径的源码，印证我们的理解。
 注:本文使用的是jemalloc-5.3.0版本
 快速上手:jemalloc的使用在我们深入内部之前，先看看怎么用它。
@@ -2217,6 +2217,150 @@ spdlog中的github上的示例
       </tags>
   </entry>
   <entry>
+    <title>spdlog源码阅读:06.spdlog中的设计模式</title>
+    <url>/2025/06/19/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/</url>
+    <content><![CDATA[前言：从功能到架构，探寻 spdlog 的设计之美在本系列之前的文章中，我们深入剖析了 spdlog 的异步机制、核心组件，并且尝试拓展实现一个压缩sink，还尝试进行了性能优化实践。
+我们理解了 spdlog 在功能和性能上“做了什么”以及“怎么做的”。现在，我们跳出具体实现的细节，从设计模式的角度重新看一下这个库，
+深入探讨 spdlog 是如何巧妙地运用**策略模式 (Strategy)、组合模式 (Composite)、工厂模式 (Factory)、以及单例模式 (Singleton)**，来构建其灵活、高效且用户友好的体系的。
+
+1. 策略模式 (Strategy Pattern)：解耦日志行为的核心策略模式的核心思想是：定义一系列算法，将每一个算法封装起来，并使它们可以相互替换。
+为什么使用策略模式？对于一个日志库而言，其核心任务是记录日志，但日志的“行为”是多变的：
+
+日志消息应该以什么样的**格式 (Format)**呈现？
+日志消息应该被发送到哪个**目的地 (Destination)**？
+
+spdlog 通过策略模式，将 logger 的核心记录逻辑与具体的格式化策略和输出策略完全解耦。
+在 spdlog 中是如何实现的？spdlog 中有两处经典的策略模式应用：Formatter 对 Sink 的策略 和 Sink 对 Logger 的策略。
+a) Formatter：定义日志的“格式化策略”
+spdlog 定义了一个 formatter 接口，所有具体的格式化器都实现这个接口。sink 对象则拥有 (has-a) 一个 formatter 策略。
+&#x2F;&#x2F; spdlog&#x2F;formatter.h  
+class formatter &#123;  public:  virtual ~formatter() = default;  virtual void format(const details::log_msg &amp;msg, memory_buf_t &amp;dest) = 0;  virtual std::unique_ptr&lt;formatter&gt; clone() const = 0;  &#125;;
+每个 sink 对象都持有一个 formatter。当 sink 需要记录日志时，它不关心如何格式化，而是把这个任务委托给它持有的 formatter 策略对象。
+// spdlog/sinks/base_sink.h  template &lt;typename Mutex&gt;  class SPDLOG_API base_sink : public sink &#123;  public:  // ...      void log(const details::log_msg &amp;msg) final override      &#123;          std::lock_guard&lt;Mutex&gt; lock(mutex_);          sink_it_(formatted); // sink_it_ 是子类实现的具体输出逻辑 , 实际调用 formatter_ 的 format 方法，执行格式化策略     &#125;protected:  // 持有一个 formatter 策略      std::unique_ptr&lt;spdlog::formatter&gt; formatter_;      Mutex mutex_;  // ...  &#125;;
+
+b) Sink：定义日志的“输出策略”
+同样地，spdlog 定义了一个 sink 接口，代表不同的输出目的地策略。logger 类则拥有 (has-a) 一个或多个 sink 策略。
+// spdlog/sinks/sink.h  class  sink &#123;  public:      virtual ~sink() = default;      virtual void log(const details::log_msg &amp;msg) = 0;      virtual void flush() = 0;      virtual void set_pattern(const std::string &amp;pattern) = 0;      virtual void set_formatter(std::unique_ptr&lt;spdlog::formatter&gt; sink_formatter) = 0;  // ...  &#125;;  
+
+logger 类中持有一个 sink 的集合。当用户调用 logger-&gt;info(...) 时，logger 将日志消息打包后，委托给它持有的所有 sink 策略对象去处理。
+class SPDLOG_API logger &#123;public:    ......protected:    std::string name_;    std::vector&lt;sink_ptr&gt; sinks_;    spdlog::level_t level_&#123;level::info&#125;;    spdlog::level_t flush_level_&#123;level::off&#125;;    err_handler custom_err_handler_&#123;nullptr&#125;;    details::backtracer tracer_;    &#125;
+
+下面是logger,sink和formatter三个类的类图:
+
+这样做有什么好处？
+高度解耦： logger、sink、formatter 三者职责清晰，logger 不关心输出细节，sink 不关心格式化细节。
+极强的扩展性： 用户可以轻松创建自己的 sink（如写入数据库）和 formatter（如输出为 JSON），并与现有 logger 无缝集成。
+灵活性： 可以在运行时动态地为 sink 更换 formatter，改变日志格式。
+
+2. 组合模式 (Composite Pattern)：统一处理多个目的地组合模式的核心思想是：将对象组合成树形结构以表示“部分-整体”的层次结构，使得用户对单个对象和组合对象的使用具有一致性。
+为什么使用组合模式？我们常常希望一条日志能同时输出到多个地方，比如控制台和文件。组合模式使得 logger 在处理这种情况时无需区分是在跟一个 sink 还是多个 sink 打交道。
+在 spdlog 中是如何实现的？如上节代码所示，spdlog 的 logger 类中持有一个 std::vector 成员 sinks_。当记录日志时，logger::sink_it_() 方法会简单地遍历这个 vector，并对其中的每一个 sink 调用 log() 方法。
+这里的实现完美地体现了组合模式的核心思想——统一对待单个对象和对象集合。对于 logger（客户端）来说，它处理 sinks_ 的逻辑是完全一致的，无论这个 vector 中只有一个 sink 还是有十个。
+spdlog 还提供了一个更经典的组合模式实现——dist_sink，它本身是一个 sink，内部也包含一个 sink 的集合，其 log() 方法就是遍历并调用内部所有 sink 的 log()。
+这样做有什么好处？
+简化客户端代码： logger 的实现变得非常简单，一个循环就解决了向所有目的地输出的问题。
+灵活性： 用户可以自由地向 logger 的 sinks_ 列表添加或移除 sink，动态地改变日志的输出组合。
+
+3. 工厂模式 (Factory Pattern)：简化对象的创建过程在 spdlog 中，工厂模式更多的是以工厂函数 (Factory Function) 结合 模板化的工厂结构体 (Factory Struct) 的形式体现，它提供了一个集中的、简化的方式来创建复杂的、预配置好的 logger 对象。
+为什么使用工厂模式？手动创建一个功能完备的 logger 对象比较繁琐。尤其是异步的logger，还需要去手动创建线程池和设置队列大小。工厂模式将这些复杂的创建逻辑封装起来，向用户提供一个简单、易用的创建接口。
+在 spdlog 中是如何实现的？spdlog 提供了一系列工厂函数，如 basic_logger_mt。这些函数巧妙地利用模板参数来接收一个“工厂”类型，这个工厂类型决定了是创建同步 logger还是异步 logger。
+// 一个异步文件日志的创建示例  void async_example()  &#123;  // 使用 async_factory 作为模板参数，创建异步 logger      auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);  &#125;
+
+// 这是同步工厂的实现  struct synchronous_factory &#123;  template &lt;typename Sink, typename... SinkArgs&gt;  static std::shared_ptr&lt;spdlog::logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;...args) &#123;      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;spdlog::logger&gt;(std::move(logger_name), std::move(sink));      details::registry::instance().initialize_logger(new_logger);      return new_logger;  &#125;  &#125;;
+
+// 这是异步工厂的实现  template&lt;async_overflow_policy OverflowPolicy = async_overflow_policy::block&gt;  struct async_factory_impl  &#123;      template&lt;typename Sink, typename... SinkArgs&gt;      static std::shared_ptr&lt;async_logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;... args)      &#123;      // ... (省略创建和获取全局线程池的逻辑) ...      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;async_logger&gt;(std::move(logger_name), std::move(sink),      std::move(tp), OverflowPolicy);      details::registry::instance().initialize_logger(new_logger);      return new_logger;      &#125;  &#125;;    using async_factory = async_factory_impl&lt;async_overflow_policy::block&gt;;    .......
+
+最终的工厂函数 basic_logger_mt 接收这个工厂类型作为模板参数，并调用其 create 方法。
+template &lt;typename Factory = spdlog::synchronous_factory&gt;  inline std::shared_ptr&lt;logger&gt; basic_logger_mt(const std::string &amp;logger_name,                                                 const filename_t &amp;filename,                                                 bool truncate = false,                                                 const file_event_handlers &amp;event_handlers = &#123;&#125;) &#123;      // 调用传入的 Factory 的静态 create 方法来创建 logger      return Factory::template create&lt;sinks::basic_file_sink_mt&gt;(logger_name, filename, truncate,event_handlers);  &#125;
+
+下面是工厂调用的时序图:
+
+这样做有什么好处？
+极大地简化了用户的使用： 用户可以用一行代码创建一个功能完备的同步或异步 logger。
+高度灵活与解耦： 通过模板参数注入不同的工厂实现，使得创建不同类型 logger 的逻辑得以复用和解耦。
+保证了最佳实践： 工厂函数创建的 logger 通常是经过预配置的、符合最佳实践的实例（例如，_mt 后缀的都是线程安全的）。
+
+通过这种模板方法和手段实现工厂也是C++实现工厂模式的一个优点，避免了重复创建无意义的工厂接口类，而是通过模板去实现静态多态
+4. 单例模式 (Singleton Pattern)：提供全局便捷访问单例模式确保一个类只有一个实例，并提供一个全局访问点。
+为什么使用单例模式？对于许多简单的应用场景，用户不希望手动创建和管理 logger 实例，而是希望有一个像 printf 一样方便的全局日志函数。spdlog 通过单例模式提供了一个全局的 logger 注册表 (registry) 和一个默认的 logger。
+在 spdlog 中是如何实现的？spdlog 提供了全局的日志函数，如 spdlog::info, spdlog::error 等。
+#include &quot;spdlog/spdlog.h&quot;int main()   &#123;      // 直接使用全局函数进行日志记录      spdlog::info(&quot;Welcome to spdlog!&quot;);      spdlog::error(&quot;Some error message with arg: &#123;&#125;&quot;, 1);  &#125;
+
+这些全局函数内部都通过调用 default_logger_raw() 来获取一个默认的 logger 实例。
+   template &lt;typename... Args&gt;  inline void debug(format_string_t&lt;Args...&gt; fmt, Args &amp;&amp;...args) &#123;  // 调用默认 logger 的 debug 方法      default_logger_raw()-&gt;debug(fmt, std::forward&lt;Args&gt;(args)...);  &#125;
+
+而这个默认的 logger 由 spdlog::registry 类管理。registry 类自身就是通过单例模式实现的，它使用 C++11 之后线程安全的“Meyers’ Singleton”模式。
+// spdlog/details/registry.h  class SPDLOG_API registry &#123;  public:  // ...  // 提供一个静态方法 instance() 来获取唯一的实例  static registry &amp;instance();    std::shared_ptr&lt;logger&gt; default_logger();      void set_default_logger(std::shared_ptr&lt;logger&gt; new_default_logger);      void register_logger(std::shared_ptr&lt;logger&gt; new_logger);      // ...  private:      registry(); // 构造函数私有化      ~registry();    std::unordered_map&lt;std::string, std::shared_ptr&lt;logger&gt;&gt; loggers_;      std::shared_ptr&lt;logger&gt; default_logger_;      // ...  &#125;;// spdlog/details/registry.cpp  SPDLOG_INLINE registry &amp;registry::instance() &#123;      // C++11 保证了静态局部变量的初始化是线程安全的      static registry s_instance;      return s_instance;  &#125;
+
+这样做有什么好处？
+便捷性： 为用户提供了极其方便的全局日志接口，大大降低了入门和日常使用的复杂度。
+全局注册与管理： 提供了一个中心化的位置来注册、获取和管理所有命名的 logger，方便统一配置。
+平衡了便利与灵活： spdlog 在提供单例便利的同时，也允许用户创建和管理自己的 logger 实例，不与全局注册表绑定。这种设计非常出色，兼顾了易用性和灵活性，避免了单例模式在大型项目中可能带来的强耦合和测试困难问题。
+
+结论通过对 spdlog 中设计模式的剖析，我们不难发现，这些经典模式并非孤立存在，而是相互协作，共同构成了 spdlog 优雅的架构：
+
+策略模式 提供了核心的灵活性，使得日志的格式化和输出行为可以被轻松替换和扩展。
+组合模式 使得 logger 能够统一、透明地处理单个或多个输出目的地，简化了客户端逻辑。
+工厂模式 (结合模板) 则封装了复杂的对象创建过程，为用户提供了简洁、易用的入口。
+单例模式 为简单的使用场景提供了极大的便利，并提供了一个全局的管理中心。
+
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>生活中的随想:相对平庸的自己怎么成长</title>
+    <url>/2025/09/08/thinks/%E7%9B%B8%E5%AF%B9%E5%B9%B3%E5%BA%B8%E7%9A%84%E8%87%AA%E5%B7%B1%E6%80%8E%E4%B9%88%E6%88%90%E9%95%BF/</url>
+    <content><![CDATA[前言：我们都是“普通人”作为一名程序员，我们能够经常听到各种传奇的故事：有人十几岁就写出了自己的操作系统，有人能随手实现一个编译器，有人对算法的理解仿佛与生俱来。这些故事令人敬佩，但也常常让我们这些普通人陷入焦虑。
+这篇文章，就是写给像你我一样的“普通”程序员的。
+我们可能需要反复阅读才能理解一个复杂的概念；我们可能无法一眼看透问题的本质；我们可能也曾被《计算机程序设计艺术》这样的“天书”劝退。
+我们，就是相对平庸的大多数。
+我们必须承认自己的平庸，我们不是天才，年轻的时候大部分人都会自命不凡，幻想自己能够成就一番伟业，但是需要承认，人与人之间的差距就是巨大的，这种差距不会因为我们的否认而消失。
+那些真正的天才，在很早的的时候就绽放了自己的光彩。
+但是这并不意味着我们不能达到一种相对优秀的地步。恰恰相反，只要我们找到一条正确的、符合人性的路径，我们同样可以走得很远。这条路的核心，就是放弃“一步登天”的幻想，拥抱“微进步”的哲学。
+核心原则：寻找你的“微挑战区”我们能够得到进步的时候，不是在自己的舒适区里重复劳动的时候，也不是在面对一个完全陌生，被当前自己解决不了的难题困住的时候， 而是在一个恰到好处的“微挑战区”。
+在这个区域里，任务对我们来说有一定难度，需要我们稍微踮踮脚、费点劲才能完成，但又不至于让我们感到绝望。每一次成功的克服，都会带来扎实的技能提升和宝贵的正反馈，激励我们走向下一个“微挑战区”。
+这个原则，可以贯穿我们学习和工作的方方面面。
+如何读书：放弃“屠龙之术”，从“踮脚”开始在我们寻求技术书单的时候，很多时候都会被推荐一堆“圣经”。这些书确实都是好书，但是它们是现在的你能把握的吗？
+一个常见的情况就是：一上来就挑战那些评分最高、最经典的“天书”。结果往往是读得极其痛苦，没几页就放弃了，最后只剩下挫败感和一本崭新的书。
+一个更务实的读书策略是：
+选择一本你大概已经掌握了 70% 内容的书。
+这 70% 的已知内容，为你提供了一个坚实的认知基础，让你在阅读时感到熟悉和自信。而那剩下的 30% 未知内容，就是为你量身打造的“微挑战区”。
+你不需要耗费巨大的心力去啃每一个概念。
+你可以在已知的基础上，轻松地将新的知识点连接到你现有的知识网络中。
+每读完一本，你的知识“基本盘”就从 70% 扩大到了 80% 甚至 90%。
+当你用这种方式读完几本书后，你会惊奇地发现，你知识的“雪球”越滚越大。那些曾经遥不可及的“经典”，不知不觉间，也进入了你的“微挑战区”。
+如何做项目：放弃“造航母”，从“装武器”开始做项目同样如此。很多人的个人项目之所以失败，往往是因为目标定得过于宏大。
+“我要写一个自己的操作系统”、“我要从零实现一个数据库”，这些目标固然伟大，但对于绝大多数人来说，这相当于直接把自己扔进了“恐慌区”。
+一个更有效的项目策略是：
+在你熟悉的项目类型上，增加 1-2 个你不会的新技术点，或者没有深挖过的技术。
+这个新技术点，就是你的“微挑战”。
+如果你写过一些命令行工具，下一个项目，可以尝试用 Qt 或 ImGui 为它套上一个图形界面。
+如果你已经用 gRPC 做过简单的服务，下一个项目，可以尝试自己实现一个拦截器 (Interceptor) 来做统一的日志或认证。
+你不需要从零开始，你的大部分精力仍然花在你熟悉的领域，这保证了项目的可控性。你只需要集中精力，攻克那一两个新的“微挑战”即可。
+每完成一个这样的项目，你的“武器库”里就多了一件新武器。几个项目下来，就可以比昨天的自己更好。
+我自己最深的体会就是刚学C++就去妄图看muduo网络库，结果大受打击。等到有点经验了，再去看这个库，才从中汲取到知识。
+结论：拥抱自己的“平庸”，然后超越它我们必须承认，天赋在一定程度上决定了我们能达到的上限。但同样不可否-认的是，一套正确的、可持续的方法论，决定了我们能达到的下限。
+对于我们这些“普通”程序员来说，最可怕的不是天赋不够，而是在焦虑中用错误的方法反复内耗，最终原地踏步。
+放弃对“天才”的执念，拥抱自己的“平庸”，然后用“微挑战”的原则，一步一个脚印地去学习和实践。
+今天你读懂了一本书里费解的一章，明天你跑通了一个项目里陌生的技术点。日积月累，你会发现，虽然你可能永远成不了那个传说中的“万中无一”，但你已经远远超越了昨天的自己，成为了一个真正优秀、可靠、且从容的工程师。
+这，或许就是我们普通人能走到的、最光荣的终点。
+]]></content>
+      <categories>
+        <category>随想</category>
+      </categories>
+      <tags>
+        <tag>个人成长</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>spdlog源码阅读:05.spdlog性能优化尝试</title>
     <url>/2025/05/12/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:05.spdlog%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%B0%9D%E8%AF%95/</url>
     <content><![CDATA[引言在本系列的前四篇文章中，我们对 spdlog 的异步机制、文件 Sink、自定义 Sink 扩展以及核心格式化引擎 pattern_formatter 进行了深入剖析。通过这些分析，我们对 spdlog 的设计哲学和实现细节有了全面的理解。spdlog 以其丰富的功能和相对不错的性能得到了广泛应用，但其默认的异步日志模型（基于共享的 MPMC 阻塞队列）在高并发、多生产者场景下，队列的锁竞争可能成为性能瓶颈。
@@ -2403,150 +2547,6 @@ spdlog 吞吐量 (条&#x2F;秒)
         <tag>C++</tag>
         <tag>spdlog</tag>
         <tag>日志系统</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>spdlog源码阅读:06.spdlog中的设计模式</title>
-    <url>/2025/06/19/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/</url>
-    <content><![CDATA[前言：从功能到架构，探寻 spdlog 的设计之美在本系列之前的文章中，我们深入剖析了 spdlog 的异步机制、核心组件，并且尝试拓展实现一个压缩sink，还尝试进行了性能优化实践。
-我们理解了 spdlog 在功能和性能上“做了什么”以及“怎么做的”。现在，我们跳出具体实现的细节，从设计模式的角度重新看一下这个库，
-深入探讨 spdlog 是如何巧妙地运用**策略模式 (Strategy)、组合模式 (Composite)、工厂模式 (Factory)、以及单例模式 (Singleton)**，来构建其灵活、高效且用户友好的体系的。
-
-1. 策略模式 (Strategy Pattern)：解耦日志行为的核心策略模式的核心思想是：定义一系列算法，将每一个算法封装起来，并使它们可以相互替换。
-为什么使用策略模式？对于一个日志库而言，其核心任务是记录日志，但日志的“行为”是多变的：
-
-日志消息应该以什么样的**格式 (Format)**呈现？
-日志消息应该被发送到哪个**目的地 (Destination)**？
-
-spdlog 通过策略模式，将 logger 的核心记录逻辑与具体的格式化策略和输出策略完全解耦。
-在 spdlog 中是如何实现的？spdlog 中有两处经典的策略模式应用：Formatter 对 Sink 的策略 和 Sink 对 Logger 的策略。
-a) Formatter：定义日志的“格式化策略”
-spdlog 定义了一个 formatter 接口，所有具体的格式化器都实现这个接口。sink 对象则拥有 (has-a) 一个 formatter 策略。
-&#x2F;&#x2F; spdlog&#x2F;formatter.h  
-class formatter &#123;  public:  virtual ~formatter() = default;  virtual void format(const details::log_msg &amp;msg, memory_buf_t &amp;dest) = 0;  virtual std::unique_ptr&lt;formatter&gt; clone() const = 0;  &#125;;
-每个 sink 对象都持有一个 formatter。当 sink 需要记录日志时，它不关心如何格式化，而是把这个任务委托给它持有的 formatter 策略对象。
-// spdlog/sinks/base_sink.h  template &lt;typename Mutex&gt;  class SPDLOG_API base_sink : public sink &#123;  public:  // ...      void log(const details::log_msg &amp;msg) final override      &#123;          std::lock_guard&lt;Mutex&gt; lock(mutex_);          sink_it_(formatted); // sink_it_ 是子类实现的具体输出逻辑 , 实际调用 formatter_ 的 format 方法，执行格式化策略     &#125;protected:  // 持有一个 formatter 策略      std::unique_ptr&lt;spdlog::formatter&gt; formatter_;      Mutex mutex_;  // ...  &#125;;
-
-b) Sink：定义日志的“输出策略”
-同样地，spdlog 定义了一个 sink 接口，代表不同的输出目的地策略。logger 类则拥有 (has-a) 一个或多个 sink 策略。
-// spdlog/sinks/sink.h  class  sink &#123;  public:      virtual ~sink() = default;      virtual void log(const details::log_msg &amp;msg) = 0;      virtual void flush() = 0;      virtual void set_pattern(const std::string &amp;pattern) = 0;      virtual void set_formatter(std::unique_ptr&lt;spdlog::formatter&gt; sink_formatter) = 0;  // ...  &#125;;  
-
-logger 类中持有一个 sink 的集合。当用户调用 logger-&gt;info(...) 时，logger 将日志消息打包后，委托给它持有的所有 sink 策略对象去处理。
-class SPDLOG_API logger &#123;public:    ......protected:    std::string name_;    std::vector&lt;sink_ptr&gt; sinks_;    spdlog::level_t level_&#123;level::info&#125;;    spdlog::level_t flush_level_&#123;level::off&#125;;    err_handler custom_err_handler_&#123;nullptr&#125;;    details::backtracer tracer_;    &#125;
-
-下面是logger,sink和formatter三个类的类图:
-
-这样做有什么好处？
-高度解耦： logger、sink、formatter 三者职责清晰，logger 不关心输出细节，sink 不关心格式化细节。
-极强的扩展性： 用户可以轻松创建自己的 sink（如写入数据库）和 formatter（如输出为 JSON），并与现有 logger 无缝集成。
-灵活性： 可以在运行时动态地为 sink 更换 formatter，改变日志格式。
-
-2. 组合模式 (Composite Pattern)：统一处理多个目的地组合模式的核心思想是：将对象组合成树形结构以表示“部分-整体”的层次结构，使得用户对单个对象和组合对象的使用具有一致性。
-为什么使用组合模式？我们常常希望一条日志能同时输出到多个地方，比如控制台和文件。组合模式使得 logger 在处理这种情况时无需区分是在跟一个 sink 还是多个 sink 打交道。
-在 spdlog 中是如何实现的？如上节代码所示，spdlog 的 logger 类中持有一个 std::vector 成员 sinks_。当记录日志时，logger::sink_it_() 方法会简单地遍历这个 vector，并对其中的每一个 sink 调用 log() 方法。
-这里的实现完美地体现了组合模式的核心思想——统一对待单个对象和对象集合。对于 logger（客户端）来说，它处理 sinks_ 的逻辑是完全一致的，无论这个 vector 中只有一个 sink 还是有十个。
-spdlog 还提供了一个更经典的组合模式实现——dist_sink，它本身是一个 sink，内部也包含一个 sink 的集合，其 log() 方法就是遍历并调用内部所有 sink 的 log()。
-这样做有什么好处？
-简化客户端代码： logger 的实现变得非常简单，一个循环就解决了向所有目的地输出的问题。
-灵活性： 用户可以自由地向 logger 的 sinks_ 列表添加或移除 sink，动态地改变日志的输出组合。
-
-3. 工厂模式 (Factory Pattern)：简化对象的创建过程在 spdlog 中，工厂模式更多的是以工厂函数 (Factory Function) 结合 模板化的工厂结构体 (Factory Struct) 的形式体现，它提供了一个集中的、简化的方式来创建复杂的、预配置好的 logger 对象。
-为什么使用工厂模式？手动创建一个功能完备的 logger 对象比较繁琐。尤其是异步的logger，还需要去手动创建线程池和设置队列大小。工厂模式将这些复杂的创建逻辑封装起来，向用户提供一个简单、易用的创建接口。
-在 spdlog 中是如何实现的？spdlog 提供了一系列工厂函数，如 basic_logger_mt。这些函数巧妙地利用模板参数来接收一个“工厂”类型，这个工厂类型决定了是创建同步 logger还是异步 logger。
-// 一个异步文件日志的创建示例  void async_example()  &#123;  // 使用 async_factory 作为模板参数，创建异步 logger      auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);  &#125;
-
-// 这是同步工厂的实现  struct synchronous_factory &#123;  template &lt;typename Sink, typename... SinkArgs&gt;  static std::shared_ptr&lt;spdlog::logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;...args) &#123;      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;spdlog::logger&gt;(std::move(logger_name), std::move(sink));      details::registry::instance().initialize_logger(new_logger);      return new_logger;  &#125;  &#125;;
-
-// 这是异步工厂的实现  template&lt;async_overflow_policy OverflowPolicy = async_overflow_policy::block&gt;  struct async_factory_impl  &#123;      template&lt;typename Sink, typename... SinkArgs&gt;      static std::shared_ptr&lt;async_logger&gt; create(std::string logger_name, SinkArgs &amp;&amp;... args)      &#123;      // ... (省略创建和获取全局线程池的逻辑) ...      auto sink = std::make_shared&lt;Sink&gt;(std::forward&lt;SinkArgs&gt;(args)...);      auto new_logger = std::make_shared&lt;async_logger&gt;(std::move(logger_name), std::move(sink),      std::move(tp), OverflowPolicy);      details::registry::instance().initialize_logger(new_logger);      return new_logger;      &#125;  &#125;;    using async_factory = async_factory_impl&lt;async_overflow_policy::block&gt;;    .......
-
-最终的工厂函数 basic_logger_mt 接收这个工厂类型作为模板参数，并调用其 create 方法。
-template &lt;typename Factory = spdlog::synchronous_factory&gt;  inline std::shared_ptr&lt;logger&gt; basic_logger_mt(const std::string &amp;logger_name,                                                 const filename_t &amp;filename,                                                 bool truncate = false,                                                 const file_event_handlers &amp;event_handlers = &#123;&#125;) &#123;      // 调用传入的 Factory 的静态 create 方法来创建 logger      return Factory::template create&lt;sinks::basic_file_sink_mt&gt;(logger_name, filename, truncate,event_handlers);  &#125;
-
-下面是工厂调用的时序图:
-
-这样做有什么好处？
-极大地简化了用户的使用： 用户可以用一行代码创建一个功能完备的同步或异步 logger。
-高度灵活与解耦： 通过模板参数注入不同的工厂实现，使得创建不同类型 logger 的逻辑得以复用和解耦。
-保证了最佳实践： 工厂函数创建的 logger 通常是经过预配置的、符合最佳实践的实例（例如，_mt 后缀的都是线程安全的）。
-
-通过这种模板方法和手段实现工厂也是C++实现工厂模式的一个优点，避免了重复创建无意义的工厂接口类，而是通过模板去实现静态多态
-4. 单例模式 (Singleton Pattern)：提供全局便捷访问单例模式确保一个类只有一个实例，并提供一个全局访问点。
-为什么使用单例模式？对于许多简单的应用场景，用户不希望手动创建和管理 logger 实例，而是希望有一个像 printf 一样方便的全局日志函数。spdlog 通过单例模式提供了一个全局的 logger 注册表 (registry) 和一个默认的 logger。
-在 spdlog 中是如何实现的？spdlog 提供了全局的日志函数，如 spdlog::info, spdlog::error 等。
-#include &quot;spdlog/spdlog.h&quot;int main()   &#123;      // 直接使用全局函数进行日志记录      spdlog::info(&quot;Welcome to spdlog!&quot;);      spdlog::error(&quot;Some error message with arg: &#123;&#125;&quot;, 1);  &#125;
-
-这些全局函数内部都通过调用 default_logger_raw() 来获取一个默认的 logger 实例。
-   template &lt;typename... Args&gt;  inline void debug(format_string_t&lt;Args...&gt; fmt, Args &amp;&amp;...args) &#123;  // 调用默认 logger 的 debug 方法      default_logger_raw()-&gt;debug(fmt, std::forward&lt;Args&gt;(args)...);  &#125;
-
-而这个默认的 logger 由 spdlog::registry 类管理。registry 类自身就是通过单例模式实现的，它使用 C++11 之后线程安全的“Meyers’ Singleton”模式。
-// spdlog/details/registry.h  class SPDLOG_API registry &#123;  public:  // ...  // 提供一个静态方法 instance() 来获取唯一的实例  static registry &amp;instance();    std::shared_ptr&lt;logger&gt; default_logger();      void set_default_logger(std::shared_ptr&lt;logger&gt; new_default_logger);      void register_logger(std::shared_ptr&lt;logger&gt; new_logger);      // ...  private:      registry(); // 构造函数私有化      ~registry();    std::unordered_map&lt;std::string, std::shared_ptr&lt;logger&gt;&gt; loggers_;      std::shared_ptr&lt;logger&gt; default_logger_;      // ...  &#125;;// spdlog/details/registry.cpp  SPDLOG_INLINE registry &amp;registry::instance() &#123;      // C++11 保证了静态局部变量的初始化是线程安全的      static registry s_instance;      return s_instance;  &#125;
-
-这样做有什么好处？
-便捷性： 为用户提供了极其方便的全局日志接口，大大降低了入门和日常使用的复杂度。
-全局注册与管理： 提供了一个中心化的位置来注册、获取和管理所有命名的 logger，方便统一配置。
-平衡了便利与灵活： spdlog 在提供单例便利的同时，也允许用户创建和管理自己的 logger 实例，不与全局注册表绑定。这种设计非常出色，兼顾了易用性和灵活性，避免了单例模式在大型项目中可能带来的强耦合和测试困难问题。
-
-结论通过对 spdlog 中设计模式的剖析，我们不难发现，这些经典模式并非孤立存在，而是相互协作，共同构成了 spdlog 优雅的架构：
-
-策略模式 提供了核心的灵活性，使得日志的格式化和输出行为可以被轻松替换和扩展。
-组合模式 使得 logger 能够统一、透明地处理单个或多个输出目的地，简化了客户端逻辑。
-工厂模式 (结合模板) 则封装了复杂的对象创建过程，为用户提供了简洁、易用的入口。
-单例模式 为简单的使用场景提供了极大的便利，并提供了一个全局的管理中心。
-
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>spdlog</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>spdlog</tag>
-        <tag>日志系统</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>生活中的随想:相对平庸的自己怎么成长</title>
-    <url>/2025/09/08/thinks/%E7%9B%B8%E5%AF%B9%E5%B9%B3%E5%BA%B8%E7%9A%84%E8%87%AA%E5%B7%B1%E6%80%8E%E4%B9%88%E6%88%90%E9%95%BF/</url>
-    <content><![CDATA[前言：我们都是“普通人”作为一名程序员，我们能够经常听到各种传奇的故事：有人十几岁就写出了自己的操作系统，有人能随手实现一个编译器，有人对算法的理解仿佛与生俱来。这些故事令人敬佩，但也常常让我们这些普通人陷入焦虑。
-这篇文章，就是写给像你我一样的“普通”程序员的。
-我们可能需要反复阅读才能理解一个复杂的概念；我们可能无法一眼看透问题的本质；我们可能也曾被《计算机程序设计艺术》这样的“天书”劝退。
-我们，就是相对平庸的大多数。
-我们必须承认自己的平庸，我们不是天才，年轻的时候大部分人都会自命不凡，幻想自己能够成就一番伟业，但是需要承认，人与人之间的差距就是巨大的，这种差距不会因为我们的否认而消失。
-那些真正的天才，在很早的的时候就绽放了自己的光彩。
-但是这并不意味着我们不能达到一种相对优秀的地步。恰恰相反，只要我们找到一条正确的、符合人性的路径，我们同样可以走得很远。这条路的核心，就是放弃“一步登天”的幻想，拥抱“微进步”的哲学。
-核心原则：寻找你的“微挑战区”我们能够得到进步的时候，不是在自己的舒适区里重复劳动的时候，也不是在面对一个完全陌生，被当前自己解决不了的难题困住的时候， 而是在一个恰到好处的“微挑战区”。
-在这个区域里，任务对我们来说有一定难度，需要我们稍微踮踮脚、费点劲才能完成，但又不至于让我们感到绝望。每一次成功的克服，都会带来扎实的技能提升和宝贵的正反馈，激励我们走向下一个“微挑战区”。
-这个原则，可以贯穿我们学习和工作的方方面面。
-如何读书：放弃“屠龙之术”，从“踮脚”开始在我们寻求技术书单的时候，很多时候都会被推荐一堆“圣经”。这些书确实都是好书，但是它们是现在的你能把握的吗？
-一个常见的情况就是：一上来就挑战那些评分最高、最经典的“天书”。结果往往是读得极其痛苦，没几页就放弃了，最后只剩下挫败感和一本崭新的书。
-一个更务实的读书策略是：
-选择一本你大概已经掌握了 70% 内容的书。
-这 70% 的已知内容，为你提供了一个坚实的认知基础，让你在阅读时感到熟悉和自信。而那剩下的 30% 未知内容，就是为你量身打造的“微挑战区”。
-你不需要耗费巨大的心力去啃每一个概念。
-你可以在已知的基础上，轻松地将新的知识点连接到你现有的知识网络中。
-每读完一本，你的知识“基本盘”就从 70% 扩大到了 80% 甚至 90%。
-当你用这种方式读完几本书后，你会惊奇地发现，你知识的“雪球”越滚越大。那些曾经遥不可及的“经典”，不知不觉间，也进入了你的“微挑战区”。
-如何做项目：放弃“造航母”，从“装武器”开始做项目同样如此。很多人的个人项目之所以失败，往往是因为目标定得过于宏大。
-“我要写一个自己的操作系统”、“我要从零实现一个数据库”，这些目标固然伟大，但对于绝大多数人来说，这相当于直接把自己扔进了“恐慌区”。
-一个更有效的项目策略是：
-在你熟悉的项目类型上，增加 1-2 个你不会的新技术点，或者没有深挖过的技术。
-这个新技术点，就是你的“微挑战”。
-如果你写过一些命令行工具，下一个项目，可以尝试用 Qt 或 ImGui 为它套上一个图形界面。
-如果你已经用 gRPC 做过简单的服务，下一个项目，可以尝试自己实现一个拦截器 (Interceptor) 来做统一的日志或认证。
-你不需要从零开始，你的大部分精力仍然花在你熟悉的领域，这保证了项目的可控性。你只需要集中精力，攻克那一两个新的“微挑战”即可。
-每完成一个这样的项目，你的“武器库”里就多了一件新武器。几个项目下来，就可以比昨天的自己更好。
-我自己最深的体会就是刚学C++就去妄图看muduo网络库，结果大受打击。等到有点经验了，再去看这个库，才从中汲取到知识。
-结论：拥抱自己的“平庸”，然后超越它我们必须承认，天赋在一定程度上决定了我们能达到的上限。但同样不可否-认的是，一套正确的、可持续的方法论，决定了我们能达到的下限。
-对于我们这些“普通”程序员来说，最可怕的不是天赋不够，而是在焦虑中用错误的方法反复内耗，最终原地踏步。
-放弃对“天才”的执念，拥抱自己的“平庸”，然后用“微挑战”的原则，一步一个脚印地去学习和实践。
-今天你读懂了一本书里费解的一章，明天你跑通了一个项目里陌生的技术点。日积月累，你会发现，虽然你可能永远成不了那个传说中的“万中无一”，但你已经远远超越了昨天的自己，成为了一个真正优秀、可靠、且从容的工程师。
-这，或许就是我们普通人能走到的、最光荣的终点。
-]]></content>
-      <categories>
-        <category>随想</category>
-      </categories>
-      <tags>
-        <tag>个人成长</tag>
       </tags>
   </entry>
   <entry>
