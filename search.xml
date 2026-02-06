@@ -1313,6 +1313,66 @@ void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#1
       </tags>
   </entry>
   <entry>
+    <title>grpc实践之路:04.grpc异步回调接口的使用</title>
+    <url>/2025/07/14/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们实现的服务端模型都有一个共同的特点：它们是同步的。无论是 Unary RPC 还是流式 RPC，我们的服务端实现在 RPC 处理函数中都会阻塞，直到该次请求处理完成。这意味着，为了同时服务多个客户端，gRPC 的同步服务器不得不在其内部的线程池中为每一个并发请求分配一个线程。这种“一个请求一个线程”的模式，在并发量不高时简单有效。但试想一下，当成千上万的客户端同时涌入时，服务器的线程资源会被迅速耗尽，系统将不堪重负。
+一个真正的高性能服务，必须具备“一人多能”的本领——用少量的核心线程，处理成千上万的并发请求。要做到这一点，我们必须拥抱异步编程。
+本文，我们将深入 gRPC C++ 最核心、也是官方最新推荐的异步服务模型——Callback API（回调式 API）。它也被称为“Reactor 模式”，因为它与我们熟悉的 muduo 等网络库的事件驱动思想如出一辙。我们将通过实践，构建一个真正意义上的高性能 gRPC 异步服务。
+
+
+异步服务的核心理念：事件、队列与回调在深入代码之前，我们必须理解 gRPC 异步模型的三个核心概念：
+
+事件驱动 (Event-Driven): 服务器不再为每个请求阻塞等待，而是以非阻塞的方式发起所有操作（如接收请求、读写数据、发送响应）。它只关心“事件”的发生，比如“一个新的 RPC 请求到来了”、“数据发送完成了”。
+完成队列 (grpc::ServerCompletionQueue): 这是 gRPC C++ 异步编程的心脏。所有异步操作的“完成事件”最终都会被放入这个队列中。我们的工作线程只需要从这个队列里取出已完成的事件进行处理即可。
+回调 (Callback): 对于每一个完成的事件，我们应该执行什么操作？这就是通过回调函数来定义的。
+
+幸运的是，从 gRPC v1.60 版本开始，官方引入了全新的 Callback API，极大地简化了异步服务的编写。我们不再需要手动管理复杂的完成队列和“标签”，而是可以通过实现一系列的回调函数来响应事件。
+第一步：重新认识服务实现在 Callback API 模式下，我们的服务实现类依然继承自 gRPC 生成的 Service 基类，但有一个关键区别：我们不再直接重写 RPC 方法本身，而是重写一个对应的 Request + RPC 方法名 的方法。
+这个方法的作用，不再是处理业务逻辑，而是创建一个“反应堆 (Reactor)”对象，并将其返回给 gRPC 框架。
+我们以一个简单的 Unary RPC 为例：
+// server.cc (新的单次 RPC 服务实现)  #**include** &lt;iostream&gt;  #**include** &lt;memory&gt;  #**include** &lt;string&gt;  #**include** &lt;thread&gt;  #**include** &lt;chrono&gt;#**include** &lt;grpcpp/grpcpp.h&gt;  #**include** &quot;controller.grpc.pb.h&quot; // 假设这是你 gRPC 生成的头文件// 1. 我们需要为每个 RPC 方法创建一个 Reactor 类  //    这个类继承自 gRPC 提供的 ServerUnaryReactor  class GreeterReactor : public grpc::ServerUnaryReactor &#123;  public:  // 构造函数接收请求和响应对象  GreeterReactor(const controller::GetVersionRequest* request, controller::GetVersionResponse* response)  : request_(request), response_(response) &#123;        // 在这里可以开始处理业务逻辑          std::cout &lt;&lt; &quot;Reactor created. Processing GetVersion request...&quot; &lt;&lt; std::endl;          std::string version_str = &quot;Async Core Service v2.0.0&quot;;          response_-&gt;set_version(version_str);        // 当业务逻辑处理完毕，调用 Finish() 告诉 gRPC 框架可以发送响应了          Finish(grpc::Status::OK);      &#125;    // 2. 当整个 RPC 调用（包括响应发送）彻底完成时，gRPC 会调用这个方法      void OnDone() override &#123;          std::cout &lt;&lt; &quot;Reactor is done. Deleting self.&quot; &lt;&lt; std::endl;          // 在这里，我们可以安全地释放资源，比如删除自身          delete this;      &#125;    // 你也可以实现其他回调，如 OnCancel 或 OnSendInitialMetadataDone      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnCancel&quot; &lt;&lt; std::endl;      &#125;    void OnSendInitialMetadataDone(bool ok) override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnSendInitialMetadataDone: &quot; &lt;&lt; (ok ? &quot;Success&quot; : &quot;Failed&quot;) &lt;&lt; std::endl;      &#125;private:  const controller::GetVersionRequest* request_;  controller::GetVersionResponse* response_;  &#125;;class ControllerServiceImpl final : public controller::Controller::CallbackService &#123;  public:  // 3. 注意！我们不再重写 GetVersion，而是重写返回 ServerUnaryReactor* 的 GetVersion 方法  //    （对于 CallbackService，它直接对应 RPC 方法名）。  grpc::ServerUnaryReactor* GetVersion(grpc::CallbackServerContext* context,  const controller::GetVersionRequest* request,  controller::GetVersionResponse* response) override &#123;  // 这个方法的核心职责就是：创建一个新的 Reactor 实例，然后返回它  // gRPC 框架会接管这个 Reactor 的生命周期  return new GreeterReactor(request, response);  &#125;  &#125;;
+
+
+第二步：理解新的异步工作流这个基于 Reactor 的新模型，其工作流程是这样的：
+
+注册服务： 我们将 ControllerServiceImpl 的一个实例注册到 ServerBuilder 中。
+等待请求： gRPC 框架的 I&#x2F;O 线程在后台监听新请求。
+创建 Reactor： 当一个 GetVersion 请求到来时，gRPC 框架会自动调用我们实现的 ControllerServiceImpl::GetVersion 方法。
+返回 Reactor： 我们在这个方法里 new 一个 GreeterReactor 对象并返回。我们只负责创建，不负责销毁。
+业务处理与响应： 在 GreeterReactor 的构造函数中，我们处理业务逻辑，填充 response，然后调用 Finish(Status::OK)。这个 Finish 调用是非阻塞的，它只是告诉 gRPC 框架：“我的活儿干完了，你可以把响应发出去了。”
+完成与销毁： 当 gRPC 框架真正将响应发送完毕，并完成了所有清理工作后，它会调用 GreeterReactor::OnDone()。我们在这个回调函数中，安全地 delete this，完成 Reactor 对象的生命周期闭环。
+
+
+扩展：如何实现异步的流式服务？Reactor 模式对于流式 RPC 同样强大。让我们看看如何用它来实现一个服务端流式 RPC —— GetRealtimeLogs。
+// [新增] Reactor 类，用于处理一个 GetRealtimeLogs 请求的生命周期  class LogStreamReactor : public grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt; &#123;  public:  // 构造函数接收请求，并立即开始发送第一条日志  LogStreamReactor(const controllerStream::GetLogsRequest* request)  : request_(*request) // 保存请求的副本（如果需要的话）  &#123;  std::cout &lt;&lt; &quot;Client subscribed for logs (Async Reactor).&quot; &lt;&lt; std::endl;  // 启动第一次写入  SendLog();  &#125;    // 当流完成时（无论成功、失败或取消），此方法被调用      void OnDone() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: OnDone called. Cleaning up.&quot; &lt;&lt; std::endl;          // 在这里释放所有与此 Reactor 相关的资源          delete this;      &#125;    // 当客户端取消流时，此方法被调用      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: Client cancelled the request.&quot; &lt;&lt; std::endl;          // OnCancel 之后通常会调用 OnDone，所以主要清理逻辑放在 OnDone      &#125;    // 当上一次的 StartWrite() 操作完成时，此方法被调用      void OnWriteDone(bool ok) override &#123;          // &#x27;ok&#x27; 为 false 表示写入失败（例如，连接断开）          if (!ok) &#123;              std::cout &lt;&lt; &quot;LogStreamReactor: Failed to write to stream. Connection might be broken.&quot; &lt;&lt; std::endl;              // 不需要手动调用 Finish，当 OnWriteDone 返回后，gRPC 会自动处理清理              // 最终会调用 OnDone              return;          &#125;        // 检查是否还有更多日志要发送          if (log_counter_ &lt;= 10) &#123;              // 如果上一次写入成功，就继续发送下一条              SendLog();          &#125; else &#123;              // 所有日志都已发送完毕              std::cout &lt;&lt; &quot;LogStreamReactor: Finished sending all logs.&quot; &lt;&lt; std::endl;              // 发送一个 OK 状态来正常关闭流              Finish(grpc::Status::OK);          &#125;      &#125;private:  void SendLog() &#123;  // 准备下一条日志  log_entry_.set_timestamp(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));  log_entry_.set_level(&quot;INFO&quot;);  log_entry_.set_message(&quot;This is async log message number &quot; + std::to_string(log_counter_));        log_counter_++;        // 模拟日志生成的延迟          // 重要提示：在异步模型中，长时间的 sleep 会阻塞处理其他事件的线程！          // 在真实应用中，这里应该是快速的非阻塞操作。          // 为了演示，我们仍然使用 sleep，但要意识到它的影响。          std::this_thread::sleep_for(std::chrono::seconds(1));        // 发起异步写入操作。我们传递 log_entry_ 的地址。          // gRPC 会在 OnWriteDone 被调用之前保证这个地址是有效的。          StartWrite(&amp;log_entry_);      &#125;    const controllerStream::GetLogsRequest request_;      controllerStream::LogEntry log_entry_; // 重用 LogEntry 对象以避免重复分配内存      int log_counter_ = 1;  &#125;;class ControllerStreamServiceImpl final : public controllerStream::Controller::CallbackService &#123;  // 注意：服务类继承自 ...::CallbackService 而不是 ...::Service    // 实现 GetRealtimeLogs 方法      // 它不再返回 Status，而是返回一个 ServerWriteReactor*      grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt;* GetRealtimeLogs(          grpc::CallbackServerContext* context,          const controllerStream::GetLogsRequest* request) override &#123;        // 创建一个新的 Reactor 来处理这个请求          // gRPC 框架将拥有这个指针的所有权，并在 OnDone 中由我们自己 delete          return new LogStreamReactor(request);      &#125;  &#125;;
+
+第三步：启动异步服务器最令人惊喜的是，启动一个异步服务器的主函数部分，与同步服务器几乎一模一样，甚至更简单。我们不再需要自己管理线程池。
+C++
+/ server_main.cc  void RunServer() &#123;  std::string server_address(&quot;0.0.0.0:50051&quot;);  // 这里根据你的服务类型选择正确的实现类，例如 ControllerServiceImpl 或 ControllerStreamServiceImpl  ControllerServiceImpl service;    grpc::ServerBuilder builder;      builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());    // 注册回调服务（异步模式）      builder.RegisterService(&amp;service);    std::unique_ptr&lt;grpc::Server&gt; server(builder.BuildAndStart());      std::cout &lt;&lt; &quot;Async Reactor Server listening on &quot; &lt;&lt; server_address &lt;&lt; std::endl;    server-&gt;Wait(); // 阻塞主线程，等待服务器关闭  &#125;int main(int argc, char** argv) &#123;  RunServer();  return 0;  &#125;
+
+gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事件分发的所有复杂工作。我们只需要提供一个个小巧、独立的 Reactor 对象来处理具体的业务逻辑即可。
+
+个人思考：新旧异步模型的对比与 Reactor 的优雅如果你之前了解过 gRPC 旧的、基于 CompletionQueue 和 void* tag 的异步 API，你会发现这个新的 Callback API (Reactor 模式) 是一个巨大的进步：
+
+告别手动状态管理： 在旧模型中，我们需要在一个庞大的 switch(tag) 语句中手动管理一次 RPC 的不同阶段（CREATE, PROCESS, FINISH），非常容易出错。现在，这些状态被封装在了 Reactor 对象内部，逻辑更清晰。
+无需手动管理 CompletionQueue： 我们不再需要编写 while(cq_-&gt;Next()) 这样的事件循环，gRPC 框架为我们代劳了。
+更符合现代 C++ 的回调思想： 这种“注册回调，等待框架调用”的模式，与 muduo 的事件处理、Qt 的信号槽都非常相似，更符合现代 C++ 开发者的直觉。
+
+
+总结与展望本文，我们迈出了从“能用”到“高性能”的关键一步。通过学习和实践 gRPC 最新的 Callback API (Reactor 模式)，我们构建了一个真正意义上的异步服务端。
+我们深入理解了如何通过实现 ServerUnaryReactor 和 ServerWriteReactor，将业务逻辑与 gRPC 的事件循环解耦，从而让我们的服务能够用少量的线程处理海量的并发请求。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>grpc实践之路:05.服务端与客户端的连接</title>
     <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
     <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
@@ -1375,66 +1435,6 @@ gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RP
 服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
 
 正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
-]]></content>
-      <categories>
-        <category>动手实践-三方库</category>
-        <category>grpc</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>grpc</tag>
-        <tag>进程间通信</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>grpc实践之路:04.grpc异步回调接口的使用</title>
-    <url>/2025/07/14/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
-    <content><![CDATA[前言在之前的文章中，我们实现的服务端模型都有一个共同的特点：它们是同步的。无论是 Unary RPC 还是流式 RPC，我们的服务端实现在 RPC 处理函数中都会阻塞，直到该次请求处理完成。这意味着，为了同时服务多个客户端，gRPC 的同步服务器不得不在其内部的线程池中为每一个并发请求分配一个线程。这种“一个请求一个线程”的模式，在并发量不高时简单有效。但试想一下，当成千上万的客户端同时涌入时，服务器的线程资源会被迅速耗尽，系统将不堪重负。
-一个真正的高性能服务，必须具备“一人多能”的本领——用少量的核心线程，处理成千上万的并发请求。要做到这一点，我们必须拥抱异步编程。
-本文，我们将深入 gRPC C++ 最核心、也是官方最新推荐的异步服务模型——Callback API（回调式 API）。它也被称为“Reactor 模式”，因为它与我们熟悉的 muduo 等网络库的事件驱动思想如出一辙。我们将通过实践，构建一个真正意义上的高性能 gRPC 异步服务。
-
-
-异步服务的核心理念：事件、队列与回调在深入代码之前，我们必须理解 gRPC 异步模型的三个核心概念：
-
-事件驱动 (Event-Driven): 服务器不再为每个请求阻塞等待，而是以非阻塞的方式发起所有操作（如接收请求、读写数据、发送响应）。它只关心“事件”的发生，比如“一个新的 RPC 请求到来了”、“数据发送完成了”。
-完成队列 (grpc::ServerCompletionQueue): 这是 gRPC C++ 异步编程的心脏。所有异步操作的“完成事件”最终都会被放入这个队列中。我们的工作线程只需要从这个队列里取出已完成的事件进行处理即可。
-回调 (Callback): 对于每一个完成的事件，我们应该执行什么操作？这就是通过回调函数来定义的。
-
-幸运的是，从 gRPC v1.60 版本开始，官方引入了全新的 Callback API，极大地简化了异步服务的编写。我们不再需要手动管理复杂的完成队列和“标签”，而是可以通过实现一系列的回调函数来响应事件。
-第一步：重新认识服务实现在 Callback API 模式下，我们的服务实现类依然继承自 gRPC 生成的 Service 基类，但有一个关键区别：我们不再直接重写 RPC 方法本身，而是重写一个对应的 Request + RPC 方法名 的方法。
-这个方法的作用，不再是处理业务逻辑，而是创建一个“反应堆 (Reactor)”对象，并将其返回给 gRPC 框架。
-我们以一个简单的 Unary RPC 为例：
-// server.cc (新的单次 RPC 服务实现)  #**include** &lt;iostream&gt;  #**include** &lt;memory&gt;  #**include** &lt;string&gt;  #**include** &lt;thread&gt;  #**include** &lt;chrono&gt;#**include** &lt;grpcpp/grpcpp.h&gt;  #**include** &quot;controller.grpc.pb.h&quot; // 假设这是你 gRPC 生成的头文件// 1. 我们需要为每个 RPC 方法创建一个 Reactor 类  //    这个类继承自 gRPC 提供的 ServerUnaryReactor  class GreeterReactor : public grpc::ServerUnaryReactor &#123;  public:  // 构造函数接收请求和响应对象  GreeterReactor(const controller::GetVersionRequest* request, controller::GetVersionResponse* response)  : request_(request), response_(response) &#123;        // 在这里可以开始处理业务逻辑          std::cout &lt;&lt; &quot;Reactor created. Processing GetVersion request...&quot; &lt;&lt; std::endl;          std::string version_str = &quot;Async Core Service v2.0.0&quot;;          response_-&gt;set_version(version_str);        // 当业务逻辑处理完毕，调用 Finish() 告诉 gRPC 框架可以发送响应了          Finish(grpc::Status::OK);      &#125;    // 2. 当整个 RPC 调用（包括响应发送）彻底完成时，gRPC 会调用这个方法      void OnDone() override &#123;          std::cout &lt;&lt; &quot;Reactor is done. Deleting self.&quot; &lt;&lt; std::endl;          // 在这里，我们可以安全地释放资源，比如删除自身          delete this;      &#125;    // 你也可以实现其他回调，如 OnCancel 或 OnSendInitialMetadataDone      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnCancel&quot; &lt;&lt; std::endl;      &#125;    void OnSendInitialMetadataDone(bool ok) override &#123;          std::cout &lt;&lt; &quot;GreeterReactor::OnSendInitialMetadataDone: &quot; &lt;&lt; (ok ? &quot;Success&quot; : &quot;Failed&quot;) &lt;&lt; std::endl;      &#125;private:  const controller::GetVersionRequest* request_;  controller::GetVersionResponse* response_;  &#125;;class ControllerServiceImpl final : public controller::Controller::CallbackService &#123;  public:  // 3. 注意！我们不再重写 GetVersion，而是重写返回 ServerUnaryReactor* 的 GetVersion 方法  //    （对于 CallbackService，它直接对应 RPC 方法名）。  grpc::ServerUnaryReactor* GetVersion(grpc::CallbackServerContext* context,  const controller::GetVersionRequest* request,  controller::GetVersionResponse* response) override &#123;  // 这个方法的核心职责就是：创建一个新的 Reactor 实例，然后返回它  // gRPC 框架会接管这个 Reactor 的生命周期  return new GreeterReactor(request, response);  &#125;  &#125;;
-
-
-第二步：理解新的异步工作流这个基于 Reactor 的新模型，其工作流程是这样的：
-
-注册服务： 我们将 ControllerServiceImpl 的一个实例注册到 ServerBuilder 中。
-等待请求： gRPC 框架的 I&#x2F;O 线程在后台监听新请求。
-创建 Reactor： 当一个 GetVersion 请求到来时，gRPC 框架会自动调用我们实现的 ControllerServiceImpl::GetVersion 方法。
-返回 Reactor： 我们在这个方法里 new 一个 GreeterReactor 对象并返回。我们只负责创建，不负责销毁。
-业务处理与响应： 在 GreeterReactor 的构造函数中，我们处理业务逻辑，填充 response，然后调用 Finish(Status::OK)。这个 Finish 调用是非阻塞的，它只是告诉 gRPC 框架：“我的活儿干完了，你可以把响应发出去了。”
-完成与销毁： 当 gRPC 框架真正将响应发送完毕，并完成了所有清理工作后，它会调用 GreeterReactor::OnDone()。我们在这个回调函数中，安全地 delete this，完成 Reactor 对象的生命周期闭环。
-
-
-扩展：如何实现异步的流式服务？Reactor 模式对于流式 RPC 同样强大。让我们看看如何用它来实现一个服务端流式 RPC —— GetRealtimeLogs。
-// [新增] Reactor 类，用于处理一个 GetRealtimeLogs 请求的生命周期  class LogStreamReactor : public grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt; &#123;  public:  // 构造函数接收请求，并立即开始发送第一条日志  LogStreamReactor(const controllerStream::GetLogsRequest* request)  : request_(*request) // 保存请求的副本（如果需要的话）  &#123;  std::cout &lt;&lt; &quot;Client subscribed for logs (Async Reactor).&quot; &lt;&lt; std::endl;  // 启动第一次写入  SendLog();  &#125;    // 当流完成时（无论成功、失败或取消），此方法被调用      void OnDone() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: OnDone called. Cleaning up.&quot; &lt;&lt; std::endl;          // 在这里释放所有与此 Reactor 相关的资源          delete this;      &#125;    // 当客户端取消流时，此方法被调用      void OnCancel() override &#123;          std::cout &lt;&lt; &quot;LogStreamReactor: Client cancelled the request.&quot; &lt;&lt; std::endl;          // OnCancel 之后通常会调用 OnDone，所以主要清理逻辑放在 OnDone      &#125;    // 当上一次的 StartWrite() 操作完成时，此方法被调用      void OnWriteDone(bool ok) override &#123;          // &#x27;ok&#x27; 为 false 表示写入失败（例如，连接断开）          if (!ok) &#123;              std::cout &lt;&lt; &quot;LogStreamReactor: Failed to write to stream. Connection might be broken.&quot; &lt;&lt; std::endl;              // 不需要手动调用 Finish，当 OnWriteDone 返回后，gRPC 会自动处理清理              // 最终会调用 OnDone              return;          &#125;        // 检查是否还有更多日志要发送          if (log_counter_ &lt;= 10) &#123;              // 如果上一次写入成功，就继续发送下一条              SendLog();          &#125; else &#123;              // 所有日志都已发送完毕              std::cout &lt;&lt; &quot;LogStreamReactor: Finished sending all logs.&quot; &lt;&lt; std::endl;              // 发送一个 OK 状态来正常关闭流              Finish(grpc::Status::OK);          &#125;      &#125;private:  void SendLog() &#123;  // 准备下一条日志  log_entry_.set_timestamp(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));  log_entry_.set_level(&quot;INFO&quot;);  log_entry_.set_message(&quot;This is async log message number &quot; + std::to_string(log_counter_));        log_counter_++;        // 模拟日志生成的延迟          // 重要提示：在异步模型中，长时间的 sleep 会阻塞处理其他事件的线程！          // 在真实应用中，这里应该是快速的非阻塞操作。          // 为了演示，我们仍然使用 sleep，但要意识到它的影响。          std::this_thread::sleep_for(std::chrono::seconds(1));        // 发起异步写入操作。我们传递 log_entry_ 的地址。          // gRPC 会在 OnWriteDone 被调用之前保证这个地址是有效的。          StartWrite(&amp;log_entry_);      &#125;    const controllerStream::GetLogsRequest request_;      controllerStream::LogEntry log_entry_; // 重用 LogEntry 对象以避免重复分配内存      int log_counter_ = 1;  &#125;;class ControllerStreamServiceImpl final : public controllerStream::Controller::CallbackService &#123;  // 注意：服务类继承自 ...::CallbackService 而不是 ...::Service    // 实现 GetRealtimeLogs 方法      // 它不再返回 Status，而是返回一个 ServerWriteReactor*      grpc::ServerWriteReactor&lt;controllerStream::LogEntry&gt;* GetRealtimeLogs(          grpc::CallbackServerContext* context,          const controllerStream::GetLogsRequest* request) override &#123;        // 创建一个新的 Reactor 来处理这个请求          // gRPC 框架将拥有这个指针的所有权，并在 OnDone 中由我们自己 delete          return new LogStreamReactor(request);      &#125;  &#125;;
-
-第三步：启动异步服务器最令人惊喜的是，启动一个异步服务器的主函数部分，与同步服务器几乎一模一样，甚至更简单。我们不再需要自己管理线程池。
-C++
-/ server_main.cc  void RunServer() &#123;  std::string server_address(&quot;0.0.0.0:50051&quot;);  // 这里根据你的服务类型选择正确的实现类，例如 ControllerServiceImpl 或 ControllerStreamServiceImpl  ControllerServiceImpl service;    grpc::ServerBuilder builder;      builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());    // 注册回调服务（异步模式）      builder.RegisterService(&amp;service);    std::unique_ptr&lt;grpc::Server&gt; server(builder.BuildAndStart());      std::cout &lt;&lt; &quot;Async Reactor Server listening on &quot; &lt;&lt; server_address &lt;&lt; std::endl;    server-&gt;Wait(); // 阻塞主线程，等待服务器关闭  &#125;int main(int argc, char** argv) &#123;  RunServer();  return 0;  &#125;
-
-gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事件分发的所有复杂工作。我们只需要提供一个个小巧、独立的 Reactor 对象来处理具体的业务逻辑即可。
-
-个人思考：新旧异步模型的对比与 Reactor 的优雅如果你之前了解过 gRPC 旧的、基于 CompletionQueue 和 void* tag 的异步 API，你会发现这个新的 Callback API (Reactor 模式) 是一个巨大的进步：
-
-告别手动状态管理： 在旧模型中，我们需要在一个庞大的 switch(tag) 语句中手动管理一次 RPC 的不同阶段（CREATE, PROCESS, FINISH），非常容易出错。现在，这些状态被封装在了 Reactor 对象内部，逻辑更清晰。
-无需手动管理 CompletionQueue： 我们不再需要编写 while(cq_-&gt;Next()) 这样的事件循环，gRPC 框架为我们代劳了。
-更符合现代 C++ 的回调思想： 这种“注册回调，等待框架调用”的模式，与 muduo 的事件处理、Qt 的信号槽都非常相似，更符合现代 C++ 开发者的直觉。
-
-
-总结与展望本文，我们迈出了从“能用”到“高性能”的关键一步。通过学习和实践 gRPC 最新的 Callback API (Reactor 模式)，我们构建了一个真正意义上的异步服务端。
-我们深入理解了如何通过实现 ServerUnaryReactor 和 ServerWriteReactor，将业务逻辑与 gRPC 的事件循环解耦，从而让我们的服务能够用少量的线程处理海量的并发请求。
 ]]></content>
       <categories>
         <category>动手实践-三方库</category>
@@ -1944,6 +1944,69 @@ readFd 的设计有几个显著优点：
       </tags>
   </entry>
   <entry>
+    <title>spdlog源码阅读:01.异步机制解析</title>
+    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
+    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
+
+spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
+跨平台： 支持windows,linux,android等多个平台
+功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
+阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
+
+从demo出发：追踪日志消息的产生，处理和输出路径
+梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
+分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
+可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
+
+以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
+注：本文分析的源码为spdlog的v1.15.1版本
+spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
+我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
+日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
+日志生产
+logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
+log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
+在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
+在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
+
+日志消费
+线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
+在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
+spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
+以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
+上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
+
+可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
+强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
+spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
+//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
+线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
+spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
+thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
+
+主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
+formatter：格式化日志消息的基类
+sink: 日志输出的基类
+spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
+mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
+template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
+通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
+一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>muduo源码剖析:05.基于对象与面向对象的设计</title>
     <url>/2025/06/12/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:05.%E5%9F%BA%E4%BA%8E%E5%AF%B9%E8%B1%A1%E4%B8%8E%E9%9D%A2%E5%90%91%E5%AF%B9%E8%B1%A1%E7%9A%84%E8%AE%BE%E8%AE%A1/</url>
     <content><![CDATA[前言：在前几篇文章中，我们依次剖析了：
@@ -2047,69 +2110,6 @@ RAII + 智能指针是 C++ 的精髓
         <tag>C++</tag>
         <tag>muduo</tag>
         <tag>网络库</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>spdlog源码阅读:01.异步机制解析</title>
-    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
-    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
-
-spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
-跨平台： 支持windows,linux,android等多个平台
-功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
-阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
-
-从demo出发：追踪日志消息的产生，处理和输出路径
-梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
-分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
-可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
-
-以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
-注：本文分析的源码为spdlog的v1.15.1版本
-spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
-我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
-日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
-日志生产
-logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
-log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
-在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
-在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
-
-日志消费
-线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
-在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
-spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
-以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
-上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
-
-可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
-强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
-spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
-//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
-线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
-spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
-thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
-
-主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
-formatter：格式化日志消息的基类
-sink: 日志输出的基类
-spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
-mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
-template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
-通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
-一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>spdlog</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>spdlog</tag>
-        <tag>日志系统</tag>
       </tags>
   </entry>
   <entry>
@@ -2621,6 +2621,42 @@ spdlog 吞吐量 (条&#x2F;秒)
       </tags>
   </entry>
   <entry>
+    <title>生活中的随想:从两则故事看婚姻的本质</title>
+    <url>/2026/02/05/thinks/%E5%A9%9A%E5%A7%BB%E7%9A%84%E7%9C%9F%E7%9B%B8/</url>
+    <content><![CDATA[引言通过两个故事，我们可以重新审视婚姻的本质。这两个故事都揭示了婚姻关系中一些被掩盖的真相，帮助我们理解婚姻关系的真正支柱是什么。
+第一个故事：王六儿与韩道国王六儿和韩道国是《金瓶梅》中的一对夫妻，他们是社会学意义上的夫妻。
+韩道国是西门庆的一个伙计，他的妻子王六儿被西门庆看上了，并且勾搭上了。韩道国并不生气，反而支持这件事。王六儿也发挥自己的长处与能力，极尽地讨好西门庆。韩道国也为两人制造方便，甚至回家的时候，如果知道西门庆在里面，会在外面待一会再回来。
+可以说是很有眼力见，两夫妻可以说都是极尽发挥自己各自的长处，让大官人开心。
+最终，他们本身也都获得了好处：两个人获得了租住的房子，韩道国升了职，当上了某个相关公司的负责人，能够得到不少实惠。最后，在西门庆快死的时候，还从西门庆那里坑了一千两的货款。
+第二个故事：朱四的拉帮套在《情债》中，姜老七身体不好，需要有一个壮男人帮衬，于是选中了朱四，开始了拉帮套。
+等到姜家家境好了之后，姜七就把朱四挤兑走了。
+婚姻的本质：战略同盟从这两个故事，我想思考的是：婚姻的本质究竟是什么？
+我认为不是爱情，不是性上的忠诚，而是为了生存以及获得更多生存资源的核心利益的战略同盟。
+这两个故事都是有原型的。拉帮套或者类似卖妻求荣这种事，实际上是屡见不鲜的。实际上就是通过让夫妻中的女性出卖性本身，男性提供”被上位者践踏尊严”的感受的组合方式，换取物质资源，改善夫妻组成的团体的生存条件。
+否定那些经不起质疑的支柱我们将那些可以否定的、经不起质疑的东西否定掉之后，就能得到我们想要的，一个事物的真正支柱。
+第一，所谓的爱情既然夫妻关系存在，还是能够出卖，或者说现代社会，其实很多人没有什么感情基础，依旧能组成婚姻，那么就证明，爱情并不是支柱。
+第二，性的忠诚更容易反驳了。既然拉帮套都能存在，那么显而易见的就否定了性忠诚作为婚姻支柱的说法。
+真正的支柱：战略同盟那么实际上应该是什么呢？应该说，就是为了获取可靠的战略盟友，获取攻守同盟。
+还是从王六儿与韩道国的事出发，王六儿甚至拒绝了入府的事，为什么？夫妻才是长久计，因为她知道，和韩道国才是利益同盟。可以说，他们通过通力合作，大大改善了他们的生存状况，二人最后还一起合伙坑了西门庆的一大笔钱，确实在为二人共同的利益做考量。
+拉帮套的故事，是为了什么呢？也是为了让他们家的生活条件改善。所谓的日子过不下去了，找个人帮衬，其实就是妻子提供服务，招人干活。后来，不是身体好了就踢朱四出局了吗？
+包括大下岗时期的很多东北工人，拉着妻子，自己在外面抽烟，不也是这种拉帮套的一种体现？
+所以说，就是如此。
+为什么某些事会让夫妻关系出现重大裂痕出轨其实，不单单是所谓感情与身体的不忠，更多的是另一个人在一段合作关系中被骗，自己的核心利益得不到保证的一种担忧。
+愤怒与生气的是，自己的合伙人，拉着另一个局外人可能在掏空自己的付出，使得自己的权益得不到保证。相当于分红被骗了。
+伏地魔为什么普通夫妻如果一方对自己的家人付出更多，往往会引发伴侣的不满？核心问题就是，合伙人的权益没有受到保证。
+这就是为什么，如果一方非常富有，另一个仅提供情绪价值的时候，可能比较稳固。不是更加慷慨，是因为拥有的更多。
+生孩子仅仅是因为双方通过共同抚育一个后代这个长期项目，并且可能获取更多收益的项目，在通过长期的合作关系后，两人合作比较稳固了，信任的基础以及搭建了，建立更加牢靠的合作关系。
+结语所以很多时候，很多人选择不进入婚姻，是因为认为这种合作方式，无法对自己的生存进行有效帮助的选择而已。
+这就是我对婚姻的看法。
+]]></content>
+      <categories>
+        <category>随想</category>
+      </categories>
+      <tags>
+        <tag>个人成长</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>spdlog源码阅读:06.spdlog中的设计模式</title>
     <url>/2025/06/19/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:06.spdlog%E4%B8%AD%E7%9A%84%E8%AE%BE%E8%AE%A1%E6%A8%A1%E5%BC%8F/</url>
     <content><![CDATA[前言：从功能到架构，探寻 spdlog 的设计之美在本系列之前的文章中，我们深入剖析了 spdlog 的异步机制、核心组件，并且尝试拓展实现一个压缩sink，还尝试进行了性能优化实践。
@@ -2893,115 +2929,6 @@ LOG 宏展开成了 fprintf 调用，自动带上了 __FILE__ 和 __LINE__。
       </tags>
   </entry>
   <entry>
-    <title>从源码到进程:02.目标文件的生成</title>
-    <url>/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/</url>
-    <content><![CDATA[前言在之前的文章中，我们初步讲解了从源码到进程这个主题的预处理部分，在这篇文章中，我们将讲解目标文件(.o)的生成过程。
-通过了解 .o文件，可以帮助我们:
-
-定位 undefined reference &#x2F; multiple definition 等链接错误的根源
-理解重定位失败与对齐问题导致的运行时崩溃
-掌控编译器、汇编器与链接器之间的契约（ABI &#x2F; ELF &#x2F; linker script）。
-为什么很多编码规范中，不允许在头文件中定义或者声明全局变量
-
-核心理论什么是目标文件？目标文件（.o）是编译器将源码转化为机器码的中间产物，遵循 ELF（Executable and Linkable Format）格式。它包含代码、数据和元信息（如符号表、重定位表），但还不是可执行程序，需要链接器进一步处理。生成目标文件是编译过程的第三步，位于以下流程中：
-
-预处理：展开宏和头文件，生成 .i 文件。
-编译：将源码转为汇编代码（.s 文件），并优化。
-汇编：将汇编代码转为机器码，打包为 .o 文件。
-链接：合并多个 .o 文件和库，生成可执行文件。
-
-ELF文件与 .o 文件的核心结构在 Linux 上，.o 文件通常遵循 ELF 规范。一个典型的 ELF 可重定位文件包含：
-
-ELF Header：文件起始，包含魔数、位宽（ELF32&#x2F;ELF64）、文件类型（REL 表示 relocatable）等。
-Section Header Table：节区（section）的目录，每个节区都有名字、类型、大小、对齐等属性。
-Sections（节区）：实际的数据或元数据，常见节区有：
-.text：机器指令（函数体）
-.rodata：只读常量（字符串字面量、常量数组）
-.data：已初始化全局&#x2F;静态变量
-.bss：未初始化全局&#x2F;静态变量（NOBITS）
-.symtab &#x2F; .strtab：符号表与字符串表
-.rela.* &#x2F; .rel.*：重定位表（记录需要在链接或加载时修正的地址）
-.debug_*：DWARF 调试信息（可选）
-
-
-
-这种分节存储将代码、可读数据、可写数据和元信息解耦，使链接器可以按节合并、重定位，并允许调试器与性能分析工具独立读取所需信息。
-符号表（Symbol Table）与名字修饰符号表记录每个符号（函数、变量、文件名）在目标文件中的属性：名称、值（在可重定位文件中通常为节内偏移或 0）、大小、类型（FUNC&#x2F;OBJECT）、绑定（LOCAL&#x2F;GLOBAL&#x2F;WEAK）与所属节（Ndx）。
-
-LOCAL 符号仅在当前翻译单元可见。
-GLOBAL 符号可被链接器解析并跨文件引用。
-WEAK 符号允许被其它强符号覆盖（常用于库或可选实现）。
-
-C++ 采用名字修饰（name mangling）将类型信息编码到符号名中，链接器基于这些 mangled names 做匹配（比如 _Z3foov）。
-排障技巧：使用 nm, readelf -s, objdump -t 查看符号属性；注意 UND（未定义）、ABS（绝对符号）、T（text 段）等标志。
-重定位（Relocation）机制.o 文件不是可执行镜像，许多地址（函数调用、全局变量地址、常量地址等）在编译后仍然是相对或占位的。重定位表记录哪些位置需要在链接（静态链接）或加载（动态加载&#x2F;内核模块）时修正。
-重定位包含三要素：
-
-偏移（offset）
-符号（symbol）
-类型（relocation type）。
-
-不同架构有不同的重定位类型（如 x86_64 的 R_X86_64_PC32 &#x2F; R_X86_64_64 等），决定链接器如何将符号地址写入目标位置（绝对&#x2F;相对&#x2F;高&#x2F;低半字等）。
-重定位错误会导致页错误、未知指令或控制流错误；对于位置无关代码（PIC &#x2F; PIE）与内核模块，正确的重定位处理尤其关键。
-就像之前一直说的，生成源码的四个步骤中。汇编器负责把汇编代码的标签变为节内偏移并产生重定位条目（如果引用外部符号则不填地址）。这正是 .o 成为“部分实现 + 重定位数据”的原因。
-实操演示// object.cppint g_var_init = 10;int g_var_uninit;static int l_var_init = 15;static int l_var_uninit;extern void extern_func();int main()&#123;  extern_func();  return 0;&#125;
-
-通过如下命令生成目标文件
-g++ -c object.cpp -o object.o
-
-通过如下命令可以看到elf的头部
-readelf -h object.o
-发现，存在一些魔数，标记文件的真正类型；文件的类型是可重定位文件，因为目标文件不是真正的可执行程序，需要链接器将多个目标文件链接在一起之后，为每个符号找到真正的地址才是可以运行
-通过如下命令查看节区表
-readelf -S object.o
-
-其中 .data .bss 段分别存储着初始化和未初始化的 全局变量与静态变量，大小分别都是8个字节，因为都是两个int变量。
-可以看到 .bss 与 .comment的偏移量，也就是在文件中的实际读取位置都是0000005c。 是因为.bss 段在文件中是不占大小的，只是运行时在内存中占有大小，并且初始化为0；
-此外各个段的地址全是 0，因为是可重定位文件，此时分配没有意义。
-通过如下命令查看符号表
-readelf -s object.o
-
-可以看见,_ZL10l_var_init,_ZL12l_var_uninit,g_var_init,g_var_uninit,_Z11extern_funcv 这样的几个符号。
-其中_ZL10l_var_init,g_var_init的Ndx都是3，因为他们都是在 .data 段, Value值分别是0和4，是因为他们在.data段的位置偏移分别是0和4。同理_ZL12l_var_uninit,g_var_uninit的Ndx都是4，Value值分别是0和4，因为他们在 .bss 段，偏移0个字节和4个字节之后，分别读取4个字节的大小就是对应点的变量的值。
-_Z11extern_funcv 这个符号的 UND是因为，这是个外部符号，需要再链接确定。
-同时，看到 _ZL10l_var_init，g_var_init的Bind类型分别是 local与global，是因为static这个标识符限定了这个符号本身是局部的，只在当前目标文件可用，链接器是访问不了的。
-通过如下命令查看重定位表
-readelf -r object.o
-
-_Z11extern_funcv 这个符号，链接器会在连接时候修正，实现call extern_func这个函数的操作
-常用命令readelf -h file.o        # 查看 ELF 头readelf -S file.o        # 列出节区readelf -s file.o        # 符号表readelf -r file.o        # 重定位表nm file.o                # 简易符号表（T/U/D 等）objdump -d file.o        # 反汇编objcopy --strip-debug in.o out.o   # 去除调试段strip   file.o           # 去符号表与调试信息addr2line -e vmlinux &lt;addr&gt;  # 将地址转为 file:line（对 vmlinux）
-
-总结
-.o 文件是 可重定位文件，遵循 ELF 格式。
-
-它包含 节区（代码&#x2F;数据&#x2F;元信息）、符号表 和 重定位表。
-
-通过符号表和重定位机制，编译器和链接器能够协同工作，把多个 .o 文件合并为一个可执行程序。
-
-理解 .o 文件能帮助我们解决：
-
-链接错误（undefined reference &#x2F; multiple definition）；
-符号可见性问题（static &#x2F; global &#x2F; weak）；
-调试信息与 strip 的作用；
-为什么不应该在头文件中定义全局变量。
-
-
-
-一句话：
-
-目标文件 (.o) 是源码到可执行程序的关键中间形态，它承载了机器码、符号与重定位信息，是编译器与链接器之间的桥梁。
-
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>从程序到进程</category>
-      </categories>
-      <tags>
-        <tag>linux</tag>
-        <tag>C++</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>从源码到进程:03.静态库的生成与使用</title>
     <url>/2025/10/09/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/03.%E9%9D%99%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8/</url>
     <content><![CDATA[从目标文件到静态库：符号索引与链接的秘密前言在前一篇文章中，我们讲解了目标文件（Object File, .o）的生成过程，理解了编译器如何将源代码翻译成机器可读的中间产物，以及目标文件的内部结构。
@@ -3186,6 +3113,115 @@ ar 与 ranlib 协作生成符号索引表，使链接器能快速定位符号；
 
 
 理解静态库机制，是深入掌握 Linux 编译系统与调试体系的关键。
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>从程序到进程</category>
+      </categories>
+      <tags>
+        <tag>linux</tag>
+        <tag>C++</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>从源码到进程:02.目标文件的生成</title>
+    <url>/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/</url>
+    <content><![CDATA[前言在之前的文章中，我们初步讲解了从源码到进程这个主题的预处理部分，在这篇文章中，我们将讲解目标文件(.o)的生成过程。
+通过了解 .o文件，可以帮助我们:
+
+定位 undefined reference &#x2F; multiple definition 等链接错误的根源
+理解重定位失败与对齐问题导致的运行时崩溃
+掌控编译器、汇编器与链接器之间的契约（ABI &#x2F; ELF &#x2F; linker script）。
+为什么很多编码规范中，不允许在头文件中定义或者声明全局变量
+
+核心理论什么是目标文件？目标文件（.o）是编译器将源码转化为机器码的中间产物，遵循 ELF（Executable and Linkable Format）格式。它包含代码、数据和元信息（如符号表、重定位表），但还不是可执行程序，需要链接器进一步处理。生成目标文件是编译过程的第三步，位于以下流程中：
+
+预处理：展开宏和头文件，生成 .i 文件。
+编译：将源码转为汇编代码（.s 文件），并优化。
+汇编：将汇编代码转为机器码，打包为 .o 文件。
+链接：合并多个 .o 文件和库，生成可执行文件。
+
+ELF文件与 .o 文件的核心结构在 Linux 上，.o 文件通常遵循 ELF 规范。一个典型的 ELF 可重定位文件包含：
+
+ELF Header：文件起始，包含魔数、位宽（ELF32&#x2F;ELF64）、文件类型（REL 表示 relocatable）等。
+Section Header Table：节区（section）的目录，每个节区都有名字、类型、大小、对齐等属性。
+Sections（节区）：实际的数据或元数据，常见节区有：
+.text：机器指令（函数体）
+.rodata：只读常量（字符串字面量、常量数组）
+.data：已初始化全局&#x2F;静态变量
+.bss：未初始化全局&#x2F;静态变量（NOBITS）
+.symtab &#x2F; .strtab：符号表与字符串表
+.rela.* &#x2F; .rel.*：重定位表（记录需要在链接或加载时修正的地址）
+.debug_*：DWARF 调试信息（可选）
+
+
+
+这种分节存储将代码、可读数据、可写数据和元信息解耦，使链接器可以按节合并、重定位，并允许调试器与性能分析工具独立读取所需信息。
+符号表（Symbol Table）与名字修饰符号表记录每个符号（函数、变量、文件名）在目标文件中的属性：名称、值（在可重定位文件中通常为节内偏移或 0）、大小、类型（FUNC&#x2F;OBJECT）、绑定（LOCAL&#x2F;GLOBAL&#x2F;WEAK）与所属节（Ndx）。
+
+LOCAL 符号仅在当前翻译单元可见。
+GLOBAL 符号可被链接器解析并跨文件引用。
+WEAK 符号允许被其它强符号覆盖（常用于库或可选实现）。
+
+C++ 采用名字修饰（name mangling）将类型信息编码到符号名中，链接器基于这些 mangled names 做匹配（比如 _Z3foov）。
+排障技巧：使用 nm, readelf -s, objdump -t 查看符号属性；注意 UND（未定义）、ABS（绝对符号）、T（text 段）等标志。
+重定位（Relocation）机制.o 文件不是可执行镜像，许多地址（函数调用、全局变量地址、常量地址等）在编译后仍然是相对或占位的。重定位表记录哪些位置需要在链接（静态链接）或加载（动态加载&#x2F;内核模块）时修正。
+重定位包含三要素：
+
+偏移（offset）
+符号（symbol）
+类型（relocation type）。
+
+不同架构有不同的重定位类型（如 x86_64 的 R_X86_64_PC32 &#x2F; R_X86_64_64 等），决定链接器如何将符号地址写入目标位置（绝对&#x2F;相对&#x2F;高&#x2F;低半字等）。
+重定位错误会导致页错误、未知指令或控制流错误；对于位置无关代码（PIC &#x2F; PIE）与内核模块，正确的重定位处理尤其关键。
+就像之前一直说的，生成源码的四个步骤中。汇编器负责把汇编代码的标签变为节内偏移并产生重定位条目（如果引用外部符号则不填地址）。这正是 .o 成为“部分实现 + 重定位数据”的原因。
+实操演示// object.cppint g_var_init = 10;int g_var_uninit;static int l_var_init = 15;static int l_var_uninit;extern void extern_func();int main()&#123;  extern_func();  return 0;&#125;
+
+通过如下命令生成目标文件
+g++ -c object.cpp -o object.o
+
+通过如下命令可以看到elf的头部
+readelf -h object.o
+发现，存在一些魔数，标记文件的真正类型；文件的类型是可重定位文件，因为目标文件不是真正的可执行程序，需要链接器将多个目标文件链接在一起之后，为每个符号找到真正的地址才是可以运行
+通过如下命令查看节区表
+readelf -S object.o
+
+其中 .data .bss 段分别存储着初始化和未初始化的 全局变量与静态变量，大小分别都是8个字节，因为都是两个int变量。
+可以看到 .bss 与 .comment的偏移量，也就是在文件中的实际读取位置都是0000005c。 是因为.bss 段在文件中是不占大小的，只是运行时在内存中占有大小，并且初始化为0；
+此外各个段的地址全是 0，因为是可重定位文件，此时分配没有意义。
+通过如下命令查看符号表
+readelf -s object.o
+
+可以看见,_ZL10l_var_init,_ZL12l_var_uninit,g_var_init,g_var_uninit,_Z11extern_funcv 这样的几个符号。
+其中_ZL10l_var_init,g_var_init的Ndx都是3，因为他们都是在 .data 段, Value值分别是0和4，是因为他们在.data段的位置偏移分别是0和4。同理_ZL12l_var_uninit,g_var_uninit的Ndx都是4，Value值分别是0和4，因为他们在 .bss 段，偏移0个字节和4个字节之后，分别读取4个字节的大小就是对应点的变量的值。
+_Z11extern_funcv 这个符号的 UND是因为，这是个外部符号，需要再链接确定。
+同时，看到 _ZL10l_var_init，g_var_init的Bind类型分别是 local与global，是因为static这个标识符限定了这个符号本身是局部的，只在当前目标文件可用，链接器是访问不了的。
+通过如下命令查看重定位表
+readelf -r object.o
+
+_Z11extern_funcv 这个符号，链接器会在连接时候修正，实现call extern_func这个函数的操作
+常用命令readelf -h file.o        # 查看 ELF 头readelf -S file.o        # 列出节区readelf -s file.o        # 符号表readelf -r file.o        # 重定位表nm file.o                # 简易符号表（T/U/D 等）objdump -d file.o        # 反汇编objcopy --strip-debug in.o out.o   # 去除调试段strip   file.o           # 去符号表与调试信息addr2line -e vmlinux &lt;addr&gt;  # 将地址转为 file:line（对 vmlinux）
+
+总结
+.o 文件是 可重定位文件，遵循 ELF 格式。
+
+它包含 节区（代码&#x2F;数据&#x2F;元信息）、符号表 和 重定位表。
+
+通过符号表和重定位机制，编译器和链接器能够协同工作，把多个 .o 文件合并为一个可执行程序。
+
+理解 .o 文件能帮助我们解决：
+
+链接错误（undefined reference &#x2F; multiple definition）；
+符号可见性问题（static &#x2F; global &#x2F; weak）；
+调试信息与 strip 的作用；
+为什么不应该在头文件中定义全局变量。
+
+
+
+一句话：
+
+目标文件 (.o) 是源码到可执行程序的关键中间形态，它承载了机器码、符号与重定位信息，是编译器与链接器之间的桥梁。
+
 ]]></content>
       <categories>
         <category>程序员的自我修养</category>
