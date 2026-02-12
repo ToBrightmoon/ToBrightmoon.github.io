@@ -212,6 +212,165 @@ mmap: 对那些“大且短命”的分配（如临时缓冲区），考虑绕�
       </tags>
   </entry>
   <entry>
+    <title>Linux下的内存管理:02.深入jemalloc,多线程内存分配器的结构与算法</title>
+    <url>/2025/11/07/Linux%E4%B8%8B%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/02.%E6%B7%B1%E5%85%A5%20jemalloc%EF%BC%9A%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E5%99%A8%E7%9A%84%E7%BB%93%E6%9E%84%E4%B8%8E%E7%AE%97%E6%B3%95/</url>
+    <content><![CDATA[前言在上一篇《从 malloc 到缺页中断》中，我们深入探索了 malloc 与内核的“垂直”交互：程序如何通过 brk&#x2F;mmap 申请虚拟内存（VMA），以及如何在第一次写入时触发“缺页中断”(Page Fault)，最终获得物理内存。
+在这篇文章中，我们将讲解jemalloc这个被redis，Firefox等著名项目默认使用的现代的内存分配器，了解这个项目是怎么在多线程情况下获取更高性能的分配效果。
+我们将从它的核心设计（数据结构+算法）出发，深入探究 jemalloc 使用什么样的数据结构来管理内存，以及在 malloc 和 free 时执行了怎样的算法流程。最终，我们将通过关键路径的源码，印证我们的理解。
+注:本文使用的是jemalloc-5.3.0版本
+快速上手:jemalloc的使用在我们深入内部之前，先看看怎么用它。
+jemalloc 的使用非常简单，它利用了 LD_PRELOAD 动态链接库预加载机制，可以“劫持”程序中所有的 malloc &#x2F; free &#x2F; calloc &#x2F; realloc 等调用。
+假设你已经编译安装了 jemalloc (通常会得到 libjemalloc.so.2 这样的文件)：
+# 编译你的程序（正常编译即可）  gcc -o my_app my_app.c# 运行时通过 LD_PRELOAD 强行使用 jemalloc  LD_PRELOAD=/path/to/libjemalloc.so.2 ./my_app
+
+程序代码将无需任何修改，它在运行时就会自动使用 jemalloc 的内存分配策略。
+jemalloc的核心思想jemalloc 的核心思想可以总结为：“分而治之” + “多级缓存”。
+它将整个内存空间划分成一套精巧的多层级结构，其设计的核心目的就是：不惜一切代价避免加锁，尤其是避免加全局锁。
+Arena：隔离线程，减少竞争jemalloc 将整个内存空间划分成多个 Arena（内存竞技场）。这是一个至关重要的设计。
+
+默认情况下，jemalloc 会创建 n * CPU核心数 个 Arena（例如 4 核 CPU，默认可能是 16 个）。
+当一个线程第一次需要分配内存时，jemalloc 会通过轮询（Round-Robin）的方式为其固定分配一个 Arena。
+关键点： 多个线程可能共享一个 Arena，但 jemalloc 的策略使得线程被高度分散在不同的 Arena 中。
+
+这有什么好处？假设有 16 个 Arena 和 100 个线程。最理想情况下，大概 6-7 个线程共享 1 个 Arena。每个 Arena 都有自己的锁，jemalloc 降低了锁的压力，极大地提高了并发度。
+大小对象分离：Bin 与 Extent每个 Arena 内部，管理者两种截然不同的内存分配方式：小对象（Small） 和 大对象（Large）。
+
+小对象（Small Objects）：
+
+jemalloc 将小对象（例如，&lt; 32KB）划分为几十个大小等级（Size Classes），如 8字节、16字节、32字节、48字节…
+Arena 中有一个 bin 数组，每个 bin 负责一个特定的大小等级。
+Bin 只是一个管理者，它真正管理的是一组 **Slab**（在 jemalloc 源码中常称为 run 或 slab，在代码中具体表现为 edata_t）。
+一个 Slab 是一个连续的内存页（如 4KB），它被预先切割成N个固定大小的块（block），这个大小由它所属的 Bin 决定。例如，一个 4KB 的 Slab 被 32 字节的 Bin 管理，它就会被切成 128 个 32 字节的 block。
+
+
+大对象（Large Objects）：
+
+对于超过小对象阈值的大内存，jemalloc 不再使用 Bin/Slab。
+Arena 会直接以页（Page）为单位来管理它们。
+Arena 内部维护着一个基数树（Radix Tree）（一种比红黑树更优化的树状结构）来挂载和管理这些空闲的大内存页（Extent）。
+
+
+
+TCache：极速的线程私有缓存（性能核心）Arena 已经将锁的竞争从“全局”降低到了“小组”。但 jemalloc 追求极致，连“小组”内的竞争也要（尽可能）消除。这就是 TCache（Thread-Specific Cache） 的使命。
+
+jemalloc 会为每一个使用它的线程创建一个 TCache。
+TCache 是线程私有的，因此对它的一切操作都完全不需要加锁。
+TCache 内部也有一组 bin（cache_bin_t），与 Arena 的 bin 对应。
+TCache 的 bin 中存放的是一个空闲 block 的指针数组。
+
+这就是 jemalloc 性能的精髓所在：
+
+当线程 malloc 一个小对象时，它首先在自己的 TCache 中寻找对应大小的 bin。
+（极速路径） 如果 TCache 中有空闲 block，直接从链表中取出一个返回。全程无锁，快如闪电。
+（进货路径） 如果 TCache 空了，它会向自己绑定的 Arena “进货”（Refill）。
+“进货”时，TCache 会锁住 Arena 中对应的 Bin，然后批量（例如 20 个）从 Slab 中获取 block，填充到自己的 TCache 中，然后解锁。
+最后，返回一个 block 给用户。
+
+free 小对象时反之：优先（无锁）放回 TCache，TCache 满了再一次性（有锁）“刷回”（Flush）给 Arena。
+
+通过 TCache，jemalloc 将有锁的 Arena 访问摊薄到了 N 次无锁的 TCache 访问中，极大地提高了平均分配性能。
+
+源码剖析理论终须源码印证。下面我们将简单的查看内部到底是怎么分配内存的
+核心入口：arena_mallocje_malloc 在选择了 Arena 之后，会调用 arena_malloc。这是 Arena 内部的“总指挥室”。
+// 这是一个 Arena 内部的总入口JEMALLOC_ALWAYS_INLINE void *arena_malloc(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind, bool zero,    tcache_t *tcache, bool slow_path) &#123;        // 关键分支点 1: 检查 TCache 是否存在    if (likely(tcache != NULL)) &#123;        // 关键分支点 2: 是否为小对象       if (likely(size &lt;= SC_SMALL_MAXCLASS)) &#123;          // 路径 A: TCache - 小对象          return tcache_alloc_small(...);       &#125;       // 关键分支点 3: 是否为“可缓存的”大对象       if (likely(size &lt;= tcache_maxclass)) &#123;          // 路径 B: TCache - 大对象          return tcache_alloc_large(...);       &#125;       // 如果对象太大，TCache 不管，掉下去    &#125;        // 路径 C: 终极 fallback    // 1. TCache 被禁用    // 2. TCache 路径尝试后失败 (slow_path = true)    // 3. 对象太大 TCache 不管    return arena_malloc_hard(tsdn, arena, size, ind, zero);&#125;
+
+
+源码解读：此函数完美地展现了 jemalloc 的分层设计。它**优先尝试 TCache**。TCache 被分为“小对象缓存”和“（中）大对象缓存”。如果 TCache 路径走不通，才会进入arena_malloc_hard 这个“硬核分配”路径。
+
+小对象分配极速路径：tcache_alloc_small这是 jemalloc 90% 时间都在走的路径。
+JEMALLOC_ALWAYS_INLINE void *tcache_alloc_small(tsd_t *tsd, arena_t *arena, tcache_t *tcache,    size_t size, szind_t binind, bool zero, bool slow_path) &#123;    void *ret;    bool tcache_success;    // 定位到 TCache 中对应的 bin    cache_bin_t *bin = &amp;tcache-&gt;bins[binind];        // 1. 【极速路径】尝试从 bin 的空闲链表头部弹出一个    ret = cache_bin_alloc(bin, &amp;tcache_success);        // 2. 【TCache 未命中】    if (unlikely(!tcache_success)) &#123;       // TCache 没货了              // ... (省略一些 arena_choose 和-d 禁用检查) ...              // 3. 刷回（Flush）一下可能暂存的 block，为“进货”做准备       tcache_bin_flush_stashed(...);              // 4. 【核心】进入“硬核分配”路径，即“进货”       ret = tcache_alloc_small_hard(tsd_tsdn(tsd), arena, tcache,           bin, binind, &amp;tcache_hard_success);       if (tcache_hard_success == false) &#123;          return NULL; // 进货失败 (OOM)       &#125;    &#125;    // ... (处理 zero 和 stats 统计) ...    return ret;&#125;
+
+
+源码解读：性能的秘密就在 unlikely(!tcache_success)。如果 TCache 命中，函数在几个CPU时钟周期内就返回了（完全无锁）。只有当 TCache 未命中时，才需要调用 tcache_alloc_small_hard 去执行“进货”这个慢操作。
+
+tcache_alloc_small_hard这个函数是“进货”的准备阶段，它负责计算“进多少货”。
+void *tcache_alloc_small_hard(tsdn_t *tsdn, arena_t *arena,    tcache_t *tcache, cache_bin_t *cache_bin, szind_t binind,    bool *tcache_success) &#123;        // ...        // 1. 计算要“进货”多少个 (nfill)，这是一个动态计算的值    unsigned nfill = cache_bin_info_ncached_max(&amp;tcache_bin_info[binind])        &gt;&gt; tcache_slow-&gt;lg_fill_div[binind];            // 2. 【核心】调用 Arena，批量填充 TCache 的 bin    arena_cache_bin_fill_small(tsdn, arena, cache_bin,        &amp;tcache_bin_info[binind], binind, nfill);        // 3. 进货完成，TCache 的 bin 已经填满    //    再次调用（必定成功），从 TCache 中拿一个    ret = cache_bin_alloc(cache_bin, tcache_success);    return ret;&#125;
+
+
+源码解读：tcache_alloc_small_hard 的职责很清晰：计算批量（nfill）-&gt; 调用 Arena 执行批量填充 -&gt; 填充后再次 cache_bin_alloc。真正复杂、有锁的操作，被封装在 arena_cache_bin_fill_small 中。
+
+
+arena_cache_bin_fill_small (Arena 批量填充)这是 jemalloc 中最精妙、最复杂的操作之一。锁，将在这里出现。
+voidarena_cache_bin_fill_small(tsdn_t *tsdn, arena_t *arena,    cache_bin_t *cache_bin, ..., const unsigned nfill) &#123;    // ... (准备工作，声明一个指针数组) ...        bool made_progress = true; // 标记是否取得进展    edata_t *fresh_slab = NULL; // 预备的新 Slab    bool alloc_and_retry = false; // 是否需要分配新 Slab 并重试    unsigned filled = 0; // 已填充数量    bin_t *bin = arena_bin_choose(...); // 找到 Arena 的那个 binlabel_refill: // GOTO 标签，用于重试    // 1. 【加锁】    // 这是 TCache 路径上遇到的第一个真正的锁！    malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);    while (filled &lt; nfill) &#123;       // 2. 尝试从当前 Slab (slabcur) 批量分配       edata_t *slabcur = bin-&gt;slabcur;       if (slabcur != NULL &amp;&amp; edata_nfree_get(slabcur) &gt; 0) &#123;          // ... (计算并批量分配) ...          arena_slab_reg_alloc_batch(slabcur, ...);          made_progress = true;          filled += cnt;          continue; // 继续循环，看是否还需要       &#125;              // 3. 当前 Slab 满了，尝试从“非满”Slab 列表中找一个       if (!arena_bin_refill_slabcur_no_fresh_slab(tsdn, arena, bin)) &#123;          assert(bin-&gt;slabcur != NULL);          continue; // 找到了，回到 while 顶部继续分配       &#125;       // 4. “非满”列表也空了，看看是否已有预备的 fresh_slab       if (fresh_slab != NULL) &#123;          arena_bin_refill_slabcur_with_fresh_slab(...);          fresh_slab = NULL;          continue; // 激活了新Slab，回到 while 顶部       &#125;       // 5. 真的没辙了。如果上次取得了进展，我们允许去分配新 Slab       if (made_progress) &#123;          alloc_and_retry = true;          break; // 退出 while 循环，准备去分配       &#125;       // 6. 连新 Slab 都分配过了，还是没进展，OOM       break;    &#125; // while 循环结束    // 7. 【解锁】    malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);    // 8. 【精妙之处】    if (alloc_and_retry) &#123;       // 走到这里，说明 bin-&gt;lock 已经被释放              // 9. 【分配新 Slab】       // 这是一个慢操作 (可能涉及 mmap)，       // 但它是在 *锁外* 执行的！       fresh_slab = arena_slab_alloc(tsdn, arena, binind, ...);       alloc_and_retry = false;       made_progress = false; // 重置进展              // 10. 重新跳回“label_refill”，准备重新加锁并尝试       goto label_refill;    &#125;    // 11. 结束，将所有“进货”的指针加载到 TCache 的 bin 中    cache_bin_finish_fill(cache_bin, ...);&#125;
+
+
+源码解读：
+
+
+
+加锁： 它必须锁住 Arena 的 bin 才能安全地操作 Slab 列表。
+最小化锁持有时间： 它在锁内只做快操作（检查 slabcur、检查 nonfull 列表）。
+锁外执行慢操作： 当必须执行 arena_slab_alloc（内部可能涉及 mmap 系统调用）这种“超级慢”的操作时，它会先释放锁，执行慢操作，然后再 goto 回去**重新加_**（并重试）。
+goto 的妙用： 这里的 goto 完美地实现了一个“释放-重试”循环，避免了在锁内执行不可预测时长的操作。
+
+
+
+大对象tcache_alloc_large 和 large_pallocjemalloc 也会尝试缓存“不大不小”的对象（例如 32KB ~ 512KB）。
+// 路径 B: TCache - 大对象JEMALLOC_ALWAYS_INLINE void *tcache_alloc_large(tsd_t *tsd, arena_t *arena, tcache_t *tcache, size_t size,    szind_t binind, bool zero, bool slow_path) &#123;        // 1. 【极速路径】和 tcache_alloc_small 一样，尝试 TCache 命中    cache_bin_t *bin = &amp;tcache-&gt;bins[binind];    ret = cache_bin_alloc(bin, &amp;tcache_success);        if (unlikely(!tcache_success)) &#123;       // 2. 【TCache 未命中】       // 注意！大对象“进货”策略不同       // 它不会“批量进货”，因为太贵了       // 它选择直接去 Arena 要一个              // 3. 【核心】直接调用大对象分配器       ret = large_malloc(tsd_tsdn(tsd), arena, sz_s2u(size), zero);       // ... (如果成功，ret 会返回，但不会放入 TCache)    &#125;    // ...    return ret;&#125;
+
+large_malloc 最终会调用到 large_palloc（Page-aligned allocation）。
+// 真正的大对象分配（有锁）void *large_palloc(tsdn_t *tsdn, arena_t *arena, size_t usize, size_t alignment,    bool zero) &#123;        // ... (ausize 计算对齐) ...    // 1. 选一个 Arena (如果需要，可能会选 Huge Arena)    if (likely(!tsdn_null(tsdn))) &#123;       arena = arena_choose_maybe_huge(tsdn_tsd(tsdn), arena, usize);    &#125;        // 2. 【核心】    // edata = arena_extent_alloc_large(...)    // 这函数会进入 Arena，锁住 Arena 的大对象管理结构（基数树）    // 查找一个足够大的空闲 Extent (页块)    // 如果找不到，就 mmap 新的内存    if (unlikely(arena == NULL) || (edata = arena_extent_alloc_large(tsdn,        arena, usize, alignment, zero)) == NULL) &#123;       return NULL; // OOM    &#125;    // 3. 【加锁】    // 将这个分配的 extent 记录到 Arena 的 large 链表中    // （注意：这里用了 arena-&gt;large_mtx，是独立的锁）    if (!arena_is_auto(arena)) &#123;       malloc_mutex_lock(tsdn, &amp;arena-&gt;large_mtx);       edata_list_active_append(&amp;arena-&gt;large, edata);       malloc_mutex_unlock(tsdn, &amp;arena-&gt;large_mtx);    &#125;    return edata_addr_get(edata);&#125;
+
+
+源码解读：大对象分配路径清晰得多：
+
+TCache 只会缓存（cache_bin_alloc）之前 free 过的大对象。
+TCache 不会为大对象“批量进货”。
+当 TCache 未命中时，直接调用 large_palloc。
+large_palloc 总是需要加锁（arena-&gt;large_mtx 或 arena_extent_alloc_large 内部的锁），以操作 Arena 的基数树来查找、分裂或 mmap 新的内存页。
+
+
+arena_malloc_hard 和 arena_malloc_small如果 TCache 被禁用（tcache == NULL），或者 TCache 路径失败，arena_malloc 就会调用 arena_malloc_hard。
+void *arena_malloc_hard(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind,    bool zero) &#123;        // ... (arena_choose_maybe_huge) ...    // 1. 小于等于最大小对象    if (likely(size &lt;= SC_SMALL_MAXCLASS)) &#123;       // 路径 C.1: 直接调用 Arena 的小对象分配 (无 TCache)       return arena_malloc_small(tsdn, arena, ind, zero);    &#125;    // 路径 C.2: 调用大对象分配 (无 TCache)    return large_malloc(tsdn, arena, sz_index2size(ind), zero);&#125;
+
+arena_malloc_small 是 arena_cache_bin_fill_small 的“单次分配”版本。
+// 在没有 TCache 时，线程每次都要调用这个函数static void *arena_malloc_small(tsdn_t *tsdn, arena_t *arena, szind_t binind, bool zero) &#123;    // ...    bin_t *bin = arena_bin_choose(...);    // 1. 【加锁】    // 每次分配都必须加锁！    malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);        // 2. 尝试从 bin 分配（先 slabcur，再 non-full）    void *ret = arena_bin_malloc_no_fresh_slab(tsdn, arena, bin, binind);        if (ret == NULL) &#123;       // 3. 分配失败，【解锁】       malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);              // 4. 【锁外】分配新 Slab (慢操作)       fresh_slab = arena_slab_alloc(tsdn, arena, binind, ...);              // 5. 【重新加锁】       malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);              // 6. 再次尝试（因为锁被释放过）       ret = arena_bin_malloc_no_fresh_slab(tsdn, arena, bin, binind);       if (ret == NULL) &#123;          if (fresh_slab == NULL) &#123; /* OOM */ &#125;          // 7. 使用刚刚分配的新 Slab          ret = arena_bin_malloc_with_fresh_slab(...);       &#125;    &#125;        // 8. 【解锁】    malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);        // ...    return ret;&#125;
+
+
+源码解读：这段代码完美地反衬了 TCache 的重要性。
+
+没有 TCache：malloc 一次小对象 &#x3D; 加锁 1 次。如果 Slab 不足 &#x3D; 解锁 1 次 + mmap 1 次 + 重加锁 1 次 + 解锁 1 次。
+有了 TCache：malloc 一次小对象 &#x3D; 0 次锁。只有在 N 次 malloc 后（N 是批量大小），才需要执行一次上述的加锁&#x2F;解锁&#x2F;分配流程。
+
+性能差距，高下立判。
+
+
+free 的过程：对称的艺术free 的过程与 malloc 完全对称：
+
+free (小对象):
+
+
+极速路径：（无锁）将 block push 回 TCache 对应 bin 。
+刷回路径： 当 TCache 的 bin 满了，触发 tcache_flush。Flush 会加锁 Arena 的 bin，批量将 TCache 中的 block 归还给它们各自的 Slab（通过 bitmap 标记为空闲）。
+
+
+free (大对象):
+
+
+（有锁）free 大对象会绕过 TCache（或在 TCache 满时），直接调用 Arena 的 large_free。
+Arena 会加锁，将这个 Extent（页块）归还到基数树中。
+核心： 归还时，jemalloc 会检查这个 Extent 前后相邻的地址是否也是空闲 Extent，如果是，则将它们合并（Coalesce）成一个更大的空闲块。这是对抗内存碎片的终极武器。
+
+总结jemalloc 之所以能提升性能，正是因为它巧妙的运用“数据结构 + 算法”运用，在“性能”与“并发”的平衡木上找到了最优解：
+
+分治（Arenas）： 用空间换时间，将全局锁竞争分散为 N 个 Arena 锁竞争。
+缓存（TCache）： 用“线程私有”的 TCache 实现了小对象分配的无锁极速路径，这是其性能超越 ptmalloc 的最核心原因。
+均摊（Batching）： TCache 的“进货”和“刷回”都是批量操作，将昂贵的锁操作成本均摊到 N 次无锁访问中。
+隔离（Lock-Dropping）： 在必须加锁的慢路径中（如 arena_cache_bin_fill_small），它精妙地在锁外执行 mmap 等慢操作，最大限度地缩短了锁的持有时间。
+合并（Coalescing）： 大对象释放时的自动合并机制，有效对抗了内存碎片。
+
+jemalloc 就像一个精密的、多级联动的缓冲系统，它用尽一切办法让线程在“无锁”的 TCache 独木桥上奔跑，只有在万不得已时，才让它们去“有锁”的 Arena 公路排队，并且连排队都设计了“慢车道（mmap）让行”的规则。
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>Linux下的内存管理</category>
+      </categories>
+      <tags>
+        <tag>linux</tag>
+        <tag>C++</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>Linux下的内存管理:03.jemalloc 实战性能测试：当多线程遇上小对象分配</title>
     <url>/2025/11/14/Linux%E4%B8%8B%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/03.jemalloc%20%E5%AE%9E%E6%88%98%E6%80%A7%E8%83%BD%E6%B5%8B%E8%AF%95%EF%BC%9A%E5%BD%93%E5%A4%9A%E7%BA%BF%E7%A8%8B%E9%81%87%E4%B8%8A%E5%B0%8F%E5%AF%B9%E8%B1%A1%E5%88%86%E9%85%8D/</url>
     <content><![CDATA[前言在前两篇文章中，我们分别讨论了：
@@ -416,165 +575,6 @@ run_benchmark.sh(主脚本)#!/bin/bashset -eBIN=./benchmarkJEMALLOC=/path/to/lib
 
 
 
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>Linux下的内存管理</category>
-      </categories>
-      <tags>
-        <tag>linux</tag>
-        <tag>C++</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>Linux下的内存管理:02.深入jemalloc,多线程内存分配器的结构与算法</title>
-    <url>/2025/11/07/Linux%E4%B8%8B%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/02.%E6%B7%B1%E5%85%A5%20jemalloc%EF%BC%9A%E5%A4%9A%E7%BA%BF%E7%A8%8B%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E5%99%A8%E7%9A%84%E7%BB%93%E6%9E%84%E4%B8%8E%E7%AE%97%E6%B3%95/</url>
-    <content><![CDATA[前言在上一篇《从 malloc 到缺页中断》中，我们深入探索了 malloc 与内核的“垂直”交互：程序如何通过 brk&#x2F;mmap 申请虚拟内存（VMA），以及如何在第一次写入时触发“缺页中断”(Page Fault)，最终获得物理内存。
-在这篇文章中，我们将讲解jemalloc这个被redis，Firefox等著名项目默认使用的现代的内存分配器，了解这个项目是怎么在多线程情况下获取更高性能的分配效果。
-我们将从它的核心设计（数据结构+算法）出发，深入探究 jemalloc 使用什么样的数据结构来管理内存，以及在 malloc 和 free 时执行了怎样的算法流程。最终，我们将通过关键路径的源码，印证我们的理解。
-注:本文使用的是jemalloc-5.3.0版本
-快速上手:jemalloc的使用在我们深入内部之前，先看看怎么用它。
-jemalloc 的使用非常简单，它利用了 LD_PRELOAD 动态链接库预加载机制，可以“劫持”程序中所有的 malloc &#x2F; free &#x2F; calloc &#x2F; realloc 等调用。
-假设你已经编译安装了 jemalloc (通常会得到 libjemalloc.so.2 这样的文件)：
-# 编译你的程序（正常编译即可）  gcc -o my_app my_app.c# 运行时通过 LD_PRELOAD 强行使用 jemalloc  LD_PRELOAD=/path/to/libjemalloc.so.2 ./my_app
-
-程序代码将无需任何修改，它在运行时就会自动使用 jemalloc 的内存分配策略。
-jemalloc的核心思想jemalloc 的核心思想可以总结为：“分而治之” + “多级缓存”。
-它将整个内存空间划分成一套精巧的多层级结构，其设计的核心目的就是：不惜一切代价避免加锁，尤其是避免加全局锁。
-Arena：隔离线程，减少竞争jemalloc 将整个内存空间划分成多个 Arena（内存竞技场）。这是一个至关重要的设计。
-
-默认情况下，jemalloc 会创建 n * CPU核心数 个 Arena（例如 4 核 CPU，默认可能是 16 个）。
-当一个线程第一次需要分配内存时，jemalloc 会通过轮询（Round-Robin）的方式为其固定分配一个 Arena。
-关键点： 多个线程可能共享一个 Arena，但 jemalloc 的策略使得线程被高度分散在不同的 Arena 中。
-
-这有什么好处？假设有 16 个 Arena 和 100 个线程。最理想情况下，大概 6-7 个线程共享 1 个 Arena。每个 Arena 都有自己的锁，jemalloc 降低了锁的压力，极大地提高了并发度。
-大小对象分离：Bin 与 Extent每个 Arena 内部，管理者两种截然不同的内存分配方式：小对象（Small） 和 大对象（Large）。
-
-小对象（Small Objects）：
-
-jemalloc 将小对象（例如，&lt; 32KB）划分为几十个大小等级（Size Classes），如 8字节、16字节、32字节、48字节…
-Arena 中有一个 bin 数组，每个 bin 负责一个特定的大小等级。
-Bin 只是一个管理者，它真正管理的是一组 **Slab**（在 jemalloc 源码中常称为 run 或 slab，在代码中具体表现为 edata_t）。
-一个 Slab 是一个连续的内存页（如 4KB），它被预先切割成N个固定大小的块（block），这个大小由它所属的 Bin 决定。例如，一个 4KB 的 Slab 被 32 字节的 Bin 管理，它就会被切成 128 个 32 字节的 block。
-
-
-大对象（Large Objects）：
-
-对于超过小对象阈值的大内存，jemalloc 不再使用 Bin/Slab。
-Arena 会直接以页（Page）为单位来管理它们。
-Arena 内部维护着一个基数树（Radix Tree）（一种比红黑树更优化的树状结构）来挂载和管理这些空闲的大内存页（Extent）。
-
-
-
-TCache：极速的线程私有缓存（性能核心）Arena 已经将锁的竞争从“全局”降低到了“小组”。但 jemalloc 追求极致，连“小组”内的竞争也要（尽可能）消除。这就是 TCache（Thread-Specific Cache） 的使命。
-
-jemalloc 会为每一个使用它的线程创建一个 TCache。
-TCache 是线程私有的，因此对它的一切操作都完全不需要加锁。
-TCache 内部也有一组 bin（cache_bin_t），与 Arena 的 bin 对应。
-TCache 的 bin 中存放的是一个空闲 block 的指针数组。
-
-这就是 jemalloc 性能的精髓所在：
-
-当线程 malloc 一个小对象时，它首先在自己的 TCache 中寻找对应大小的 bin。
-（极速路径） 如果 TCache 中有空闲 block，直接从链表中取出一个返回。全程无锁，快如闪电。
-（进货路径） 如果 TCache 空了，它会向自己绑定的 Arena “进货”（Refill）。
-“进货”时，TCache 会锁住 Arena 中对应的 Bin，然后批量（例如 20 个）从 Slab 中获取 block，填充到自己的 TCache 中，然后解锁。
-最后，返回一个 block 给用户。
-
-free 小对象时反之：优先（无锁）放回 TCache，TCache 满了再一次性（有锁）“刷回”（Flush）给 Arena。
-
-通过 TCache，jemalloc 将有锁的 Arena 访问摊薄到了 N 次无锁的 TCache 访问中，极大地提高了平均分配性能。
-
-源码剖析理论终须源码印证。下面我们将简单的查看内部到底是怎么分配内存的
-核心入口：arena_mallocje_malloc 在选择了 Arena 之后，会调用 arena_malloc。这是 Arena 内部的“总指挥室”。
-// 这是一个 Arena 内部的总入口JEMALLOC_ALWAYS_INLINE void *arena_malloc(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind, bool zero,    tcache_t *tcache, bool slow_path) &#123;        // 关键分支点 1: 检查 TCache 是否存在    if (likely(tcache != NULL)) &#123;        // 关键分支点 2: 是否为小对象       if (likely(size &lt;= SC_SMALL_MAXCLASS)) &#123;          // 路径 A: TCache - 小对象          return tcache_alloc_small(...);       &#125;       // 关键分支点 3: 是否为“可缓存的”大对象       if (likely(size &lt;= tcache_maxclass)) &#123;          // 路径 B: TCache - 大对象          return tcache_alloc_large(...);       &#125;       // 如果对象太大，TCache 不管，掉下去    &#125;        // 路径 C: 终极 fallback    // 1. TCache 被禁用    // 2. TCache 路径尝试后失败 (slow_path = true)    // 3. 对象太大 TCache 不管    return arena_malloc_hard(tsdn, arena, size, ind, zero);&#125;
-
-
-源码解读：此函数完美地展现了 jemalloc 的分层设计。它**优先尝试 TCache**。TCache 被分为“小对象缓存”和“（中）大对象缓存”。如果 TCache 路径走不通，才会进入arena_malloc_hard 这个“硬核分配”路径。
-
-小对象分配极速路径：tcache_alloc_small这是 jemalloc 90% 时间都在走的路径。
-JEMALLOC_ALWAYS_INLINE void *tcache_alloc_small(tsd_t *tsd, arena_t *arena, tcache_t *tcache,    size_t size, szind_t binind, bool zero, bool slow_path) &#123;    void *ret;    bool tcache_success;    // 定位到 TCache 中对应的 bin    cache_bin_t *bin = &amp;tcache-&gt;bins[binind];        // 1. 【极速路径】尝试从 bin 的空闲链表头部弹出一个    ret = cache_bin_alloc(bin, &amp;tcache_success);        // 2. 【TCache 未命中】    if (unlikely(!tcache_success)) &#123;       // TCache 没货了              // ... (省略一些 arena_choose 和-d 禁用检查) ...              // 3. 刷回（Flush）一下可能暂存的 block，为“进货”做准备       tcache_bin_flush_stashed(...);              // 4. 【核心】进入“硬核分配”路径，即“进货”       ret = tcache_alloc_small_hard(tsd_tsdn(tsd), arena, tcache,           bin, binind, &amp;tcache_hard_success);       if (tcache_hard_success == false) &#123;          return NULL; // 进货失败 (OOM)       &#125;    &#125;    // ... (处理 zero 和 stats 统计) ...    return ret;&#125;
-
-
-源码解读：性能的秘密就在 unlikely(!tcache_success)。如果 TCache 命中，函数在几个CPU时钟周期内就返回了（完全无锁）。只有当 TCache 未命中时，才需要调用 tcache_alloc_small_hard 去执行“进货”这个慢操作。
-
-tcache_alloc_small_hard这个函数是“进货”的准备阶段，它负责计算“进多少货”。
-void *tcache_alloc_small_hard(tsdn_t *tsdn, arena_t *arena,    tcache_t *tcache, cache_bin_t *cache_bin, szind_t binind,    bool *tcache_success) &#123;        // ...        // 1. 计算要“进货”多少个 (nfill)，这是一个动态计算的值    unsigned nfill = cache_bin_info_ncached_max(&amp;tcache_bin_info[binind])        &gt;&gt; tcache_slow-&gt;lg_fill_div[binind];            // 2. 【核心】调用 Arena，批量填充 TCache 的 bin    arena_cache_bin_fill_small(tsdn, arena, cache_bin,        &amp;tcache_bin_info[binind], binind, nfill);        // 3. 进货完成，TCache 的 bin 已经填满    //    再次调用（必定成功），从 TCache 中拿一个    ret = cache_bin_alloc(cache_bin, tcache_success);    return ret;&#125;
-
-
-源码解读：tcache_alloc_small_hard 的职责很清晰：计算批量（nfill）-&gt; 调用 Arena 执行批量填充 -&gt; 填充后再次 cache_bin_alloc。真正复杂、有锁的操作，被封装在 arena_cache_bin_fill_small 中。
-
-
-arena_cache_bin_fill_small (Arena 批量填充)这是 jemalloc 中最精妙、最复杂的操作之一。锁，将在这里出现。
-voidarena_cache_bin_fill_small(tsdn_t *tsdn, arena_t *arena,    cache_bin_t *cache_bin, ..., const unsigned nfill) &#123;    // ... (准备工作，声明一个指针数组) ...        bool made_progress = true; // 标记是否取得进展    edata_t *fresh_slab = NULL; // 预备的新 Slab    bool alloc_and_retry = false; // 是否需要分配新 Slab 并重试    unsigned filled = 0; // 已填充数量    bin_t *bin = arena_bin_choose(...); // 找到 Arena 的那个 binlabel_refill: // GOTO 标签，用于重试    // 1. 【加锁】    // 这是 TCache 路径上遇到的第一个真正的锁！    malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);    while (filled &lt; nfill) &#123;       // 2. 尝试从当前 Slab (slabcur) 批量分配       edata_t *slabcur = bin-&gt;slabcur;       if (slabcur != NULL &amp;&amp; edata_nfree_get(slabcur) &gt; 0) &#123;          // ... (计算并批量分配) ...          arena_slab_reg_alloc_batch(slabcur, ...);          made_progress = true;          filled += cnt;          continue; // 继续循环，看是否还需要       &#125;              // 3. 当前 Slab 满了，尝试从“非满”Slab 列表中找一个       if (!arena_bin_refill_slabcur_no_fresh_slab(tsdn, arena, bin)) &#123;          assert(bin-&gt;slabcur != NULL);          continue; // 找到了，回到 while 顶部继续分配       &#125;       // 4. “非满”列表也空了，看看是否已有预备的 fresh_slab       if (fresh_slab != NULL) &#123;          arena_bin_refill_slabcur_with_fresh_slab(...);          fresh_slab = NULL;          continue; // 激活了新Slab，回到 while 顶部       &#125;       // 5. 真的没辙了。如果上次取得了进展，我们允许去分配新 Slab       if (made_progress) &#123;          alloc_and_retry = true;          break; // 退出 while 循环，准备去分配       &#125;       // 6. 连新 Slab 都分配过了，还是没进展，OOM       break;    &#125; // while 循环结束    // 7. 【解锁】    malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);    // 8. 【精妙之处】    if (alloc_and_retry) &#123;       // 走到这里，说明 bin-&gt;lock 已经被释放              // 9. 【分配新 Slab】       // 这是一个慢操作 (可能涉及 mmap)，       // 但它是在 *锁外* 执行的！       fresh_slab = arena_slab_alloc(tsdn, arena, binind, ...);       alloc_and_retry = false;       made_progress = false; // 重置进展              // 10. 重新跳回“label_refill”，准备重新加锁并尝试       goto label_refill;    &#125;    // 11. 结束，将所有“进货”的指针加载到 TCache 的 bin 中    cache_bin_finish_fill(cache_bin, ...);&#125;
-
-
-源码解读：
-
-
-
-加锁： 它必须锁住 Arena 的 bin 才能安全地操作 Slab 列表。
-最小化锁持有时间： 它在锁内只做快操作（检查 slabcur、检查 nonfull 列表）。
-锁外执行慢操作： 当必须执行 arena_slab_alloc（内部可能涉及 mmap 系统调用）这种“超级慢”的操作时，它会先释放锁，执行慢操作，然后再 goto 回去**重新加_**（并重试）。
-goto 的妙用： 这里的 goto 完美地实现了一个“释放-重试”循环，避免了在锁内执行不可预测时长的操作。
-
-
-
-大对象tcache_alloc_large 和 large_pallocjemalloc 也会尝试缓存“不大不小”的对象（例如 32KB ~ 512KB）。
-// 路径 B: TCache - 大对象JEMALLOC_ALWAYS_INLINE void *tcache_alloc_large(tsd_t *tsd, arena_t *arena, tcache_t *tcache, size_t size,    szind_t binind, bool zero, bool slow_path) &#123;        // 1. 【极速路径】和 tcache_alloc_small 一样，尝试 TCache 命中    cache_bin_t *bin = &amp;tcache-&gt;bins[binind];    ret = cache_bin_alloc(bin, &amp;tcache_success);        if (unlikely(!tcache_success)) &#123;       // 2. 【TCache 未命中】       // 注意！大对象“进货”策略不同       // 它不会“批量进货”，因为太贵了       // 它选择直接去 Arena 要一个              // 3. 【核心】直接调用大对象分配器       ret = large_malloc(tsd_tsdn(tsd), arena, sz_s2u(size), zero);       // ... (如果成功，ret 会返回，但不会放入 TCache)    &#125;    // ...    return ret;&#125;
-
-large_malloc 最终会调用到 large_palloc（Page-aligned allocation）。
-// 真正的大对象分配（有锁）void *large_palloc(tsdn_t *tsdn, arena_t *arena, size_t usize, size_t alignment,    bool zero) &#123;        // ... (ausize 计算对齐) ...    // 1. 选一个 Arena (如果需要，可能会选 Huge Arena)    if (likely(!tsdn_null(tsdn))) &#123;       arena = arena_choose_maybe_huge(tsdn_tsd(tsdn), arena, usize);    &#125;        // 2. 【核心】    // edata = arena_extent_alloc_large(...)    // 这函数会进入 Arena，锁住 Arena 的大对象管理结构（基数树）    // 查找一个足够大的空闲 Extent (页块)    // 如果找不到，就 mmap 新的内存    if (unlikely(arena == NULL) || (edata = arena_extent_alloc_large(tsdn,        arena, usize, alignment, zero)) == NULL) &#123;       return NULL; // OOM    &#125;    // 3. 【加锁】    // 将这个分配的 extent 记录到 Arena 的 large 链表中    // （注意：这里用了 arena-&gt;large_mtx，是独立的锁）    if (!arena_is_auto(arena)) &#123;       malloc_mutex_lock(tsdn, &amp;arena-&gt;large_mtx);       edata_list_active_append(&amp;arena-&gt;large, edata);       malloc_mutex_unlock(tsdn, &amp;arena-&gt;large_mtx);    &#125;    return edata_addr_get(edata);&#125;
-
-
-源码解读：大对象分配路径清晰得多：
-
-TCache 只会缓存（cache_bin_alloc）之前 free 过的大对象。
-TCache 不会为大对象“批量进货”。
-当 TCache 未命中时，直接调用 large_palloc。
-large_palloc 总是需要加锁（arena-&gt;large_mtx 或 arena_extent_alloc_large 内部的锁），以操作 Arena 的基数树来查找、分裂或 mmap 新的内存页。
-
-
-arena_malloc_hard 和 arena_malloc_small如果 TCache 被禁用（tcache == NULL），或者 TCache 路径失败，arena_malloc 就会调用 arena_malloc_hard。
-void *arena_malloc_hard(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind,    bool zero) &#123;        // ... (arena_choose_maybe_huge) ...    // 1. 小于等于最大小对象    if (likely(size &lt;= SC_SMALL_MAXCLASS)) &#123;       // 路径 C.1: 直接调用 Arena 的小对象分配 (无 TCache)       return arena_malloc_small(tsdn, arena, ind, zero);    &#125;    // 路径 C.2: 调用大对象分配 (无 TCache)    return large_malloc(tsdn, arena, sz_index2size(ind), zero);&#125;
-
-arena_malloc_small 是 arena_cache_bin_fill_small 的“单次分配”版本。
-// 在没有 TCache 时，线程每次都要调用这个函数static void *arena_malloc_small(tsdn_t *tsdn, arena_t *arena, szind_t binind, bool zero) &#123;    // ...    bin_t *bin = arena_bin_choose(...);    // 1. 【加锁】    // 每次分配都必须加锁！    malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);        // 2. 尝试从 bin 分配（先 slabcur，再 non-full）    void *ret = arena_bin_malloc_no_fresh_slab(tsdn, arena, bin, binind);        if (ret == NULL) &#123;       // 3. 分配失败，【解锁】       malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);              // 4. 【锁外】分配新 Slab (慢操作)       fresh_slab = arena_slab_alloc(tsdn, arena, binind, ...);              // 5. 【重新加锁】       malloc_mutex_lock(tsdn, &amp;bin-&gt;lock);              // 6. 再次尝试（因为锁被释放过）       ret = arena_bin_malloc_no_fresh_slab(tsdn, arena, bin, binind);       if (ret == NULL) &#123;          if (fresh_slab == NULL) &#123; /* OOM */ &#125;          // 7. 使用刚刚分配的新 Slab          ret = arena_bin_malloc_with_fresh_slab(...);       &#125;    &#125;        // 8. 【解锁】    malloc_mutex_unlock(tsdn, &amp;bin-&gt;lock);        // ...    return ret;&#125;
-
-
-源码解读：这段代码完美地反衬了 TCache 的重要性。
-
-没有 TCache：malloc 一次小对象 &#x3D; 加锁 1 次。如果 Slab 不足 &#x3D; 解锁 1 次 + mmap 1 次 + 重加锁 1 次 + 解锁 1 次。
-有了 TCache：malloc 一次小对象 &#x3D; 0 次锁。只有在 N 次 malloc 后（N 是批量大小），才需要执行一次上述的加锁&#x2F;解锁&#x2F;分配流程。
-
-性能差距，高下立判。
-
-
-free 的过程：对称的艺术free 的过程与 malloc 完全对称：
-
-free (小对象):
-
-
-极速路径：（无锁）将 block push 回 TCache 对应 bin 。
-刷回路径： 当 TCache 的 bin 满了，触发 tcache_flush。Flush 会加锁 Arena 的 bin，批量将 TCache 中的 block 归还给它们各自的 Slab（通过 bitmap 标记为空闲）。
-
-
-free (大对象):
-
-
-（有锁）free 大对象会绕过 TCache（或在 TCache 满时），直接调用 Arena 的 large_free。
-Arena 会加锁，将这个 Extent（页块）归还到基数树中。
-核心： 归还时，jemalloc 会检查这个 Extent 前后相邻的地址是否也是空闲 Extent，如果是，则将它们合并（Coalesce）成一个更大的空闲块。这是对抗内存碎片的终极武器。
-
-总结jemalloc 之所以能提升性能，正是因为它巧妙的运用“数据结构 + 算法”运用，在“性能”与“并发”的平衡木上找到了最优解：
-
-分治（Arenas）： 用空间换时间，将全局锁竞争分散为 N 个 Arena 锁竞争。
-缓存（TCache）： 用“线程私有”的 TCache 实现了小对象分配的无锁极速路径，这是其性能超越 ptmalloc 的最核心原因。
-均摊（Batching）： TCache 的“进货”和“刷回”都是批量操作，将昂贵的锁操作成本均摊到 N 次无锁访问中。
-隔离（Lock-Dropping）： 在必须加锁的慢路径中（如 arena_cache_bin_fill_small），它精妙地在锁外执行 mmap 等慢操作，最大限度地缩短了锁的持有时间。
-合并（Coalescing）： 大对象释放时的自动合并机制，有效对抗了内存碎片。
-
-jemalloc 就像一个精密的、多级联动的缓冲系统，它用尽一切办法让线程在“无锁”的 TCache 独木桥上奔跑，只有在万不得已时，才让它们去“有锁”的 Arena 公路排队，并且连排队都设计了“慢车道（mmap）让行”的规则。
 ]]></content>
       <categories>
         <category>程序员的自我修养</category>
@@ -1373,80 +1373,6 @@ gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事
       </tags>
   </entry>
   <entry>
-    <title>grpc实践之路:05.服务端与客户端的连接</title>
-    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
-    <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
-这引出了一个最根本的问题，也是本文将要探究的核心：
-一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
-我们将像科学家一样，首先提出一个猜想，然后深入源码和网络协议的细节，去寻找证据来证明或修正它。
-我的猜想如下：gRPC 的一一对应机制，是一个编译时和运行时协同工作的结果。
-
-编译时 - 生成“身份证”： protoc 工具在生成代码时，会为每一个 RPC 方法创建一个全局唯一的“身份证”（一个字符串签名）。
-运行时 - 递送“身份证”： 客户端在发起调用时，会将这个“身份证”放入网络请求的某个标准位置（比如 HTTP&#x2F;2 的请求头），连同序列化好的参数一起发送出去。
-服务端 - 验证“身份证”： 服务端在启动时就建立了一个“身份证 -&gt; 处理函数”的路由表。收到请求后，只需读取“身份证”，就能快速找到对应的处理函数。
-
-本文，我们就将带着这个猜想，通过分析生成代码和Wireshark 抓包，完整地走一遍 RPC 的全链路之旅。
-
-第一站：编译时的约定 —— Stub 中隐藏的“身份证”一切的起点都在客户端。我们从 protoc 生成的 Stub 类入手，寻找“身份证”是如何被制造出来的。
-&#x2F;&#x2F; 客户端代码grpc::Status status &#x3D; stub_-&gt;GetVersion(context, request, &amp;response);
-当我们查看生成的 controller.grpc.pb.cc 文件时，证据立刻就出现了：
-controller.grpc.pb.cc (生成代码摘录)
-// 证据 1：定义了一个全局唯一的“方法名身份证”  static const char* Controller_method_names[] = &#123;  &quot;/controller.Controller/GetVersion&quot;,  &#125;;// ...// 证据 2：Stub 的 GetVersion 方法实现  ::grpc::Status Controller::Stub::GetVersion(...) &#123;  // 将“身份证”和所有参数，打包交给一个更底层的通用函数  return ::grpc::internal::BlockingUnaryCall&lt;...&gt;(channel_.get(), rpcmethod_GetVersion_, ...);  &#125;
-
-源码剖析：
-
-方法名字符串： protoc 明确地为我们的 GetVersion RPC 生成了一个全局唯一的字符串标识符 “&#x2F;controller.Controller&#x2F;GetVersion”。这完美印证了我们猜想的第一步——“身份证”是在编译时被创建的。
-BlockingUnaryCall： 用户的调用最终被委托给了这个内部函数。Stub 的作用，就是为这个通用函数准备好所有必要的参数，其中最重要的就是 rpcmethod_GetVersion_，这是一个封装了上述“身份证”字符串的对象。
-
-至此，我们已经证明了，每一次 RPC 调用在 C++ 代码层面，都与一个唯一的方法签名字符串绑定在了一起。但这个字符串是如何跨越网络的呢？
-第二站：网络上的“信封” —— Wireshark 抓包分析理论和源码分析固然重要，但网络抓包的结果才是“铁证”。我使用 Wireshark 捕获了一次客户端调用 GetVersion 的网络流量，结果完全印证了我们的猜想。
-一次 gRPC 调用在网络上表现为一次 HTTP&#x2F;2 的请求-响应交换。在请求的 HEADERS 帧中，我们发现了决定性的证据：
-Wireshark 抓包结果 (概念示意)
-Hypertext Transfer Protocol 2  Stream: HEADERS, Stream ID: 1, Length 87  :method: POST  :scheme: http  :path: /controller.Controller/GetVersion  &lt;-- 铁证如山！  :authority: localhost:50051  content-type: application/grpc  ...
-
-
-抓包分析：
-
-:path 伪头： 我们在 Stub 源码中找到的那个“身份证”字符串 “&#x2F;controller.Controller&#x2F;GetVersion”，被原封不动地放在了 HTTP&#x2F;2 的 :path 伪头中。
-这就是 gRPC 的“信封”！ 它清晰地告诉了网络上的任何接收方：“这封信是寄给 &#x2F;controller.Controller&#x2F;GetVersion 这个处理单元的”。
-
-同样，在响应的 HEADERS 帧中，我们也能看到 gRPC 的状态码，而在 DATA 帧中，则是 Protobuf 序列化后的响应体。
-小结： Wireshark 的抓包结果，完美地连接了我们的代码分析和网络现实。它证明了 gRPC 的“寻址”机制，就是通过将编译时生成的唯一方法签名，作为运行时 HTTP&#x2F;2 请求的 :path 来实现的。
-第三站：服务端的“中央调度室”现在，请求已经带着清晰的“信封”抵达服务端。服务端是如何根据这个地址，找到正确的处理函数的呢？答案的起点，在于 Service 的构造函数。
-controller.grpc.pb.cc (生成代码摘录)
-Controller::Service::Service() &#123;  // 在构造时，就调用 AddMethod  AddMethod(new ::grpc::internal::RpcServiceMethod(  Controller_method_names[0], // Key: 还是那个唯一的“身份证”  ...,  new ::grpc::internal::RpcMethodHandler&lt;...&gt;(...))); // Value: 处理器  &#125;
-
-源码剖析：
-
-AddMethod： Service 基类在构造时，就为每个 RPC 方法调用 AddMethod。这个函数的核心作用，就是将方法签名字符串 (Key) 和一个知道如何调用具体实现的处理器 Handler (Value) 绑定在一起。
-
-当我们调用 ServerBuilder::RegisterService(&amp;service) 时，这些 Key-Value 对会被收集起来，并通过底层的 grpc_server_register_method 函数，正式注册到 grpc-core 内部的一个方法路由表中。从逻辑上推断，这个路由表必然是一个哈希表，以保证 O(1) 的查找效率。
-至此，服务端的“中央调度室”就构建完成了。 当一个网络请求到来时：
-
-grpc-core 的 I&#x2F;O 线程接收到 HTTP&#x2F;2 请求，解析出 :path 头，得到 Key。
-以这个 Key 在内部的哈希路由表中进行查找，得到 Value (对应的 Handler)。
-这个 Handler 随后会反序列化请求的 Protobuf 数据，并最终调用我们自己重写的 ControllerServiceImpl::GetVersion C++ 成员函数。
-
-结论：从猜想到证据的闭环通过这次“代码生成分析”和“网络抓包”相结合的探索，我们为开篇提出的核心问题，找到了一个完整且证据确凿的答案：
-gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RPC 调用与网络请求的一一对应：
-
-编译时契约： protoc 为每个 RPC 方法生成一个全局唯一的方法签名字符串。
-运行时传输： 客户端将此签名作为 HTTP&#x2F;2 的 :path，连同 Protobuf 数据一起发送。
-服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
-
-正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
-]]></content>
-      <categories>
-        <category>动手实践-三方库</category>
-        <category>grpc</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>grpc</tag>
-        <tag>进程间通信</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>grpc实践之路:06.rpc的大问题思考</title>
     <url>/2025/08/06/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:06.rpc%E7%9A%84%E5%A4%A7%E9%97%AE%E9%A2%98%E6%80%9D%E8%80%83/</url>
     <content><![CDATA[前言在之前的源码剖析文章中，我们深入了 gRPC 的一些具体实现。
@@ -1532,6 +1458,80 @@ Protobuf, JSON, FlatBuffers 等就是不同的序列化方案。
 问题 6：如何做好高并发下的线程安全？
 
 四、结语这，就是我的探索地图。希望它也能为你带来一些启发，如果有什么错误或者不足，希望也能在评论区指出。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:05.服务端与客户端的连接</title>
+    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
+    <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
+这引出了一个最根本的问题，也是本文将要探究的核心：
+一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
+我们将像科学家一样，首先提出一个猜想，然后深入源码和网络协议的细节，去寻找证据来证明或修正它。
+我的猜想如下：gRPC 的一一对应机制，是一个编译时和运行时协同工作的结果。
+
+编译时 - 生成“身份证”： protoc 工具在生成代码时，会为每一个 RPC 方法创建一个全局唯一的“身份证”（一个字符串签名）。
+运行时 - 递送“身份证”： 客户端在发起调用时，会将这个“身份证”放入网络请求的某个标准位置（比如 HTTP&#x2F;2 的请求头），连同序列化好的参数一起发送出去。
+服务端 - 验证“身份证”： 服务端在启动时就建立了一个“身份证 -&gt; 处理函数”的路由表。收到请求后，只需读取“身份证”，就能快速找到对应的处理函数。
+
+本文，我们就将带着这个猜想，通过分析生成代码和Wireshark 抓包，完整地走一遍 RPC 的全链路之旅。
+
+第一站：编译时的约定 —— Stub 中隐藏的“身份证”一切的起点都在客户端。我们从 protoc 生成的 Stub 类入手，寻找“身份证”是如何被制造出来的。
+&#x2F;&#x2F; 客户端代码grpc::Status status &#x3D; stub_-&gt;GetVersion(context, request, &amp;response);
+当我们查看生成的 controller.grpc.pb.cc 文件时，证据立刻就出现了：
+controller.grpc.pb.cc (生成代码摘录)
+// 证据 1：定义了一个全局唯一的“方法名身份证”  static const char* Controller_method_names[] = &#123;  &quot;/controller.Controller/GetVersion&quot;,  &#125;;// ...// 证据 2：Stub 的 GetVersion 方法实现  ::grpc::Status Controller::Stub::GetVersion(...) &#123;  // 将“身份证”和所有参数，打包交给一个更底层的通用函数  return ::grpc::internal::BlockingUnaryCall&lt;...&gt;(channel_.get(), rpcmethod_GetVersion_, ...);  &#125;
+
+源码剖析：
+
+方法名字符串： protoc 明确地为我们的 GetVersion RPC 生成了一个全局唯一的字符串标识符 “&#x2F;controller.Controller&#x2F;GetVersion”。这完美印证了我们猜想的第一步——“身份证”是在编译时被创建的。
+BlockingUnaryCall： 用户的调用最终被委托给了这个内部函数。Stub 的作用，就是为这个通用函数准备好所有必要的参数，其中最重要的就是 rpcmethod_GetVersion_，这是一个封装了上述“身份证”字符串的对象。
+
+至此，我们已经证明了，每一次 RPC 调用在 C++ 代码层面，都与一个唯一的方法签名字符串绑定在了一起。但这个字符串是如何跨越网络的呢？
+第二站：网络上的“信封” —— Wireshark 抓包分析理论和源码分析固然重要，但网络抓包的结果才是“铁证”。我使用 Wireshark 捕获了一次客户端调用 GetVersion 的网络流量，结果完全印证了我们的猜想。
+一次 gRPC 调用在网络上表现为一次 HTTP&#x2F;2 的请求-响应交换。在请求的 HEADERS 帧中，我们发现了决定性的证据：
+Wireshark 抓包结果 (概念示意)
+Hypertext Transfer Protocol 2  Stream: HEADERS, Stream ID: 1, Length 87  :method: POST  :scheme: http  :path: /controller.Controller/GetVersion  &lt;-- 铁证如山！  :authority: localhost:50051  content-type: application/grpc  ...
+
+
+抓包分析：
+
+:path 伪头： 我们在 Stub 源码中找到的那个“身份证”字符串 “&#x2F;controller.Controller&#x2F;GetVersion”，被原封不动地放在了 HTTP&#x2F;2 的 :path 伪头中。
+这就是 gRPC 的“信封”！ 它清晰地告诉了网络上的任何接收方：“这封信是寄给 &#x2F;controller.Controller&#x2F;GetVersion 这个处理单元的”。
+
+同样，在响应的 HEADERS 帧中，我们也能看到 gRPC 的状态码，而在 DATA 帧中，则是 Protobuf 序列化后的响应体。
+小结： Wireshark 的抓包结果，完美地连接了我们的代码分析和网络现实。它证明了 gRPC 的“寻址”机制，就是通过将编译时生成的唯一方法签名，作为运行时 HTTP&#x2F;2 请求的 :path 来实现的。
+第三站：服务端的“中央调度室”现在，请求已经带着清晰的“信封”抵达服务端。服务端是如何根据这个地址，找到正确的处理函数的呢？答案的起点，在于 Service 的构造函数。
+controller.grpc.pb.cc (生成代码摘录)
+Controller::Service::Service() &#123;  // 在构造时，就调用 AddMethod  AddMethod(new ::grpc::internal::RpcServiceMethod(  Controller_method_names[0], // Key: 还是那个唯一的“身份证”  ...,  new ::grpc::internal::RpcMethodHandler&lt;...&gt;(...))); // Value: 处理器  &#125;
+
+源码剖析：
+
+AddMethod： Service 基类在构造时，就为每个 RPC 方法调用 AddMethod。这个函数的核心作用，就是将方法签名字符串 (Key) 和一个知道如何调用具体实现的处理器 Handler (Value) 绑定在一起。
+
+当我们调用 ServerBuilder::RegisterService(&amp;service) 时，这些 Key-Value 对会被收集起来，并通过底层的 grpc_server_register_method 函数，正式注册到 grpc-core 内部的一个方法路由表中。从逻辑上推断，这个路由表必然是一个哈希表，以保证 O(1) 的查找效率。
+至此，服务端的“中央调度室”就构建完成了。 当一个网络请求到来时：
+
+grpc-core 的 I&#x2F;O 线程接收到 HTTP&#x2F;2 请求，解析出 :path 头，得到 Key。
+以这个 Key 在内部的哈希路由表中进行查找，得到 Value (对应的 Handler)。
+这个 Handler 随后会反序列化请求的 Protobuf 数据，并最终调用我们自己重写的 ControllerServiceImpl::GetVersion C++ 成员函数。
+
+结论：从猜想到证据的闭环通过这次“代码生成分析”和“网络抓包”相结合的探索，我们为开篇提出的核心问题，找到了一个完整且证据确凿的答案：
+gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RPC 调用与网络请求的一一对应：
+
+编译时契约： protoc 为每个 RPC 方法生成一个全局唯一的方法签名字符串。
+运行时传输： 客户端将此签名作为 HTTP&#x2F;2 的 :path，连同 Protobuf 数据一起发送。
+服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
+
+正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
 ]]></content>
       <categories>
         <category>动手实践-三方库</category>
@@ -1742,6 +1742,91 @@ Channel 作为事件分发的核心： 它封装了文件描述符和相关的�
       </tags>
   </entry>
   <entry>
+    <title>muduo源码剖析:04.Buffer设计分析</title>
+    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
+在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
+
+假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
+如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
+在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
+在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
+
+这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
+在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
+本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
+
+muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
++——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
+
+prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
+readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
+writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
+
+这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
+核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
+class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
+
+
+buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
+readerIndex_: size_t 类型，标记可读数据的起始位置。
+writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
+
+通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
+size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
+
+基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
+void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
+
+核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
+2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
+void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
+
+在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
+空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
+
+内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
+外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
+
+void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
+
+这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
+高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
+ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
+
+readFd 的设计有几个显著优点：  
+
+减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
+避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
+避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
+栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
+
+其他实用特性
+网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
+头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
+查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
+
+总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
+其核心设计启示包括：
+
+空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
+减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
+设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
+接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
+
+理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>muduo源码剖析:03.定时器的实现</title>
     <url>/2025/06/04/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/</url>
     <content><![CDATA[前言在muduo源码剖析的前两篇文章中，我们深入探讨了 muduo 的核心并发模型——“One Loop Per Thread” 的实现，以及 TCP连接从建立、数据收发到关闭的完整生命周期管理。
@@ -1847,91 +1932,6 @@ std::set 管理定时器： 利用 std::set&lt;std::pair&lt;Timestamp, Timer*&gt
 处理回调期间的取消： 通过 callingExpiredTimers_ 标志和 cancelingTimers_集合，优雅地处理了在执行定时器回调期间，这些定时器（特别是重复定时器）又被用户请求取消的复杂情况。
 资源管理： Timer 对象通过 new 创建，并在不再需要时（非重复到期、或被取消、或 TimerQueue 析构时）通过 delete释放。
 
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>muduo</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>muduo</tag>
-        <tag>网络库</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>muduo源码剖析:04.Buffer设计分析</title>
-    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
-    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
-在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
-
-假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
-如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
-在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
-在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
-
-这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
-在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
-本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
-
-muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
-+——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
-
-prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
-readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
-writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
-
-这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
-核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
-class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
-
-
-buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
-readerIndex_: size_t 类型，标记可读数据的起始位置。
-writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
-
-通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
-size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
-
-基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
-void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
-
-核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
-2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
-void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
-
-在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
-空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
-
-内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
-外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
-
-void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
-
-这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
-高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
-ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
-
-readFd 的设计有几个显著优点：  
-
-减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
-避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
-避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
-栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
-
-其他实用特性
-网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
-头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
-查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
-
-总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
-其核心设计启示包括：
-
-空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
-减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
-设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
-接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
-
-理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
 ]]></content>
       <categories>
         <category>源码分析</category>
@@ -2966,6 +2966,82 @@ initial_covariance：各误差状态分量的初始标准差，用于构造初�
       </tags>
   </entry>
   <entry>
+    <title>专业知识的应用03.惯导解算用了哪些知识</title>
+    <url>/2026/02/11/%E4%B8%93%E4%B8%9A%E7%9F%A5%E8%AF%86%E7%9A%84%E5%9B%9E%E9%A1%BE/%E4%B8%93%E4%B8%9A%E7%9F%A5%E8%AF%86%E7%9A%84%E5%BA%94%E7%94%A803.%E6%83%AF%E5%AF%BC%E8%A7%A3%E7%AE%97%E7%94%A8%E4%BA%86%E5%93%AA%E4%BA%9B%E7%9F%A5%E8%AF%86/</url>
+    <content><![CDATA[前言在上一篇里我们说了卡尔曼在本项目里怎么用：它估计的是误差状态，用 GNSS 位置观测去修正惯导解算的结果。
+那么惯导解算在本项目里做什么？一句话：在已知初始位置、速度、姿态的前提下，用 IMU 的角速度和加速度递推出当前时刻的位置、速度、姿态（名义状态）。
+这些名义状态一方面是对外输出的「当前位姿」，另一方面也是卡尔曼预测步骤所需要的：误差状态的传播（状态转移矩阵 Φ、过程噪声驱动矩阵 G）都依赖当前惯导状态和 IMU 数据。
+所以惯导解算是「组合导航」里和卡尔曼并列的另一条腿：惯导负责递推名义状态，供卡尔曼预测使用，卡尔曼负责估计误差并校正，同时名义状态也是组合系统对外输出的位置和姿态。
+
+本篇不展开课本级的理论推导，只写在本项目里实际用到的知识点：坐标系怎么约定、姿态怎么表示和递推、地球模型在哪些公式里出现、我们采用了什么样的积分方式。
+每个点只讲「是什么 + 在代码里对应什么」；
+惯性系与非惯性系的详细推导、安装误差等复杂误差模型、高阶数值积分理论，本篇都不写，公式与推导请直接参考牛小骥老师的《惯性导航原理与算法设计》等教材。
+惯导在本项目里的角色惯导（Inertial Navigation System，INS）解算的核心是：
+利用 IMU 测到的角速度和加速度，在给定初始状态的前提下，通过积分得到当前的位置、速度、姿态。
+角速度用来更新姿态（载体相对导航系的朝向），加速度（比力）在扣除重力和哥式效应后用来更新速度，速度再积分得到位置。
+因此惯导是一个积分系统：误差会随时间累积，这也是为什么需要 GNSS 等外部观测来定期校正。
+在本项目中，惯导解算由 ins/pins.cpp 中的 Pins 类完成。
+它对外提供 init(state, imu) 和 insUpdate(imu)：给定初始状态和上一帧 IMU 后，每次传入新的 IMU 数据，内部调用 propagate(dt)，依次更新速度、位置、姿态，得到当前时刻的 InsState（位置、速度、姿态）。这个 InsState 会被 pose_estimator 同步到名义状态，并传给滤波器的 predict()，用于构建 Φ 和 G。
+所以惯导在本项目里的角色就是：用 IMU 递推名义状态，供卡尔曼预测使用；同时名义状态也是组合系统对外输出的位置和姿态。
+实际用到的知识点坐标系：NED 与 FRD惯导公式和代码里会大量出现「在哪个坐标系下」的约定。本项目采用：
+
+导航坐标系（n 系）：北东地（NED）——北为 X、东为 Y、地为 Z。位置用经纬高（LLH）表示，速度用 NED 下的三分量表示。
+载体&#x2F;IMU 坐标系（b 系）：前右下（FRD）——前为 X、右为 Y、下为 Z。
+
+这两个约定和牛小骥老师《惯性导航原理与算法设计》中的定义一致。
+统一约定的重要性在于：教材里的公式、地球模型（子午圈&#x2F;卯酉圈半径、地球自转在 NED 下的投影等）、以及代码里的旋转矩阵、速度&#x2F;位置增量的方向，都必须一致，否则符号错一个就会导致解算错误。
+在代码里，位置存在 InsState::pos 中，是 [纬度, 经度, 高]（弧度、弧度、米）；速度 vel 是 NED 三分量；姿态四元数 quat 表示从载体系到导航系的旋转（b → n），即把矢量从 b 系变换到 n 系时用 quat.toRotationMatrix() * v_b。
+姿态表示：四元数、欧拉角、旋转矩阵姿态表示方法有很多种：欧拉角（滚转角、俯仰角、航向角）、旋转矩阵、四元数、旋转矢量等。
+本项目内部递推采用四元数，原因主要有两点：一是无奇异，欧拉角在俯仰角接近 ±90° 时会遇到万向锁；二是递推形式简单，姿态微分方程可以写成四元数对时间的导数，离散化后用「旋转增量」对应的四元数左乘或右乘当前四元数即可，和 Sophus 的 SO3d::exp(旋转向量) 配合很方便。在代码里，当前姿态存在 InsState::quat（Eigen::Quaterniond），递推时用 Sophus::SO3d::exp(dtheta) 得到载体系旋转增量对应的四元数 qbb，再与导航系旋转 qnn 组合：currState_.quat = (qnn * prevState_.quat * qbb).normalized()（见 updateAttitudeByMid）。
+欧拉角在项目里主要用于输入和输出：配置文件中的初始姿态是滚转、俯仰、航向（度），需要转换成四元数再参与解算；若要把结果输出成欧拉角（例如给可视化或日志），则用 utils/rotation.h 里的 quaternion2euler（内部先转成旋转矩阵再按 ZYX 顺序解算欧拉角）。
+旋转矩阵则作为四元数的等价表示，在需要把矢量从载体系变到导航系时使用 quat.toRotationMatrix()，在滤波器里构建 Φ、G 时也会用到。
+旋转矢量在误差状态里出现：姿态误差 attDelta 是三维旋转矢量，用 Sophus 的 SO3d::exp(attDelta) 可得到对应的旋转并作用于四元数（见 correctPose）。所以本项目实际用到了四元数（存储与递推）、欧拉角（配置与输出）、旋转矩阵（矢量变换与滤波）、旋转矢量（误差表示），各自用在不同的环节。
+地球模型：WGS84 与导航参数惯导解算中的速度、位置微分方程里会用到地球的形状和自转：子午圈曲率半径 Rm、卯酉圈曲率半径 Rn（与纬度、高度有关），地球自转角速度在导航系的投影 ω_ie_n，以及由于载体运动导致的运移角速度 ω_en_n。这些参数在教材里统称为「导航系参数」，在本项目中由 utils/earth_model 提供。
+
+椭球与重力：采用 WGS84 椭球（赤道半径、扁率等），与 GPS 常用的大地基准一致。重力加速度随纬度和高度变化，用 Somigliana 公式加高度修正计算，对应 EarthModel::getGravity(lat, h)。
+曲率半径：子午圈半径 Rm、卯酉圈半径 Rn 由纬度和椭球参数计算；考虑高度后有 Rmh &#x3D; Rm + h、Rnh &#x3D; Rn + h。它们在位置微分方程里出现（NED 速度到经纬高变化率的转换），也在速度微分方程里出现（哥式力、曲率项）。对应 EarthModel::computeNavParam(lat, h, vn, ve) 返回的 NavEarthParam（Rm, Rn, Rmh, Rnh, wie_n, wen_n）。
+地球自转与运移角速度：ω_ie_n 是地球自转角速度在 NED 下的投影，ω_en_n 是运移角速度（载体相对地心的角速度在 NED 下的投影）。它们出现在速度更新的哥式力项（−2(ω_ie + ω_en) × v）和姿态更新的导航系旋转 qnn 中。getQne、getQee、getQnn 等函数用于计算「导航系相对地心系」「地心系随时间」以及「导航系随时间」的旋转四元数，供位置和姿态更新使用。
+
+因此，地球模型在代码里的角色就是：在速度、位置、姿态的微分方程（或离散化后的递推式）里，提供 Rm、Rn、重力、ω_ie_n、ω_en_n 等参数；具体对应 ins/pins.cpp 中调用 EarthModel::computeNavParam、getGravity、getQnn、getQne、NDE2LLhMatrix 等的位置。
+公式的完整形式见教材，这里只强调「这些量在哪些步骤里被用到」。
+
+可以看到，地球模型并不是初始化阶段的一次性计算，而是在每一帧 INS 递推中动态参与姿态、速度和位置的更新。
+微分方程与积分：速度、位置、姿态
+惯导解算的本质是对一组非线性微分方程做离散积分：
+
+姿态：微分方程描述四元数对时间的导数与角速度的关系；离散化后变成「用当前角速度（经零偏补偿后）积分得到旋转增量，再与上一时刻姿态组合」。本项目在简化版本（USE_EASY_PINS）里采用前一时刻参数计算导航系旋转 qnn，用当前角速度加 Coning 补偿（1&#x2F;12·(ω_{k-1} × ω_k)）得到载体系旋转增量，再按 q_{b→n}k &#x3D; qnn · q{b→n}_{k-1} · qbb 更新姿态。Coning 补偿是为了在圆锥运动下减小一阶误差。
+速度：微分方程包含比力在导航系的投影、重力、哥式力（−2(ω_ie + ω_en) × v）。离散化后，比力由加速度计测量值经Sculling 补偿（0.5·(ω × a)）后转到导航系，再加重力增量与哥式力增量。本项目简化版里用前一时刻的导航参数和姿态，计算 dvN、重力项、哥式力项，然后 v_k &#x3D; v_{k-1} + dvN + gravity + coriolis。
+位置：微分方程描述经纬高对时间的导数与 NED 速度、曲率半径的关系。离散化后用「中点速度」和 NED→LLH 的转换矩阵 T 更新：pos_k &#x3D; pos_{k-1} + T · v_mid · dt，其中 T 由 EarthModel::NDE2LLhMatrix(lat, h) 给出。
+
+本项目没有采用高阶多子步积分（如 RK4 或多子样圆锥&#x2F;划桨补偿），而是采用简单的一阶&#x2F;中点式积分和一阶 Coning&#x2F;Sculling 补偿，在保证可读性和可维护性的前提下，满足练手与复习的目的。更高阶的积分格式和更完整的误差补偿，教材和工程实现里都有，这里不展开。
+明确不写的内容为避免写成课本，下面这些内容本篇不写，只列出名字，便于读者知道「存在但本项目未展开」：
+
+惯性系与非惯性系的详细推导：为什么在导航系下要加哥式力、运移角速度从何而来等，请直接看教材。
+复杂误差模型：安装误差（非正交、尺度因子）、高阶的圆锥&#x2F;划桨补偿、零偏的复杂模型等，本项目均未实现，只建模了最简单的零偏（在滤波器里估计）。
+高阶数值积分理论：多阶 Runge-Kutta、多子样算法等，本项目未采用，不展开推导。
+
+代码对应小结
+惯导解算：ins/pins.h、pins.cpp。Pins::propagate(dt) 内部根据 USE_EASY_PINS 调用 updateVelocityByMid、updatePositionByMid、updateAttitudeByMid（简化版）或 updateVelocity、updatePosition、updateAttitude（完整版）。状态存在 currState_（InsState：pos 纬经高、vel NED、quat 体到导航系）。
+地球模型：utils/earth_model.h、earth_model.cpp。WGS84 椭球、computeNavParam（Rm, Rn, Rmh, Rnh, wie_n, wen_n）、getGravity、NDE2LLhMatrix&#x2F;LLh2NEDMatrix、getQne&#x2F;getQee&#x2F;getQnn、getLLhByQne 等，被 pins.cpp 和滤波器 buildPhi 调用。
+姿态与旋转：utils/rotation.h 提供欧拉角与旋转矩阵、四元数的转换（matrix2euler、quaternion2euler、euler2quaternion 等）；Sophus 的 SO3d::exp、unit_quaternion() 在 pins.cpp 和 pose_estimator.cpp 中用于旋转矢量与四元数的转换。
+坐标系约定：README 与 ARCHITECTURE 中写明导航系 NED、载体系 FRD；位置为 LLH，速度为 NED，姿态四元数为 b→n，与代码中的存储一致。
+
+总结
+惯导的角色：在本项目中，惯导用 IMU 角速度与加速度在给定初始状态下递推位置、速度、姿态（名义状态），供卡尔曼预测使用，并作为组合系统对外输出的位姿。
+用到的知识：坐标系（NED&#x2F;FRD）统一约定；姿态用四元数递推，欧拉角用于配置与输出，旋转矩阵与旋转矢量在变换与误差表示中使用；地球模型（WGS84、Rm&#x2F;Rn、重力、ω_ie_n、ω_en_n）在速度、位置、姿态微分方程及其离散化中出现；采用简单的一阶&#x2F;中点式积分和一阶 Coning&#x2F;Sculling 补偿，不展开高阶积分理论。
+不写什么：惯性系与非惯性系的详细推导、安装误差等复杂误差模型、高阶数值积分与多子样补偿的推导；公式与完整理论见牛小骥《惯性导航原理与算法设计》等教材。
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>组合导航</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>组合导航</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>从源码到进程:01.程序的预处理</title>
     <url>/2025/09/18/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/01.%E7%A8%8B%E5%BA%8F%E7%9A%84%E9%A2%84%E5%A4%84%E7%90%86/</url>
     <content><![CDATA[前言在这个系列中，我们准备从 源码到进程 这个角度去分析，在 Linux 平台下，一个项目的文件，究竟是怎么一步步变成可执行文件，然后最终变成一个进程的。
@@ -3033,6 +3109,115 @@ LOG 宏展开成了 fprintf 调用，自动带上了 __FILE__ 和 __LINE__。
 
 在大型项目（如 spdlog、Linux 内核）中，预处理器是支撑跨平台和可配置性的关键机制。
 
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>从程序到进程</category>
+      </categories>
+      <tags>
+        <tag>linux</tag>
+        <tag>C++</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>从源码到进程:02.目标文件的生成</title>
+    <url>/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/</url>
+    <content><![CDATA[前言在之前的文章中，我们初步讲解了从源码到进程这个主题的预处理部分，在这篇文章中，我们将讲解目标文件(.o)的生成过程。
+通过了解 .o文件，可以帮助我们:
+
+定位 undefined reference &#x2F; multiple definition 等链接错误的根源
+理解重定位失败与对齐问题导致的运行时崩溃
+掌控编译器、汇编器与链接器之间的契约（ABI &#x2F; ELF &#x2F; linker script）。
+为什么很多编码规范中，不允许在头文件中定义或者声明全局变量
+
+核心理论什么是目标文件？目标文件（.o）是编译器将源码转化为机器码的中间产物，遵循 ELF（Executable and Linkable Format）格式。它包含代码、数据和元信息（如符号表、重定位表），但还不是可执行程序，需要链接器进一步处理。生成目标文件是编译过程的第三步，位于以下流程中：
+
+预处理：展开宏和头文件，生成 .i 文件。
+编译：将源码转为汇编代码（.s 文件），并优化。
+汇编：将汇编代码转为机器码，打包为 .o 文件。
+链接：合并多个 .o 文件和库，生成可执行文件。
+
+ELF文件与 .o 文件的核心结构在 Linux 上，.o 文件通常遵循 ELF 规范。一个典型的 ELF 可重定位文件包含：
+
+ELF Header：文件起始，包含魔数、位宽（ELF32&#x2F;ELF64）、文件类型（REL 表示 relocatable）等。
+Section Header Table：节区（section）的目录，每个节区都有名字、类型、大小、对齐等属性。
+Sections（节区）：实际的数据或元数据，常见节区有：
+.text：机器指令（函数体）
+.rodata：只读常量（字符串字面量、常量数组）
+.data：已初始化全局&#x2F;静态变量
+.bss：未初始化全局&#x2F;静态变量（NOBITS）
+.symtab &#x2F; .strtab：符号表与字符串表
+.rela.* &#x2F; .rel.*：重定位表（记录需要在链接或加载时修正的地址）
+.debug_*：DWARF 调试信息（可选）
+
+
+
+这种分节存储将代码、可读数据、可写数据和元信息解耦，使链接器可以按节合并、重定位，并允许调试器与性能分析工具独立读取所需信息。
+符号表（Symbol Table）与名字修饰符号表记录每个符号（函数、变量、文件名）在目标文件中的属性：名称、值（在可重定位文件中通常为节内偏移或 0）、大小、类型（FUNC&#x2F;OBJECT）、绑定（LOCAL&#x2F;GLOBAL&#x2F;WEAK）与所属节（Ndx）。
+
+LOCAL 符号仅在当前翻译单元可见。
+GLOBAL 符号可被链接器解析并跨文件引用。
+WEAK 符号允许被其它强符号覆盖（常用于库或可选实现）。
+
+C++ 采用名字修饰（name mangling）将类型信息编码到符号名中，链接器基于这些 mangled names 做匹配（比如 _Z3foov）。
+排障技巧：使用 nm, readelf -s, objdump -t 查看符号属性；注意 UND（未定义）、ABS（绝对符号）、T（text 段）等标志。
+重定位（Relocation）机制.o 文件不是可执行镜像，许多地址（函数调用、全局变量地址、常量地址等）在编译后仍然是相对或占位的。重定位表记录哪些位置需要在链接（静态链接）或加载（动态加载&#x2F;内核模块）时修正。
+重定位包含三要素：
+
+偏移（offset）
+符号（symbol）
+类型（relocation type）。
+
+不同架构有不同的重定位类型（如 x86_64 的 R_X86_64_PC32 &#x2F; R_X86_64_64 等），决定链接器如何将符号地址写入目标位置（绝对&#x2F;相对&#x2F;高&#x2F;低半字等）。
+重定位错误会导致页错误、未知指令或控制流错误；对于位置无关代码（PIC &#x2F; PIE）与内核模块，正确的重定位处理尤其关键。
+就像之前一直说的，生成源码的四个步骤中。汇编器负责把汇编代码的标签变为节内偏移并产生重定位条目（如果引用外部符号则不填地址）。这正是 .o 成为“部分实现 + 重定位数据”的原因。
+实操演示// object.cppint g_var_init = 10;int g_var_uninit;static int l_var_init = 15;static int l_var_uninit;extern void extern_func();int main()&#123;  extern_func();  return 0;&#125;
+
+通过如下命令生成目标文件
+g++ -c object.cpp -o object.o
+
+通过如下命令可以看到elf的头部
+readelf -h object.o
+发现，存在一些魔数，标记文件的真正类型；文件的类型是可重定位文件，因为目标文件不是真正的可执行程序，需要链接器将多个目标文件链接在一起之后，为每个符号找到真正的地址才是可以运行
+通过如下命令查看节区表
+readelf -S object.o
+
+其中 .data .bss 段分别存储着初始化和未初始化的 全局变量与静态变量，大小分别都是8个字节，因为都是两个int变量。
+可以看到 .bss 与 .comment的偏移量，也就是在文件中的实际读取位置都是0000005c。 是因为.bss 段在文件中是不占大小的，只是运行时在内存中占有大小，并且初始化为0；
+此外各个段的地址全是 0，因为是可重定位文件，此时分配没有意义。
+通过如下命令查看符号表
+readelf -s object.o
+
+可以看见,_ZL10l_var_init,_ZL12l_var_uninit,g_var_init,g_var_uninit,_Z11extern_funcv 这样的几个符号。
+其中_ZL10l_var_init,g_var_init的Ndx都是3，因为他们都是在 .data 段, Value值分别是0和4，是因为他们在.data段的位置偏移分别是0和4。同理_ZL12l_var_uninit,g_var_uninit的Ndx都是4，Value值分别是0和4，因为他们在 .bss 段，偏移0个字节和4个字节之后，分别读取4个字节的大小就是对应点的变量的值。
+_Z11extern_funcv 这个符号的 UND是因为，这是个外部符号，需要再链接确定。
+同时，看到 _ZL10l_var_init，g_var_init的Bind类型分别是 local与global，是因为static这个标识符限定了这个符号本身是局部的，只在当前目标文件可用，链接器是访问不了的。
+通过如下命令查看重定位表
+readelf -r object.o
+
+_Z11extern_funcv 这个符号，链接器会在连接时候修正，实现call extern_func这个函数的操作
+常用命令readelf -h file.o        # 查看 ELF 头readelf -S file.o        # 列出节区readelf -s file.o        # 符号表readelf -r file.o        # 重定位表nm file.o                # 简易符号表（T/U/D 等）objdump -d file.o        # 反汇编objcopy --strip-debug in.o out.o   # 去除调试段strip   file.o           # 去符号表与调试信息addr2line -e vmlinux &lt;addr&gt;  # 将地址转为 file:line（对 vmlinux）
+
+总结
+.o 文件是 可重定位文件，遵循 ELF 格式。
+
+它包含 节区（代码&#x2F;数据&#x2F;元信息）、符号表 和 重定位表。
+
+通过符号表和重定位机制，编译器和链接器能够协同工作，把多个 .o 文件合并为一个可执行程序。
+
+理解 .o 文件能帮助我们解决：
+
+链接错误（undefined reference &#x2F; multiple definition）；
+符号可见性问题（static &#x2F; global &#x2F; weak）；
+调试信息与 strip 的作用；
+为什么不应该在头文件中定义全局变量。
+
+
+
+一句话：
+
+目标文件 (.o) 是源码到可执行程序的关键中间形态，它承载了机器码、符号与重定位信息，是编译器与链接器之间的桥梁。
 
 ]]></content>
       <categories>
@@ -3229,115 +3414,6 @@ ar 与 ranlib 协作生成符号索引表，使链接器能快速定位符号；
 
 
 理解静态库机制，是深入掌握 Linux 编译系统与调试体系的关键。
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>从程序到进程</category>
-      </categories>
-      <tags>
-        <tag>linux</tag>
-        <tag>C++</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>从源码到进程:02.目标文件的生成</title>
-    <url>/2025/09/25/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/02.%E7%9B%AE%E6%A0%87%E6%96%87%E4%BB%B6%E7%9A%84%E7%94%9F%E6%88%90/</url>
-    <content><![CDATA[前言在之前的文章中，我们初步讲解了从源码到进程这个主题的预处理部分，在这篇文章中，我们将讲解目标文件(.o)的生成过程。
-通过了解 .o文件，可以帮助我们:
-
-定位 undefined reference &#x2F; multiple definition 等链接错误的根源
-理解重定位失败与对齐问题导致的运行时崩溃
-掌控编译器、汇编器与链接器之间的契约（ABI &#x2F; ELF &#x2F; linker script）。
-为什么很多编码规范中，不允许在头文件中定义或者声明全局变量
-
-核心理论什么是目标文件？目标文件（.o）是编译器将源码转化为机器码的中间产物，遵循 ELF（Executable and Linkable Format）格式。它包含代码、数据和元信息（如符号表、重定位表），但还不是可执行程序，需要链接器进一步处理。生成目标文件是编译过程的第三步，位于以下流程中：
-
-预处理：展开宏和头文件，生成 .i 文件。
-编译：将源码转为汇编代码（.s 文件），并优化。
-汇编：将汇编代码转为机器码，打包为 .o 文件。
-链接：合并多个 .o 文件和库，生成可执行文件。
-
-ELF文件与 .o 文件的核心结构在 Linux 上，.o 文件通常遵循 ELF 规范。一个典型的 ELF 可重定位文件包含：
-
-ELF Header：文件起始，包含魔数、位宽（ELF32&#x2F;ELF64）、文件类型（REL 表示 relocatable）等。
-Section Header Table：节区（section）的目录，每个节区都有名字、类型、大小、对齐等属性。
-Sections（节区）：实际的数据或元数据，常见节区有：
-.text：机器指令（函数体）
-.rodata：只读常量（字符串字面量、常量数组）
-.data：已初始化全局&#x2F;静态变量
-.bss：未初始化全局&#x2F;静态变量（NOBITS）
-.symtab &#x2F; .strtab：符号表与字符串表
-.rela.* &#x2F; .rel.*：重定位表（记录需要在链接或加载时修正的地址）
-.debug_*：DWARF 调试信息（可选）
-
-
-
-这种分节存储将代码、可读数据、可写数据和元信息解耦，使链接器可以按节合并、重定位，并允许调试器与性能分析工具独立读取所需信息。
-符号表（Symbol Table）与名字修饰符号表记录每个符号（函数、变量、文件名）在目标文件中的属性：名称、值（在可重定位文件中通常为节内偏移或 0）、大小、类型（FUNC&#x2F;OBJECT）、绑定（LOCAL&#x2F;GLOBAL&#x2F;WEAK）与所属节（Ndx）。
-
-LOCAL 符号仅在当前翻译单元可见。
-GLOBAL 符号可被链接器解析并跨文件引用。
-WEAK 符号允许被其它强符号覆盖（常用于库或可选实现）。
-
-C++ 采用名字修饰（name mangling）将类型信息编码到符号名中，链接器基于这些 mangled names 做匹配（比如 _Z3foov）。
-排障技巧：使用 nm, readelf -s, objdump -t 查看符号属性；注意 UND（未定义）、ABS（绝对符号）、T（text 段）等标志。
-重定位（Relocation）机制.o 文件不是可执行镜像，许多地址（函数调用、全局变量地址、常量地址等）在编译后仍然是相对或占位的。重定位表记录哪些位置需要在链接（静态链接）或加载（动态加载&#x2F;内核模块）时修正。
-重定位包含三要素：
-
-偏移（offset）
-符号（symbol）
-类型（relocation type）。
-
-不同架构有不同的重定位类型（如 x86_64 的 R_X86_64_PC32 &#x2F; R_X86_64_64 等），决定链接器如何将符号地址写入目标位置（绝对&#x2F;相对&#x2F;高&#x2F;低半字等）。
-重定位错误会导致页错误、未知指令或控制流错误；对于位置无关代码（PIC &#x2F; PIE）与内核模块，正确的重定位处理尤其关键。
-就像之前一直说的，生成源码的四个步骤中。汇编器负责把汇编代码的标签变为节内偏移并产生重定位条目（如果引用外部符号则不填地址）。这正是 .o 成为“部分实现 + 重定位数据”的原因。
-实操演示// object.cppint g_var_init = 10;int g_var_uninit;static int l_var_init = 15;static int l_var_uninit;extern void extern_func();int main()&#123;  extern_func();  return 0;&#125;
-
-通过如下命令生成目标文件
-g++ -c object.cpp -o object.o
-
-通过如下命令可以看到elf的头部
-readelf -h object.o
-发现，存在一些魔数，标记文件的真正类型；文件的类型是可重定位文件，因为目标文件不是真正的可执行程序，需要链接器将多个目标文件链接在一起之后，为每个符号找到真正的地址才是可以运行
-通过如下命令查看节区表
-readelf -S object.o
-
-其中 .data .bss 段分别存储着初始化和未初始化的 全局变量与静态变量，大小分别都是8个字节，因为都是两个int变量。
-可以看到 .bss 与 .comment的偏移量，也就是在文件中的实际读取位置都是0000005c。 是因为.bss 段在文件中是不占大小的，只是运行时在内存中占有大小，并且初始化为0；
-此外各个段的地址全是 0，因为是可重定位文件，此时分配没有意义。
-通过如下命令查看符号表
-readelf -s object.o
-
-可以看见,_ZL10l_var_init,_ZL12l_var_uninit,g_var_init,g_var_uninit,_Z11extern_funcv 这样的几个符号。
-其中_ZL10l_var_init,g_var_init的Ndx都是3，因为他们都是在 .data 段, Value值分别是0和4，是因为他们在.data段的位置偏移分别是0和4。同理_ZL12l_var_uninit,g_var_uninit的Ndx都是4，Value值分别是0和4，因为他们在 .bss 段，偏移0个字节和4个字节之后，分别读取4个字节的大小就是对应点的变量的值。
-_Z11extern_funcv 这个符号的 UND是因为，这是个外部符号，需要再链接确定。
-同时，看到 _ZL10l_var_init，g_var_init的Bind类型分别是 local与global，是因为static这个标识符限定了这个符号本身是局部的，只在当前目标文件可用，链接器是访问不了的。
-通过如下命令查看重定位表
-readelf -r object.o
-
-_Z11extern_funcv 这个符号，链接器会在连接时候修正，实现call extern_func这个函数的操作
-常用命令readelf -h file.o        # 查看 ELF 头readelf -S file.o        # 列出节区readelf -s file.o        # 符号表readelf -r file.o        # 重定位表nm file.o                # 简易符号表（T/U/D 等）objdump -d file.o        # 反汇编objcopy --strip-debug in.o out.o   # 去除调试段strip   file.o           # 去符号表与调试信息addr2line -e vmlinux &lt;addr&gt;  # 将地址转为 file:line（对 vmlinux）
-
-总结
-.o 文件是 可重定位文件，遵循 ELF 格式。
-
-它包含 节区（代码&#x2F;数据&#x2F;元信息）、符号表 和 重定位表。
-
-通过符号表和重定位机制，编译器和链接器能够协同工作，把多个 .o 文件合并为一个可执行程序。
-
-理解 .o 文件能帮助我们解决：
-
-链接错误（undefined reference &#x2F; multiple definition）；
-符号可见性问题（static &#x2F; global &#x2F; weak）；
-调试信息与 strip 的作用；
-为什么不应该在头文件中定义全局变量。
-
-
-
-一句话：
-
-目标文件 (.o) 是源码到可执行程序的关键中间形态，它承载了机器码、符号与重定位信息，是编译器与链接器之间的桥梁。
-
 ]]></content>
       <categories>
         <category>程序员的自我修养</category>
