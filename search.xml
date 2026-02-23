@@ -1373,6 +1373,80 @@ gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事
       </tags>
   </entry>
   <entry>
+    <title>grpc实践之路:05.服务端与客户端的连接</title>
+    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
+    <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
+这引出了一个最根本的问题，也是本文将要探究的核心：
+一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
+我们将像科学家一样，首先提出一个猜想，然后深入源码和网络协议的细节，去寻找证据来证明或修正它。
+我的猜想如下：gRPC 的一一对应机制，是一个编译时和运行时协同工作的结果。
+
+编译时 - 生成“身份证”： protoc 工具在生成代码时，会为每一个 RPC 方法创建一个全局唯一的“身份证”（一个字符串签名）。
+运行时 - 递送“身份证”： 客户端在发起调用时，会将这个“身份证”放入网络请求的某个标准位置（比如 HTTP&#x2F;2 的请求头），连同序列化好的参数一起发送出去。
+服务端 - 验证“身份证”： 服务端在启动时就建立了一个“身份证 -&gt; 处理函数”的路由表。收到请求后，只需读取“身份证”，就能快速找到对应的处理函数。
+
+本文，我们就将带着这个猜想，通过分析生成代码和Wireshark 抓包，完整地走一遍 RPC 的全链路之旅。
+
+第一站：编译时的约定 —— Stub 中隐藏的“身份证”一切的起点都在客户端。我们从 protoc 生成的 Stub 类入手，寻找“身份证”是如何被制造出来的。
+&#x2F;&#x2F; 客户端代码grpc::Status status &#x3D; stub_-&gt;GetVersion(context, request, &amp;response);
+当我们查看生成的 controller.grpc.pb.cc 文件时，证据立刻就出现了：
+controller.grpc.pb.cc (生成代码摘录)
+// 证据 1：定义了一个全局唯一的“方法名身份证”  static const char* Controller_method_names[] = &#123;  &quot;/controller.Controller/GetVersion&quot;,  &#125;;// ...// 证据 2：Stub 的 GetVersion 方法实现  ::grpc::Status Controller::Stub::GetVersion(...) &#123;  // 将“身份证”和所有参数，打包交给一个更底层的通用函数  return ::grpc::internal::BlockingUnaryCall&lt;...&gt;(channel_.get(), rpcmethod_GetVersion_, ...);  &#125;
+
+源码剖析：
+
+方法名字符串： protoc 明确地为我们的 GetVersion RPC 生成了一个全局唯一的字符串标识符 “&#x2F;controller.Controller&#x2F;GetVersion”。这完美印证了我们猜想的第一步——“身份证”是在编译时被创建的。
+BlockingUnaryCall： 用户的调用最终被委托给了这个内部函数。Stub 的作用，就是为这个通用函数准备好所有必要的参数，其中最重要的就是 rpcmethod_GetVersion_，这是一个封装了上述“身份证”字符串的对象。
+
+至此，我们已经证明了，每一次 RPC 调用在 C++ 代码层面，都与一个唯一的方法签名字符串绑定在了一起。但这个字符串是如何跨越网络的呢？
+第二站：网络上的“信封” —— Wireshark 抓包分析理论和源码分析固然重要，但网络抓包的结果才是“铁证”。我使用 Wireshark 捕获了一次客户端调用 GetVersion 的网络流量，结果完全印证了我们的猜想。
+一次 gRPC 调用在网络上表现为一次 HTTP&#x2F;2 的请求-响应交换。在请求的 HEADERS 帧中，我们发现了决定性的证据：
+Wireshark 抓包结果 (概念示意)
+Hypertext Transfer Protocol 2  Stream: HEADERS, Stream ID: 1, Length 87  :method: POST  :scheme: http  :path: /controller.Controller/GetVersion  &lt;-- 铁证如山！  :authority: localhost:50051  content-type: application/grpc  ...
+
+
+抓包分析：
+
+:path 伪头： 我们在 Stub 源码中找到的那个“身份证”字符串 “&#x2F;controller.Controller&#x2F;GetVersion”，被原封不动地放在了 HTTP&#x2F;2 的 :path 伪头中。
+这就是 gRPC 的“信封”！ 它清晰地告诉了网络上的任何接收方：“这封信是寄给 &#x2F;controller.Controller&#x2F;GetVersion 这个处理单元的”。
+
+同样，在响应的 HEADERS 帧中，我们也能看到 gRPC 的状态码，而在 DATA 帧中，则是 Protobuf 序列化后的响应体。
+小结： Wireshark 的抓包结果，完美地连接了我们的代码分析和网络现实。它证明了 gRPC 的“寻址”机制，就是通过将编译时生成的唯一方法签名，作为运行时 HTTP&#x2F;2 请求的 :path 来实现的。
+第三站：服务端的“中央调度室”现在，请求已经带着清晰的“信封”抵达服务端。服务端是如何根据这个地址，找到正确的处理函数的呢？答案的起点，在于 Service 的构造函数。
+controller.grpc.pb.cc (生成代码摘录)
+Controller::Service::Service() &#123;  // 在构造时，就调用 AddMethod  AddMethod(new ::grpc::internal::RpcServiceMethod(  Controller_method_names[0], // Key: 还是那个唯一的“身份证”  ...,  new ::grpc::internal::RpcMethodHandler&lt;...&gt;(...))); // Value: 处理器  &#125;
+
+源码剖析：
+
+AddMethod： Service 基类在构造时，就为每个 RPC 方法调用 AddMethod。这个函数的核心作用，就是将方法签名字符串 (Key) 和一个知道如何调用具体实现的处理器 Handler (Value) 绑定在一起。
+
+当我们调用 ServerBuilder::RegisterService(&amp;service) 时，这些 Key-Value 对会被收集起来，并通过底层的 grpc_server_register_method 函数，正式注册到 grpc-core 内部的一个方法路由表中。从逻辑上推断，这个路由表必然是一个哈希表，以保证 O(1) 的查找效率。
+至此，服务端的“中央调度室”就构建完成了。 当一个网络请求到来时：
+
+grpc-core 的 I&#x2F;O 线程接收到 HTTP&#x2F;2 请求，解析出 :path 头，得到 Key。
+以这个 Key 在内部的哈希路由表中进行查找，得到 Value (对应的 Handler)。
+这个 Handler 随后会反序列化请求的 Protobuf 数据，并最终调用我们自己重写的 ControllerServiceImpl::GetVersion C++ 成员函数。
+
+结论：从猜想到证据的闭环通过这次“代码生成分析”和“网络抓包”相结合的探索，我们为开篇提出的核心问题，找到了一个完整且证据确凿的答案：
+gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RPC 调用与网络请求的一一对应：
+
+编译时契约： protoc 为每个 RPC 方法生成一个全局唯一的方法签名字符串。
+运行时传输： 客户端将此签名作为 HTTP&#x2F;2 的 :path，连同 Protobuf 数据一起发送。
+服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
+
+正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>grpc实践之路:06.rpc的大问题思考</title>
     <url>/2025/08/06/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:06.rpc%E7%9A%84%E5%A4%A7%E9%97%AE%E9%A2%98%E6%80%9D%E8%80%83/</url>
     <content><![CDATA[前言在之前的源码剖析文章中，我们深入了 gRPC 的一些具体实现。
@@ -1458,80 +1532,6 @@ Protobuf, JSON, FlatBuffers 等就是不同的序列化方案。
 问题 6：如何做好高并发下的线程安全？
 
 四、结语这，就是我的探索地图。希望它也能为你带来一些启发，如果有什么错误或者不足，希望也能在评论区指出。
-]]></content>
-      <categories>
-        <category>动手实践-三方库</category>
-        <category>grpc</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>grpc</tag>
-        <tag>进程间通信</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>grpc实践之路:05.服务端与客户端的连接</title>
-    <url>/2025/07/17/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:05.%E6%9C%8D%E5%8A%A1%E7%AB%AF%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%BF%9E%E6%8E%A5/</url>
-    <content><![CDATA[前言：探究 gRPC 的“黑盒”在我们之前的实践中，我们已经能熟练地使用 gRPC 的 API。但每一次 stub-&gt;GetVersion() 的调用，背后都是一个被精心封装的复杂网络通信过程。
-这引出了一个最根本的问题，也是本文将要探究的核心：
-一次 RPC 调用，在技术上是如何保证这个网络请求与远端函数一一对应的？
-我们将像科学家一样，首先提出一个猜想，然后深入源码和网络协议的细节，去寻找证据来证明或修正它。
-我的猜想如下：gRPC 的一一对应机制，是一个编译时和运行时协同工作的结果。
-
-编译时 - 生成“身份证”： protoc 工具在生成代码时，会为每一个 RPC 方法创建一个全局唯一的“身份证”（一个字符串签名）。
-运行时 - 递送“身份证”： 客户端在发起调用时，会将这个“身份证”放入网络请求的某个标准位置（比如 HTTP&#x2F;2 的请求头），连同序列化好的参数一起发送出去。
-服务端 - 验证“身份证”： 服务端在启动时就建立了一个“身份证 -&gt; 处理函数”的路由表。收到请求后，只需读取“身份证”，就能快速找到对应的处理函数。
-
-本文，我们就将带着这个猜想，通过分析生成代码和Wireshark 抓包，完整地走一遍 RPC 的全链路之旅。
-
-第一站：编译时的约定 —— Stub 中隐藏的“身份证”一切的起点都在客户端。我们从 protoc 生成的 Stub 类入手，寻找“身份证”是如何被制造出来的。
-&#x2F;&#x2F; 客户端代码grpc::Status status &#x3D; stub_-&gt;GetVersion(context, request, &amp;response);
-当我们查看生成的 controller.grpc.pb.cc 文件时，证据立刻就出现了：
-controller.grpc.pb.cc (生成代码摘录)
-// 证据 1：定义了一个全局唯一的“方法名身份证”  static const char* Controller_method_names[] = &#123;  &quot;/controller.Controller/GetVersion&quot;,  &#125;;// ...// 证据 2：Stub 的 GetVersion 方法实现  ::grpc::Status Controller::Stub::GetVersion(...) &#123;  // 将“身份证”和所有参数，打包交给一个更底层的通用函数  return ::grpc::internal::BlockingUnaryCall&lt;...&gt;(channel_.get(), rpcmethod_GetVersion_, ...);  &#125;
-
-源码剖析：
-
-方法名字符串： protoc 明确地为我们的 GetVersion RPC 生成了一个全局唯一的字符串标识符 “&#x2F;controller.Controller&#x2F;GetVersion”。这完美印证了我们猜想的第一步——“身份证”是在编译时被创建的。
-BlockingUnaryCall： 用户的调用最终被委托给了这个内部函数。Stub 的作用，就是为这个通用函数准备好所有必要的参数，其中最重要的就是 rpcmethod_GetVersion_，这是一个封装了上述“身份证”字符串的对象。
-
-至此，我们已经证明了，每一次 RPC 调用在 C++ 代码层面，都与一个唯一的方法签名字符串绑定在了一起。但这个字符串是如何跨越网络的呢？
-第二站：网络上的“信封” —— Wireshark 抓包分析理论和源码分析固然重要，但网络抓包的结果才是“铁证”。我使用 Wireshark 捕获了一次客户端调用 GetVersion 的网络流量，结果完全印证了我们的猜想。
-一次 gRPC 调用在网络上表现为一次 HTTP&#x2F;2 的请求-响应交换。在请求的 HEADERS 帧中，我们发现了决定性的证据：
-Wireshark 抓包结果 (概念示意)
-Hypertext Transfer Protocol 2  Stream: HEADERS, Stream ID: 1, Length 87  :method: POST  :scheme: http  :path: /controller.Controller/GetVersion  &lt;-- 铁证如山！  :authority: localhost:50051  content-type: application/grpc  ...
-
-
-抓包分析：
-
-:path 伪头： 我们在 Stub 源码中找到的那个“身份证”字符串 “&#x2F;controller.Controller&#x2F;GetVersion”，被原封不动地放在了 HTTP&#x2F;2 的 :path 伪头中。
-这就是 gRPC 的“信封”！ 它清晰地告诉了网络上的任何接收方：“这封信是寄给 &#x2F;controller.Controller&#x2F;GetVersion 这个处理单元的”。
-
-同样，在响应的 HEADERS 帧中，我们也能看到 gRPC 的状态码，而在 DATA 帧中，则是 Protobuf 序列化后的响应体。
-小结： Wireshark 的抓包结果，完美地连接了我们的代码分析和网络现实。它证明了 gRPC 的“寻址”机制，就是通过将编译时生成的唯一方法签名，作为运行时 HTTP&#x2F;2 请求的 :path 来实现的。
-第三站：服务端的“中央调度室”现在，请求已经带着清晰的“信封”抵达服务端。服务端是如何根据这个地址，找到正确的处理函数的呢？答案的起点，在于 Service 的构造函数。
-controller.grpc.pb.cc (生成代码摘录)
-Controller::Service::Service() &#123;  // 在构造时，就调用 AddMethod  AddMethod(new ::grpc::internal::RpcServiceMethod(  Controller_method_names[0], // Key: 还是那个唯一的“身份证”  ...,  new ::grpc::internal::RpcMethodHandler&lt;...&gt;(...))); // Value: 处理器  &#125;
-
-源码剖析：
-
-AddMethod： Service 基类在构造时，就为每个 RPC 方法调用 AddMethod。这个函数的核心作用，就是将方法签名字符串 (Key) 和一个知道如何调用具体实现的处理器 Handler (Value) 绑定在一起。
-
-当我们调用 ServerBuilder::RegisterService(&amp;service) 时，这些 Key-Value 对会被收集起来，并通过底层的 grpc_server_register_method 函数，正式注册到 grpc-core 内部的一个方法路由表中。从逻辑上推断，这个路由表必然是一个哈希表，以保证 O(1) 的查找效率。
-至此，服务端的“中央调度室”就构建完成了。 当一个网络请求到来时：
-
-grpc-core 的 I&#x2F;O 线程接收到 HTTP&#x2F;2 请求，解析出 :path 头，得到 Key。
-以这个 Key 在内部的哈希路由表中进行查找，得到 Value (对应的 Handler)。
-这个 Handler 随后会反序列化请求的 Protobuf 数据，并最终调用我们自己重写的 ControllerServiceImpl::GetVersion C++ 成员函数。
-
-结论：从猜想到证据的闭环通过这次“代码生成分析”和“网络抓包”相结合的探索，我们为开篇提出的核心问题，找到了一个完整且证据确凿的答案：
-gRPC 通过一个编译时和运行时协同工作的精巧机制，保证了 RPC 调用与网络请求的一一对应：
-
-编译时契约： protoc 为每个 RPC 方法生成一个全局唯一的方法签名字符串。
-运行时传输： 客户端将此签名作为 HTTP&#x2F;2 的 :path，连同 Protobuf 数据一起发送。
-服务端路由： 服务端在启动时，已构建好一个从方法签名到处理函数的哈希路由表，收到请求后按图索骥，实现 O(1) 高效分发。
-
-正是这套标准化的“身份证制造 -&gt; 邮寄 -&gt; 验证”体系，构建起了 gRPC 强大、高效且灵活的 RPC 世界。
 ]]></content>
       <categories>
         <category>动手实践-三方库</category>
@@ -1742,91 +1742,6 @@ Channel 作为事件分发的核心： 它封装了文件描述符和相关的�
       </tags>
   </entry>
   <entry>
-    <title>muduo源码剖析:04.Buffer设计分析</title>
-    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
-    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
-在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
-
-假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
-如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
-在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
-在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
-
-这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
-在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
-本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
-
-muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
-+——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
-
-prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
-readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
-writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
-
-这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
-核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
-class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
-
-
-buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
-readerIndex_: size_t 类型，标记可读数据的起始位置。
-writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
-
-通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
-size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
-
-基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
-void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
-
-核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
-2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
-void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
-
-在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
-空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
-
-内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
-外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
-
-void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
-
-这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
-高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
-ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
-
-readFd 的设计有几个显著优点：  
-
-减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
-避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
-避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
-栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
-
-其他实用特性
-网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
-头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
-查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
-
-总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
-其核心设计启示包括：
-
-空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
-减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
-设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
-接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
-
-理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>muduo</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>muduo</tag>
-        <tag>网络库</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>muduo源码剖析:03.定时器的实现</title>
     <url>/2025/06/04/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:03.%E5%AE%9A%E6%97%B6%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0/</url>
     <content><![CDATA[前言在muduo源码剖析的前两篇文章中，我们深入探讨了 muduo 的核心并发模型——“One Loop Per Thread” 的实现，以及 TCP连接从建立、数据收发到关闭的完整生命周期管理。
@@ -1932,6 +1847,91 @@ std::set 管理定时器： 利用 std::set&lt;std::pair&lt;Timestamp, Timer*&gt
 处理回调期间的取消： 通过 callingExpiredTimers_ 标志和 cancelingTimers_集合，优雅地处理了在执行定时器回调期间，这些定时器（特别是重复定时器）又被用户请求取消的复杂情况。
 资源管理： Timer 对象通过 new 创建，并在不再需要时（非重复到期、或被取消、或 TimerQueue 析构时）通过 delete释放。
 
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>muduo</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>muduo</tag>
+        <tag>网络库</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>muduo源码剖析:04.Buffer设计分析</title>
+    <url>/2025/06/09/muduo/muduo%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90:04.Bugffer%E8%AE%BE%E8%AE%A1%E5%88%86%E6%9E%90/</url>
+    <content><![CDATA[前言在本系列之前的源码剖析中，我们已经分析了 muduo “一个线程一个EventLoop”的实现方式、网络连接事件的处理（三个半事件）、以及 TimerQueue 如何将定时器纳入事件循环框架。至此，我们对 muduo 的事件驱动逻辑和核心调度机制已经有了深入的理解。
+在正式进入 Buffer 的剖析前，让我们先重新考虑下一下陈硕大佬在《Linux高性能网络编程》一书的 6.4.1 小节中提出的关于为什么要使用微应用层缓冲区的问题：
+
+假设应用程序需要发送 40kB 数据，但是操作系统的 TCP 发送缓冲区只有 25kB 剩余空间，那么剩下的 15kB 数据怎么办？如果等待 OS 缓冲区可用，会阻塞当前线程…
+如果应用程序随后又要发送 50kB 数据，而此时应用层发送缓冲区中尚有未发送的数据…那么网络库应该将这 50kB 数据追加到发送缓冲区的末尾，而不能立刻尝试 write()，因为这样有可能打乱数据的顺序。
+在非阻塞网络编程中，为什么要使用应用层接收缓冲区？假如一次读到的数据不够一个完整的数据包，那么这些已经读到的数据是不是应该先暂存在某个地方…？
+在非阻塞网络编程中，如何设计并使用缓冲区？一方面我们希望减少系统调用，一次读的数据越多越划算…另一方面，我们希望减少内存占用…muduo 用 readv(2) 结合栈上空间巧妙地解决了这个问题。
+
+这些问题实际上在说一个事情：如何在非阻塞 I&#x2F;O 模型下，高效、安全地处理数据的收发和内存管理。 
+在计算机界有一个经典的论断：程序 = 数据结构 + 算法 ,muduo::net::Buffer就是陈硕大佬解决此问题的数据结构，也是他此问题的答案。
+本文，我们将深入剖析 muduo::net::Buffer 的设计与实现，理解其如何通过精巧的内部结构和操作，实现高效的内存管理和数据处理，从而为 muduo 的高性能网络 I&#x2F;O 提供坚实基础。
+
+muduo::Buffer 概览与设计目标muduo::net::Buffer 的核心目标是提供一个可动态增长的缓冲区，用于暂存网络套接字读写的数据。其设计深受 Netty ChannelBuffer 的启发，采用了经典的三段式内存布局：
++——————-+——————+——————+| prependable bytes |  readable bytes  |  writable bytes  ||                   |     (CONTENT)    |                  |+——————-+——————+——————+|                   |                  |                  |0      &lt;&#x3D;      readerIndex   &lt;&#x3D;   writerIndex    &lt;&#x3D;     size
+
+prependable bytes (可预置空间): 位于缓冲区的最前端。它的一个妙用是在已有数据前方便地添加协议头（如消息长度），而无需移动现有数据。muduo 默认预留了 kCheapPrepend &#x3D; 8 字节。
+readable bytes (可读数据区): 存储了从网络接收到或准备发送的实际有效数据，从 readerIndex_ 开始，到 writerIndex_ 结束。
+writable bytes (可写空间): 位于可读数据之后，用于追加新的数据，从 writerIndex_ 开始，到缓冲区末尾结束。
+
+这种设计使得 Buffer 在处理网络协议和进行数据读写时非常灵活和高效。
+核心数据成员与内存布局Buffer 类的核心主要由以下三个成员构成：
+class Buffer : public muduo::copyable  &#123;  public:  static const size_t kCheapPrepend = 8;  static const size_t kInitialSize = 1024;explicit Buffer(size_t initialSize = kInitialSize): buffer_(kCheapPrepend + initialSize), // 内部使用 std::vector&lt;char&gt; 存储数据  readerIndex_(kCheapPrepend),          // 读指针，初始指向预留空间之后  writerIndex_(kCheapPrepend)           // 写指针，初始与读指针相同  &#123;  assert(readableBytes() == 0);  assert(writableBytes() == initialSize);  assert(prependableBytes() == kCheapPrepend);  &#125;  // ...  private:  std::vector&lt;char&gt; buffer_; // 底层存储  size_t readerIndex_;       // 读指针索引  size_t writerIndex_;       // 写指针索引  // ...  &#125;;
+
+
+buffer_: 一个 std::vector，作为实际存储数据的底层容器。其初始大小为 kCheapPrepend + initialSize。
+readerIndex_: size_t 类型，标记可读数据的起始位置。
+writerIndex_: size_t 类型，标记可读数据的结束位置，同时也是可写空间的起始位置。
+
+通过这两个索引，我们可以方便地计算出三段空间的大小，并获取可读数据的指针：
+size_t readableBytes() const  &#123; return writerIndex_ - readerIndex_; &#125; // 可读数据长度size_t writableBytes() const  &#123; return buffer_.size() - writerIndex_; &#125; // 可写空间长度size_t prependableBytes() const  &#123; return readerIndex_; &#125; // 可预置空间长度const char* peek() const  &#123; return begin() + readerIndex_; &#125;
+
+基本操作：数据读取 (Retrieve) 与追加 (Append)1. 数据读取 (Retrieve) - 逻辑上的消耗当数据被应用程序消耗后，需要从 Buffer 中“取出”这部分数据。muduo::Buffer 并不立即删除内存，而是通过移动 readerIndex_ 来高效地完成这个操作：
+void Buffer::retrieve(size_t len)  &#123;  assert(len &lt;= readableBytes());  if (len &lt; readableBytes())  &#123;  readerIndex_ += len; // 简单地将读指针后移  &#125;  else // 如果取出的长度等于或超过可读数据长度，则全部取出  &#123;  retrieveAll();  &#125;  &#125;void Buffer::retrieveAll()  &#123;  // 将读写指针都重置到预留空间之后，表示缓冲区已空。  // 之前已读的数据空间（0 到 readerIndex_）被逻辑上回收，成为新的 prependable 空间。  readerIndex_ = kCheapPrepend;  writerIndex_ = kCheapPrepend;  &#125;string Buffer::retrieveAsString(size_t len)  &#123;  assert(len &lt;= readableBytes());  string result(peek(), len); // 从可读区构造字符串  retrieve(len); // 更新读指针  return result;  &#125;
+
+核心思想是通过增加 readerIndex_ 来“丢弃”已处理的数据，这些数据在物理上并未立即从 buffer_ 中删除，只是逻辑上变为不可读。当 retrieveAll() 被调用时，读写指针会重置，为下一次写入腾出大量空间。
+2. 数据追加 (Append) - 解决系统缓冲区满的问题向 Buffer 中写入新数据是通过 append 系列方法实现的，这会移动 writerIndex_。这正是解决文章开头提出的“系统发送缓冲区满，数据怎么办”问题的答案——先将数据追加到应用层的 Buffer 中。
+void Buffer::append(const char* /*restrict*/ data, size_t len)  &#123;  ensureWritableBytes(len); // 确保有足够的可写空间  std::copy(data, data+len, beginWrite()); // 拷贝数据到可写区  hasWritten(len); // 更新写指针  &#125;void Buffer::hasWritten(size_t len) // 更新写指针  &#123;  assert(len &lt;= writableBytes());  writerIndex_ += len;  &#125;
+
+在追加数据前，会调用 ensureWritableBytes(len) 来确保有足够的空间。如果空间不足，则会触发 makeSpace(len) 逻辑。
+空间管理与扩容：makeSpace 的智慧makeSpace 是 Buffer 内存管理的核心，它智能地采取两种策略来获取更多可写空间：
+
+内部腾挪 (空间复用)： 如果 writableBytes() + prependableBytes()（即总的空闲空间）足够大，它会选择将当前可读数据 (readerIndex_ 到 writerIndex_ 之间的内容) 向前移动到 kCheapPrepend 位置，从而将 prependableBytes 的已读空间转化为新的 writableBytes。这种方式避免了 std::vector 的重新分配和数据拷贝（如果 resize 导致了重新分配），效率极高。
+外部扩容 (内存增长)： 如果总空闲空间也不够用，说明缓冲区确实需要增长。此时，只能通过 buffer_.resize(writerIndex_ + len) 来扩展底层 std::vector 的大小。
+
+void Buffer::makeSpace(size_t len)  &#123;  // 条件：总空闲空间不足以容纳 len 和 kCheapPrepend  if (writableBytes() + prependableBytes() &lt; len + kCheapPrepend)  &#123;  // 只能扩容 vector  buffer_.resize(writerIndex_ + len);  &#125;  else // 总空闲空间足够，通过移动数据来腾出可写空间  &#123;  assert(kCheapPrepend &lt; readerIndex_); // 确保 prependableBytes 区域确实有已读空间  size_t readable = readableBytes();  // 将 [readerIndex_, writerIndex_) 的数据拷贝到 [kCheapPrepend, kCheapPrepend + readable)  std::copy(begin() + readerIndex_,  begin() + writerIndex_,  begin() + kCheapPrepend);  readerIndex_ = kCheapPrepend; // 更新读指针  writerIndex_ = readerIndex_ + readable; // 更新写指针  assert(readable == readableBytes());  &#125;  &#125;
+
+这种“优先内部腾挪，实在不行再扩容”的策略，完美兼顾了效率和空间利用率。
+高效的 Socket 读操作：readFd 与 readv 的绝妙配合muduo 通常工作在 LT (电平触发) 模式下，为了避免因数据未读完而导致的事件重复触发，需要一次性将 socket 缓冲区的数据尽可能读完。Buffer::readFd 正是为此设计的，它通过 readv (分散读) 系统调用和栈上临时缓冲区 extrabuf，巧妙地解决了这个问题，同时优化了性能。
+ssize_t Buffer::readFd(int fd, int* savedErrno)  &#123;  char extrabuf[65536]; // 在栈上分配一个较大的临时缓冲区 (64KB)  struct iovec vec[2];  const size_t writable = writableBytes(); // Buffer 内部当前可写空间// 第一块 iovec 指向 Buffer 内部的可写空间  vec[0].iov_base = begin() + writerIndex_;  vec[0].iov_len = writable;  // 第二块 iovec 指向栈上的 extrabuf  vec[1].iov_base = extrabuf;  vec[1].iov_len = sizeof extrabuf;// 如果 Buffer 内部可写空间较小，则同时使用两块 iovec 进行读操作  const int iovcnt = (writable &lt; sizeof extrabuf) ? 2 : 1;  const ssize_t n = sockets::readv(fd, vec, iovcnt); // 一次系统调用，最多读取 writable + 64KB 数据if (n &lt; 0)  &#123;  *savedErrno = errno;  &#125;  else if (implicit_cast&lt;size_t&gt;(n) &lt;= writable) // 读取的数据全部放入了 Buffer 的可写区  &#123;  writerIndex_ += n;  &#125;  else // 读取的数据量大于 Buffer 内部可写空间，说明 extrabuf 被用到了  &#123;  writerIndex_ = buffer_.size(); // Buffer 内部可写空间已写满  append(extrabuf, n - writable); // 将 extrabuf 中多余的数据追加到 Buffer (此时会触发 makeSpace 扩容)  &#125;  return n;  &#125;  
+
+readFd 的设计有几个显著优点：  
+
+减少系统调用： 通过 readv 和 extrabuf，即使 Buffer 内部当前可写空间不大，也能尝试一次性从内核读取更多数据，避免了多次 read 系统调用。  
+避免内存浪费： 解决了文章开头提出的“为每个连接分配大的缓冲区导致内存浪费”的问题。Buffer 可以以较小的初始大小启动，readFd 利用栈上临时空间来处理突发的大量数据，只有在确认需要时才真正扩容 Buffer。  
+避免 ioctl(FIONREAD)： 它没有先查询有多少数据可读，而是直接尝试读取，更加高效。  
+栈上缓冲区： extrabuf 分配在栈上，避免了额外的堆内存分配开销。
+
+其他实用特性
+网络字节序处理： Buffer 提供了一系列 appendIntXX、readIntXX、peekIntXX 方法，方便地处理网络字节序（Big Endian）的整型数据。  
+头部预置 (prepend)： 利用 prependableBytes_ 空间，在可读数据前高效地添加数据，非常适合用于封装协议头。  
+查找与收缩： findCRLF() &#x2F; findEOL() 辅助解析文本协议；shrink() 用于在 Buffer 容量远大于实际数据时回收内存。
+
+总结与设计启示muduo::net::Buffer 通过其精巧的三段式内存布局、灵活的读写指针以及高效的空间管理和 I&#x2F;O 策略，完美地回答了文章开头提出的所有关于网络编程中缓冲区设计的难题。 它为 muduo 网络库提供了坚实的数据缓冲基础。
+其核心设计启示包括：
+
+空间复用优于频繁分配： kCheapPrepend 的设计和 makeSpace 中优先移动数据的策略，体现了对内存分配和数据拷贝的优化。  
+减少系统调用是关键： readFd 中使用 readv 和栈上大缓冲区，是典型的用少量计算换取大量 I&#x2F;O 系统调用开销的性能优化范例。  
+设计要贴合场景： Buffer 的所有设计都紧密围绕 TCP 网络编程的特点和痛点，如协议头添加、避免阻塞等。  
+接口的完备性与易用性： 提供了丰富的辅助函数，使得上层业务处理数据和解析协议变得更加简单和安全。
+
+理解了 Buffer 的设计，我们就能更好地理解 muduo 中数据是如何在网络连接中高效流转的。至此，我们对 muduo 核心的并发模型、事件处理、时间管理以及数据缓冲都有了深入的认识。
 ]]></content>
       <categories>
         <category>源码分析</category>
@@ -2050,69 +2050,6 @@ RAII + 智能指针是 C++ 的精髓
       </tags>
   </entry>
   <entry>
-    <title>spdlog源码阅读:01.异步机制解析</title>
-    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
-    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
-
-spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
-跨平台： 支持windows,linux,android等多个平台
-功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
-阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
-
-从demo出发：追踪日志消息的产生，处理和输出路径
-梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
-分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
-可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
-
-以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
-注：本文分析的源码为spdlog的v1.15.1版本
-spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
-我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
-#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
-日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
-日志生产
-logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
-log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
-在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
-在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
-
-日志消费
-线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
-在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
-spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
-以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
-上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
-
-可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
-强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
-spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
-//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
-线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
-spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
-thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
-
-主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
-formatter：格式化日志消息的基类
-sink: 日志输出的基类
-spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
-mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
-template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
-通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
-一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
-]]></content>
-      <categories>
-        <category>源码分析</category>
-        <category>spdlog</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>spdlog</tag>
-        <tag>日志系统</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>spdlog源码阅读:02.sink分析</title>
     <url>/2025/04/29/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:02.sink%E5%88%86%E6%9E%90/</url>
     <content><![CDATA[引言上一篇文章讲解了主要spdlog的异步模式及其实现方式，其中讲到了spdlog中负责将日志输出到具体的地方的类是sink。这篇文章就会具体的分析daily_file_sink和rotating_file_sink的部分源码，分析下spdlog是怎么实现按日分割和按尺寸分割日志的。
@@ -2181,6 +2118,69 @@ rotating_file_sink
 磁盘空间控制
 
 
+]]></content>
+      <categories>
+        <category>源码分析</category>
+        <category>spdlog</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>spdlog</tag>
+        <tag>日志系统</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>spdlog源码阅读:01.异步机制解析</title>
+    <url>/2025/04/23/spdlog/spdlog%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB:01.%E5%BC%82%E6%AD%A5%E6%9C%BA%E5%88%B6%E8%A7%A3%E6%9E%90/</url>
+    <content><![CDATA[引言在之前的工作中使用spdlog这个开源库封装了一个异步的日志模块供上层应用使用，并借着这个机会学习阅读了spdlog的源码，在使用和阅读的过程中有一些心得，也踩了一些坑，最近终于稍微闲暇下来，准备将自己阅读源码和分析源码过程记录下来，方便日后自己的学习和复盘。
+
+spdlog的优势便于集成：提供了头文件模式，可以直接在源码中集成
+跨平台： 支持windows,linux,android等多个平台
+功能丰富： 提供了同步，异步日志等多种日志模式，并且提供了丰富的格式化选择和日志输出选择 
+阅读导航在阅读spdlog源码，分析spdlog是怎么使用同一套接口支持同步和异步日志，以及丰富的日志类型的机制的时候，当时是从spdlog提供的异步日志的demo出发，分析日志消息是怎么在各个类之间流转，从用户输入到日志打印都经历了那些类和函数。以下是我的阅读过程：
+
+从demo出发：追踪日志消息的产生，处理和输出路径
+梳理类和函数的调用链：通过调试和阅读源码，理清日志消息流转中设计的主要类和函数调用关系
+分析协作机制：理解这个类是怎么通过消息传递和多态机制协作，完成日志功能
+可视化设计：梳理出关键类之后，绘制出类图，进一步明确设计思路和拓展方式
+
+以上内容是我阅读源码的思路，也是这篇文章的主要脉络，读者可以通过这个思路更好的理解这篇文章，也可以通过这个方式去自己了解想要理解spdlog源码中的其他部分
+注：本文分析的源码为spdlog的v1.15.1版本
+spdlog异步机制解析异步测试demospdlog官方提供了异步日志的使用demo,包括单文件和多文件的异步日志demo
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);&#125;
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/stdout_color_sinks.h&quot;#include &quot;spdlog/sinks/rotating_file_sink.h&quot;void multi_sink_example2()&#123;    spdlog::init_thread_pool(8192, 1);    auto stdout_sink = std::make_shared&lt;spdlog::sinks::stdout_color_sink_mt &gt;();    auto rotating_sink = std::make_shared&lt;spdlog::sinks::rotating_file_sink_mt&gt;(&quot;mylog.txt&quot;, 1024*1024*10, 3);    std::vector&lt;spdlog::sink_ptr&gt; sinks &#123;stdout_sink, rotating_sink&#125;;    auto logger = std::make_shared&lt;spdlog::async_logger&gt;(&quot;loggername&quot;, sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);    spdlog::register_logger(logger);&#125;
+我们从最简答的单文件的异步日志demo入手，使用这个单文件的异步日志进行静态的字符串打印
+#include &quot;spdlog/async.h&quot;#include &quot;spdlog/sinks/basic_file_sink.h&quot;void async_example()&#123;    auto async_file = spdlog::basic_logger_mt&lt;spdlog::async_factory&gt;(&quot;async_file_logger&quot;, &quot;logs/async_log.txt&quot;);    async_file-&gt;info(&quot;message&quot;);&#125;
+日志消息流转以info(“message”)这个过程为例进行测试，整个日志消息的流转过程如下：
+日志生产
+logger对象指针通过info这个模板函数根据参数类型进行匹配，调用log这个模板方法template &lt;typename T&gt;void info(const T &amp;msg) &#123;     log(level::info, msg);&#125;
+log这个模板方法根据参数类型进行匹配，调用log_it_这个函数void log(source_loc loc, level::level_enum lvl, string_view_t msg) &#123;    bool log_enabled = should_log(lvl);    bool traceback_enabled = tracer_.enabled();    if (!log_enabled &amp;&amp; !traceback_enabled) &#123;        return;    &#125;    details::log_msg log_msg(loc, name_, lvl, msg);    log_it_(log_msg, log_enabled, traceback_enabled);&#125;
+在log_it_这个方法里，会调用logger这个类的虚函数sink_it_void logger::log_it_(const spdlog::details::log_msg &amp;log_msg,                                   bool log_enabled,                                   bool traceback_enabled) &#123;    if (log_enabled) &#123;        sink_it_(log_msg);//实际调用的async_logger这个类的sink_it_方法    &#125;    if (traceback_enabled) &#123;        tracer_.push_back(log_msg);    &#125;&#125;
+在async_logger的sink_it_函数中，日志消息最终被封装成async_msg，并加入mpmc_queue这个队列中void spdlog::async_logger::sink_it_(const details::log_msg &amp;msg) &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_log(shared_from_this(), msg, overflow_policy_);    &#125; else &#123;        throw_spdlog_ex(&quot;async log: thread pool doesn&#x27;t exist anymore&quot;);    &#125;&#125;//构造一个async_msg，包含日志消息和async_logger的弱指针（shared_from_this()），然后调用post_async_msg_void thread_pool::post_log(async_logger_ptr &amp;&amp;worker_ptr, const details::log_msg &amp;msg, async_overflow_policy overflow_policy) &#123;    async_msg async_m(std::move(worker_ptr), async_msg_type::log, msg);    post_async_msg_(std::move(async_m), overflow_policy);&#125;//将async_msg入队到多生产者单消费者队列（mpsc_que）中，支持不同的溢出策略（如阻塞、丢弃新消息或覆盖旧消息）void thread_pool::post_async_msg_(async_msg &amp;&amp;new_msg, async_overflow_policy overflow_policy) &#123;    if (overflow_policy == async_overflow_policy::block) &#123;        q_.enqueue(std::move(new_msg));    &#125; else if (overflow_policy == async_overflow_policy::overrun_oldest) &#123;        q_.enqueue_nowait(std::move(new_msg));    &#125; else &#123;        q_.enqueue_if_have_room(std::move(new_msg));    &#125;&#125;
+
+日志消费
+线程池的工作线程将不断从队列中取出async_msg消息，并根据异步日志的类型不同的处理void thread_pool::worker_loop_() &#123;    while (process_next_msg_()) &#123;&#125;&#125;//process_next_msg_从队列中取出async_msg，根据消息类型执行操作。bool  thread_pool::process_next_msg_() &#123;    async_msg incoming_async_msg;    q_.dequeue(incoming_async_msg);    switch (incoming_async_msg.msg_type) &#123;        //对于log类型，调用async_logger::backend_sink_it        case async_msg_type::log: &#123;            incoming_async_msg.worker_ptr-&gt;backend_sink_it_(incoming_async_msg);            return true;        &#125;        //对于flush类型，调用async_logger::backend_sink_it        case async_msg_type::flush: &#123;            incoming_async_msg.worker_ptr-&gt;backend_flush_();            return true;        &#125;                //对于terminate类型，结束工作线程        case async_msg_type::terminate: &#123;            return false;        &#125;        default: &#123;            assert(false);        &#125;    &#125;    return true;&#125;
+在async_logger::backend_sink_it_中，async_logger遍历其持有的所有sinks_，调用每个sink的log方法void async_logger::backend_sink_it_(const details::log_msg &amp;msg) &#123;    for (auto &amp;sink : sinks_) &#123;        if (sink-&gt;should_log(msg.level)) &#123;            sink-&gt;log(msg);        &#125;    &#125;        //强制日志进行输出    if (should_flush_(msg)) &#123;        backend_flush_();    &#125;&#125;
+spdlog中的sink类都是继承自base_sink这个类，在base_sink的log方法中，调用了sink_it_这个虚方法，进行了具体的打印操作template &lt;typename Mutex&gt;void base_sink&lt;Mutex&gt;::log(const details::log_msg &amp;msg) &#123;    std::lock_guard&lt;Mutex&gt; lock(mutex_);    sink_it_(msg);&#125;
+以basic_file_sink这个类为例，在这个方法中，使用格式化器格式化了日志，并且将日志消息写入文件template &lt;typename Mutex&gt;void basic_file_sink&lt;Mutex&gt;::sink_it_(const details::log_msg &amp;msg) &#123;    memory_buf_t formatted;    base_sink&lt;Mutex&gt;::formatter_-&gt;format(msg, formatted);    file_helper_.write(formatted);&#125;
+上述过程就是，就是整个异步过程中日志消息的整个流程，通过这个流程我们可以发现，spdlog的异步模式就是经典的生产者，消费者模式，前端通过logger的打印日志的log方法将日志消息写入队列，线程池中的后端线程不断从队列中取出异步消息，根据异步消息调用async_logger本身的方法进行处理，这样就实现了异步的日志写入。
+
+可以参考下图更加直观的感受这个过程(图片来源: https://www.cnblogs.com/shuqin/p/12214439.html)
+强制刷新与结束线程在上面线程中的工作中提到了三种异步日志消息，log，flush,terminate。log类型的消息是用户写日志的时候产生的，那么另外两种消息是什么时候产生的呢？
+spdlog支持手动强制日志输出，用户调用logger-&gt;flush()时，spdlog强制刷新日志:
+//async_logger::flush_生成一个flush类型的async_msg，投递到线程池void async_logger::flush_() &#123;    if (auto pool_ptr = thread_pool_.lock()) &#123;        pool_ptr-&gt;post_flush(shared_from_this(), overflow_policy_);    &#125;&#125;void thread_pool::post_flush(async_logger_ptr &amp;&amp;worker_ptr,                                           async_overflow_policy overflow_policy) &#123;    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);&#125;
+线程池处理flush消息，调用async_logger::backend_flush_，最终触发每个sink的flush操作。
+spdlog的线程池在调用析构函数的时候，会产生terminate消息，优雅的结束这个工作线程
+thread_pool::~thread_pool() &#123;    for (size_t i = 0; i &lt; threads_.size(); i++) &#123;        post_async_msg_(async_msg(async_msg_type::terminate), async_overflow_policy::block);    &#125;    for (auto &amp;t : threads_) &#123;        t.join();    &#125;&#125;
+
+主要类类层次结构通过上面分析日志消息流转的过程中可以发现，实现异步日志功能的主要类包括，logger，async_logger,sink,base_sink，thread_pool和mpmc_blocking_queue这几个类。他们的类关系图如下所示：logger：用户打印日志的接口基类
+formatter：格式化日志消息的基类
+sink: 日志输出的基类
+spdlog通过让logger组合sink，sink组合formatter，并通过合理的职责划分和接口定义，实现了良好的可拓展性，用户只需要继承sink接口，实现sink_it_和flush方法就可以实现自定义sink的实现，实现formatter类的format函数就能实现自定义格式化器
+mpmc_blocking_queue分析mpmc_blocking_queue是存储异步日志消息的关键类，使用互斥锁和条件变量保证线程安全，内部使用环形队列(circular_q.h)存储数据
+template &lt;typename T&gt;class mpmc_blocking_queue &#123;public:    using item_type = T;       //阻塞模式下调用    void enqueue(T &amp;&amp;item) &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            pop_cv_.wait(lock, [this] &#123; return !this-&gt;q_.full(); &#125;);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //overrun_oldest 覆盖旧日志模式下使用    void enqueue_nowait(T &amp;&amp;item)     &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            q_.push_back(std::move(item));        &#125;        push_cv_.notify_one();    &#125;    //覆盖新日志模式下使用    void enqueue_if_have_room(T &amp;&amp;item)     &#123;        bool pushed = false;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            if (!q_.full()) &#123;                q_.push_back(std::move(item));                pushed = true;            &#125;        &#125;        if (pushed) &#123;            push_cv_.notify_one();        &#125; else &#123;            ++discard_counter_;        &#125;    &#125;    void dequeue(T &amp;popped_item)    &#123;        &#123;            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex_);            push_cv_.wait(lock, [this] &#123; return !this-&gt;q_.empty(); &#125;);            popped_item = std::move(q_.front());            q_.pop_front();        &#125;        pop_cv_.notify_one();    &#125;private:    std::mutex queue_mutex_; //全局锁，保护线程安全    std::condition_variable push_cv_; //针对消费者的条件变量，等待非空，通知可读    std::condition_variable pop_cv_; //针对生产者的条件变量，等待不满，通知可写    spdlog::details::circular_q&lt;T&gt; q_;    std::atomic&lt;size_t&gt; discard_counter_&#123;0&#125;;&#125;;
+通过相关的源代码可以看出来，只有在阻塞模式下，生产者线程才会等待队列进入可写状态，其他时候均当队列满的时候都会覆盖消息；但是无论在什么模式下，所有的生产者和消费者都会去争夺互斥锁，保证线程安全；
+一些建议在使用的时候，虽然spdlog支持多消费模式，但是理论上写日志这个操作是IO密集型的操作，性能的瓶颈不在cpu上，多线程读取是没必要的，还会增加锁的损耗，所以多线程的消费者是没必要。并且多个消费者无法保证日志的输出顺序，在实际的测试中也发现，单个消费者的吞吐量是比多个消费者更高，所以建议将线程池的线程数设置为1
 ]]></content>
       <categories>
         <category>源码分析</category>
@@ -3042,6 +3042,101 @@ initial_covariance：各误差状态分量的初始标准差，用于构造初�
       </tags>
   </entry>
   <entry>
+    <title>专业知识的应用04.误差状态与松耦合怎么串起来</title>
+    <url>/2026/02/23/%E4%B8%93%E4%B8%9A%E7%9F%A5%E8%AF%86%E7%9A%84%E5%9B%9E%E9%A1%BE/%E4%B8%93%E4%B8%9A%E7%9F%A5%E8%AF%86%E7%9A%84%E5%BA%94%E7%94%A804.%E8%AF%AF%E5%B7%AE%E7%8A%B6%E6%80%81%E4%B8%8E%E6%9D%BE%E8%80%A6%E5%90%88%E6%80%8E%E4%B9%88%E4%B8%B2%E8%B5%B7%E6%9D%A5/</url>
+    <content><![CDATA[前言前两篇分别讲了卡尔曼在本项目里怎么用、惯导解算用到了哪些知识。
+但组合导航是一个整体：惯导负责用 IMU 递推名义状态，卡尔曼负责估计误差并用 GNSS 观测去修正；两者通过「误差注入 + 重置」形成闭环，使得下一段递推的初值始终是「组合后的最优值」，不会一路漂下去。
+本篇把前两篇串成「一个系统」，讲清楚名义状态与误差状态分别是什么、数据怎么流、松耦合在本项目里具体指什么，以及这些在代码里对应谁调用谁。
+这是实现层面的核心，看懂这一篇，整个组合导航的主循环就通了。
+名义状态与误差状态名义状态：对外输出的「当前位姿」名义状态（Nominal State）就是组合系统对外输出的当前位置、速度、姿态以及零偏估计。
+在代码里对应 state/state.h 中的 NominalState：pos（纬经高）、vel（NED 速度）、quat（体到导航系的四元数）、bg（陀螺零偏）、ba（加速度计零偏）。用户调用 getPose() 拿到的就是这份名义状态。
+名义状态不是卡尔曼直接估计出来的，而是由两条线共同维护：
+
+惯导递推：每次有 IMU 数据时，用零偏补偿后的 IMU 做惯导解算，得到新的位置、速度、姿态；这部分结果先更新在 Pins 内部的 InsState 里，再通过 syncFromINS() 同步到名义状态（只同步 pos、vel、quat，不同步零偏）。所以在只有 IMU、没有 GNSS 的时候，名义状态就是惯导解算的结果。
+误差注入：当有 GNSS 观测时，卡尔曼用位置残差做一次观测更新，得到最新的误差状态估计；然后用误差状态去修正名义状态（位置、速度、姿态、零偏都按误差做一次校正），再把误差状态置零，并把校正后的名义状态写回 INS，作为下一段递推的初值。所以在 GNSS 更新之后，名义状态 &#x3D; 惯导结果 + 卡尔曼估计的误差修正。
+
+因此，名义状态 &#x3D; 惯导递推的结果 + 卡尔曼误差校正；零偏只在 GNSS 更新时通过 correctPose() 注入，平时由滤波器在预测步中随误差状态一起传播。
+误差状态：卡尔曼估计的「惯导结果的误差」误差状态（Error State）是卡尔曼滤波器估计的对象，表示「当前惯导解算结果相对于真实状态的误差」。
+在代码里对应 state/state.h 中的 GIState：posDelta、velDelta、attDelta（NED 下左扰动的旋转矢量）、bg、ba（零偏误差）。滤波器内部维护这份误差状态和其 15×15 协方差矩阵 P。
+误差状态的含义是：真实状态 ≈ 名义状态 − 误差状态（位置、速度、姿态用减，零偏用加，具体符号与扰动定义一致）。
+所以观测更新后，我们用估计出的误差去修正名义状态：位置、速度减去误差，姿态用 exp(δφ) 左乘名义四元数，零偏加上误差。
+修正完成后，误差状态会被重置为零（filter_.reset()），因为「误差已经注入到名义状态里了」，下一时刻的误差状态应该表示的是「新名义状态」相对于真实的误差，而不是累积旧误差。
+同时，INS 的当前状态也会被重置为校正后的名义状态（pins_.resetState(NominalState2InsState(state_))），这样下一段 IMU 递推的初值就是「组合后的最优值」，惯导不会带着未校正的偏差继续积分。
+这就是 误差状态卡尔曼滤波（ESKF） 在本项目里的用法：估计的是误差，用误差修正名义状态，然后误差状态置零、INS 与名义状态对齐，形成闭环。
+
+从系统角度看，误差状态并不是“长期存在的状态”，而是一个只在修正瞬间发挥作用的中间量；修正完成后，系统的所有信息都回到名义状态和 INS 内部.
+数据流：主循环与四种时间对齐模式
+组合导航的主入口是 PoseEstimator::updatePose()。
+外部按时间顺序喂入 IMU 和 GNSS 数据（addImuData、addGnssData），每次在合适的时机调用 updatePose()，内部根据当前 IMU 时间和当前 GNSS 时间的关系，决定「先传播还是先更新、要不要在 IMU 区间内插值到 GNSS 时刻再更新」。
+updatePose() 本身并不关心“算法细节”，它做的只是根据 IMU 与 GNSS 的时间关系，选择传播与更新的顺序，从而保证观测在正确的时间点被使用。
+时间对齐的四种模式项目以 IMU 时间为基准。ImuTimeAligner::getMode(prevImuData_, currImuData_, gnssData_, ...) 会给出四种模式：
+
+Curr：GNSS 时间在当前 IMU 时刻之前。先做 GNSS 更新和误差注入，再做当前 IMU 的传播。
+Next：GNSS 时间在当前 IMU 时刻之后。先做当前 IMU 的传播，再做 GNSS 更新和误差注入。
+Internal：GNSS 时间落在上一帧 IMU 与当前帧 IMU 之间。先用插值得到 GNSS 时刻的「虚拟 IMU」，传播到 GNSS 时刻；在该时刻做 GNSS 更新和误差注入；再用剩余时间从 GNSS 时刻传播到当前 IMU 时刻。
+No：没有有效 GNSS 或时间差过大。只做 IMU 传播，不做 GNSS 更新。
+
+这样做的目的，是让 GNSS 观测在正确的时刻被使用，避免时间错位带来的额外误差。
+单步传播：propagate(imuData)每次「用一帧 IMU 做一次递推」时，都会调用 propagate(imuData)，其顺序是：
+
+零偏补偿：comPenImu(imuData) 用当前名义状态里的 bg、ba 对原始 IMU 做补偿，得到补偿后的 IMU。
+惯导解算：pins_.insUpdate(comPenImuData) 用补偿后的 IMU 更新 INS 内部的状态（位置、速度、姿态）。
+误差状态预测：filter_.predict(pins_.getState(), comPenImuData, dt) 用当前惯导状态和 IMU 数据更新误差状态和协方差 P（Φ、G、Q 参与的那一步）。
+同步到名义状态：syncFromINS() 把 INS 当前的位置、速度、姿态拷贝到名义状态 state_（零偏不变）。
+
+所以每来一帧 IMU，名义状态中的 pos&#x2F;vel&#x2F;quat 会跟着惯导走一步，误差状态和 P 会跟着卡尔曼预测走一步；零偏在名义状态里要等 GNSS 更新时才会被修正。
+
+GNSS 更新与误差注入：gnssUpdate() + correctPose()当逻辑判断「这一拍要做 GNSS 更新」时，会先调用 gnssUpdate()，再调用 correctPose()。
+gnssUpdate() 做的事：
+
+用当前名义状态和天线杆臂 antlever_ 计算「天线相位中心在 LLH 下的位置」：fixCurrPos = state_.pos + NDE2LLhMatrix(...) * Cbn * antlever_（Cbn 即 state_.quat.toRotationMatrix()）。
+计算位置差：posErr = fixCurrPos - gnssData_.pos（LLH 下）。
+把位置差转到 NED：dz = LLh2NEDMatrix(...) * posErr，得到观测残差。
+调用 filter_.update(dz)，用 dz 做一次卡尔曼观测更新，更新误差状态和 P。
+
+correctPose() 做的事：
+
+从滤波器取出当前误差状态 dx = filter_.getState()。
+用误差修正名义状态：位置减 NDE2LLh * posDelta，速度减 velDelta，零偏加 bg&#x2F;ba，姿态用 exp(attDelta) 左乘原四元数（左扰动）。
+调用 filter_.reset() 把误差状态置零。
+调用 pins_.resetState(NominalState2InsState(state_)) 把 INS 状态设为校正后的名义状态。
+
+这样，GNSS 观测被用来修正名义状态和零偏，并让 INS 与名义状态重新对齐；下一段 IMU 递推就从「校正后的状态」开始，形成闭环。
+
+数据流小结文字描述的数据流如下，读者可以据此画一张简图：
+
+IMU 数据 → 零偏补偿 → INS 解算（更新位置、速度、姿态）→ 结果同步到名义状态（pos&#x2F;vel&#x2F;quat）；同时用同一帧 IMU 和当前 INS 状态做误差状态预测（更新误差状态与 P）。
+GNSS 数据（位置）→ 与当前名义状态（加杆臂）求差 → 得到 NED 下的观测残差 dz → 卡尔曼观测更新（更新误差状态与 P）→ 误差注入（用误差状态修正名义状态与零偏）→ 误差状态置零、INS 重置为名义状态。
+对外输出：始终是名义状态（getPose()）。
+
+因此，名义状态 &#x3D; 惯导递推 + 误差注入；误差状态 &#x3D; 卡尔曼估计，只在内部和校正时使用，校正后置零。
+松耦合：只用 GNSS 位置作为观测松耦合（Loose Coupling）在本项目里指：只用 GNSS 已经解算好的位置（如单点定位或 RTK 的结果）作为观测，与惯导解算的位置做差得到观测残差，再交给卡尔曼做融合。我们不使用 GNSS 的原始观测量（伪距、伪距率、载波相位等），也不在滤波器里估计 GNSS 的钟差、模糊度等状态。
+这样做的好处是接口简单：GNSS 端只需输出「某一时刻的 LLH 位置（及是否有效）」；组合端只需在对应时刻算「当前名义状态对应的天线位置 − GNSS 位置」，得到 dz，再调用 filter_.update(dz)。不需要和 GNSS 接收机的原始观测接口、不需要额外的状态维数，适合练手和离线复现。代价是信息利用得不如紧耦合充分（紧耦合会把伪距、载波等一起建进观测方程），但作为学习和复习组合导航原理已经足够。本项目在 pose_estimator 里融合 IMU 与 GNSS 的方式，就是这种「只融合位置」的松耦合。
+代码对应小结
+名义状态：PoseEstimator::state_，类型为 NominalState（pos, vel, quat, bg, ba）。对外通过 getPose() 返回。
+误差状态：GILooseFilter 内部维护，类型为 GIState（posDelta, velDelta, attDelta, bg, ba）；通过 getState() 取出，仅在 correctPose() 中使用。
+主循环：updatePose() 根据 ImuTimeAligner::getMode(...) 选择 Curr&#x2F;Next&#x2F;Internal&#x2F;No，在合适顺序下调用 propagate()、gnssUpdate()、correctPose()。
+传播：propagate(imuData) → comPenImu → pins_.insUpdate → filter_.predict → syncFromINS。
+GNSS 更新：gnssUpdate() 计算 dz（含杆臂）并调用 filter_.update(dz)；correctPose() 用误差状态修正 state_，再 filter_.reset()、pins_.resetState(...)。
+状态定义：state/state.h 中的 NominalState、GIState、InsState，以及 NominalState2InsState 用于在名义状态与 INS 状态之间拷贝（不含零偏）。
+
+谁调用谁、数据怎么流，按上述顺序在代码里走一遍，就能和本篇的「名义状态 vs 误差状态」「数据流」「松耦合」一一对应。
+总结
+名义状态 vs 误差状态：名义状态是对外输出的位置、速度、姿态和零偏，由惯导递推与卡尔曼误差注入共同得到；误差状态是卡尔曼估计的惯导结果误差，用于修正名义状态，修正后置零，INS 同时重置为名义状态，形成闭环。
+数据流与闭环：IMU → 零偏补偿 → INS 解算 → 名义状态同步 + 误差状态预测；GNSS 位置 → 观测残差 dz → 卡尔曼更新 → 误差注入 → 误差状态置零、INS 重置。主循环 updatePose() 按 IMU&#x2F;GNSS 时间关系选择传播与更新的顺序，必要时在 IMU 区间内插值到 GNSS 时刻再更新。
+松耦合：只用 GNSS 解算后的位置作为观测，不用伪距&#x2F;载波；接口简单，与 pose_estimator 中 IMU + GNSS 的融合方式一致。
+
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>组合导航</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>组合导航</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>从源码到进程:01.程序的预处理</title>
     <url>/2025/09/18/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/01.%E7%A8%8B%E5%BA%8F%E7%9A%84%E9%A2%84%E5%A4%84%E7%90%86/</url>
     <content><![CDATA[前言在这个系列中，我们准备从 源码到进程 这个角度去分析，在 Linux 平台下，一个项目的文件，究竟是怎么一步步变成可执行文件，然后最终变成一个进程的。
@@ -3425,6 +3520,157 @@ ar 与 ranlib 协作生成符号索引表，使链接器能快速定位符号；
       </tags>
   </entry>
   <entry>
+    <title>从源码到进程:05.可执行程序的装载与启动</title>
+    <url>/2025/10/22/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/05.%E5%8F%AF%E6%89%A7%E8%A1%8C%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%A3%85%E8%BD%BD%E4%B8%8E%E5%90%AF%E5%8A%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们详细讲解了linux系统下动态库的实现机制，并且通过gdb调试验证了动态库加载的过程。
+在这篇文章中，我们将继续从源码到进程这个主题，详细讲解linux下，一个磁盘上的可执行文件，是怎么变成运行在内存上的进程的,也就是可执行程序的装载过程。
+Linux中的进程要理解这个装载的过程，首就要对进程本身有一个理解。
+在Linux中，进程到底是什么？
+它不是一个程序，也不是代码。在内核的视角里，一个进程本质上只是一个数据结构，即大名鼎鼎的task_struct，也就是咱们在课本上经常听的**进程控制块(Process Control Block, PCB)**。
+这个结构体是内核管理和调度一切的抓手，它记录了进程的PID、状态、权限、打开的文件、信号处理器，以及最重要的——它指向的内存映像（mm_struct）。
+进程如何“跑”起来？
+进程的执行依赖于两个核心概念：
+
+**虚拟地址空间 (Virtual Address Space)**：每个进程都拥有自己独立的、从0开始的虚拟地址空间。这是一个“沙盒”，让进程以为自己独占了整个内存。
+**页管理 (Paging)**：CPU的内存管理单元（MMU）负责将进程访问的“虚拟地址”翻译成“物理内存地址”。内核通过维护一张 页表(Page Table) 来实现这种映射。
+
+因此，“加载一个程序”的本质，就是内核去填充这个task_struct，并为其建立一套全新的虚拟地址空间和对应的页表映射，将ELF文件中的内容（代码、数据）“映射”到这个地址空间中。
+进程的构建过程申请资源当我们在shell中执行./hello时，fork()创建了一个子进程（几乎是父进程的克隆），然后这个子进程调用execve(&quot;./hello&quot;, ...)系统调用。这个系统调用，就是程序开始装载的开始。
+execve的使命是：丢弃当前的内存映像，换上一个全新的程序。
+内核此时会：
+
+查找并验证格式：内核会读取文件头部，通过x7fELF魔数识别出这是一个ELF文件，并找到对应的处理器binfmt_elf。
+销毁旧世界：内核会毫不留情地释放当前进程的旧虚拟地址空间（解散旧的mm_struct和所有VMA）。
+创建新骨架：内核会创建一个新的mm_struct（内存描述符）和task_struct中的相关字段，为新程序准备一个干净的“沙盒”。
+
+至此，我们有了一个“空”的进程骨架，得到了我们用来描述的资源。
+填充内容现在，内核需要按照ELF这张“蓝图”，将代码和数据填充到这个新的虚拟地址空间中。
+程序想跑，至少要知道在哪里跑？
+这就是ELF文件“执行视图”（Program Headers）的用武之地。内核会遍历readelf -l看到的每一个PT_LOAD段：
+
+代码段（.text, .rodata, …）：内核看到一个PT_LOAD段，它标记为可读、可执行（R E）。内核会在虚拟地址空间中创建一块区域（VMA, vm_area_struct），并将其权限设置为VM_READ | VM_EXEC。
+数据段（.data, .bss）：内核看到另一个PT_LOAD段，它标记为可读、可写（RW）。内核会创建另一块VMA，并将其权限设置为VM_READ | VM_WRITE。
+
+关键机制：延迟加载（Demand Paging）
+内核在这一步并不会真的去从磁盘读取G字节的数据。它只是建立了“映射关系”。它在页表中将这些虚拟地址标记为“存在”，但“不在物理内存中”。
+当CPU第一次尝试执行位于代码段的某条指令时，MMU发现这个虚拟地址没有对应的物理内存，就会触发一个 缺页异常 (Page Fault) 。
+此时内核才会被唤醒，它检查这个地址是否合法（是否在某个VMA内），然后才去磁盘上读取那一页（通常是4KB）的代码，将其加载到物理内存，更新页表，然后让CPU重新执行那条指令。
+这就是为什么即使是G字节大小的程序，启动也可能非常快的原因。
+对于.bss段（未初始化的全局变量），它在文件中不占空间（FileSiz &lt; MemSiz）。内核会为这部分多出来的虚拟内存映射一个特殊的、全零的“匿名页”，实现了C&#x2F;C++标准中“全局变量默认初始化为0”的承诺。
+设置入口点内核已经把内存空间准备好了。现在，它必须设置一个“入口点”，告诉CPU从哪里开始执行第一条指令。
+这个入口点 不是main ，而是ELF头中指定的e_entry地址。
+此时，控制权交给了 C运行时库 (glibc) 。这里分为两种情况：
+情况一：静态链接_start函数（来自crt1.o）被直接链接到程序中。它就是e_entry。_start的任务很单纯：
+
+从堆栈上准备好argc, argv, envp。
+调用__libc_start_main函数。
+
+情况二：动态链接（现代C++程序的常态）
+内核在解析Program Headers时，会发现一个PT_INTERP段，它指向一个程序：/lib64/ld-linux-x86-64.so.2。
+内核的入口点：内核会将动态链接器 (ld.so) 加载到内存，并将e_entry设置为ld.so的入口点。
+ld.so接管：ld.so首先开始运行。它负责：
+加载程序所依赖的所有共享库（如libstdc++.so, libc.so）。
+对所有跨库的函数调用进行“重定位”（Relocation），填平.got.plt表。
+完成所有库的加载后，ld.so才会跳转到程序自己的e_entry（即_start）。
+
+
+
+无论哪种情况，最终都会调用到glibc中的__libc_start_main。
+C++的特殊性：.init_array的执行__libc_start_main是进入main前最后的处理函数。它除了初始化线程、I&#x2F;O等，还必须处理C++的特殊需求。
+C++允许我们定义具有复杂构造函数的全局对象：
+std::ofstream log_file(&quot;global.log&quot;); // 需要在main之前运行int main() &#123;    log_file &lt;&lt; &quot;Main started&quot; &lt;&lt; std::endl;&#125;
+
+log_file的构造函数必须在main之前执行。编译器和链接器如何实现这一点？
+它们会将这个构造函数的指针（或一个调用它的辅助函数指针）放入一个特殊的、只读的节：**.init_array**。
+__libc_start_main在调用main之前，会执行一个循环，遍历.init_array中的每一个函数指针并调用它们，确保所有全局对象都按顺序被正确构造。
+在main返回后，__libc_start_main还会去遍历.fini_array，执行全局对象的析构函数。
+实验演示与源码剖析gdb调试让我们用GDB来亲眼见证这个过程。elf_load_test.cpp:
+#include &lt;iostream&gt;struct GlobalInitializer &#123;    GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global constructor (.init_array) running!&quot; &lt;&lt; std::endl;    &#125;    ~GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global destructor (.fini_array) running!&quot; &lt;&lt; std::endl;    &#125;&#125;;GlobalInitializer g_init; // .init_array 将包含调用其构造函数的代码int main() &#123;    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;    return 0;&#125;
+
+g++ -g -o main elf_load_test.cpp
+
+使用GDB调试：
+
+查看入口点：
+
+# 启动gdb调试gdb ./main# 查看入口信息(gdb) info file## 会出现类似的信息Entry point: 0x10a0 #这是 _start 的地址，不是 main0x0000000000000318 - 0x0000000000000334 is .interp.....0x0000000000003d88 - 0x0000000000003d98 is .init_array
+
+
+在入口点和main打断点：
+
+(gdb) b _startBreakpoint 1 at 0x10a0(gdb) b __libc_start_main_implFunction &quot;__libc_start_main_impl&quot; not defined.Make breakpoint pending on future shared library load? (y or [n]) yBreakpoint 2 (__libc_start_main_impl) pending.(gdb) b mainBreakpoint 3 at 0x1191: file elf_load_test.cpp, line 15.
+
+
+执行起来：
+
+可以看到类似的输出
+(gdb) rStarting program: Breakpoint 1, 0x00007ffff7fe3290 in _start () from /lib64/ld-linux-x86-64.so.2(gdb) cContinuing.[Thread debugging using libthread_db enabled]Using host libthread_db library &quot;/lib/x86_64-linux-gnu/libthread_db.so.1&quot;.Breakpoint 1, 0x00005555555550a0 in _start ()(gdb) cContinuing.Breakpoint 2, __libc_start_main_impl (main=0x555555555189 &lt;main()&gt;, argc=1, argv=0x7fffffffd998, init=0x0, fini=0x0, rtld_fini=0x7ffff7fc9040 &lt;_dl_fini&gt;, stack_end=0x7fffffffd988) at ../csu/libc-start.c:242242	../csu/libc-start.c: 没有那个文件或目录.(gdb) cContinuing.Global constructor (.init_array) running!Breakpoint 3, main () at elf_load_test.cpp:1515	    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;(gdb) cContinuing.main() function running!Global destructor (.fini_array) running!
+
+这清晰地证明了执行顺序：_start -&gt; __libc_start_main -&gt; .init_array (全局构造) -&gt; main的过程。
+linux内核源码剖析之前讲解的理论部分，在现代的Linux内核中都有体现。在Linux内核中的fs/binfmt_elf.c文件就实现了相关的部分，其核心函数是load_elf_binary。
+让我们来看看它（基于现代内核，已简化）的关键步骤：
+
+验证ELF头：
+
+内核首先把bprm-&gt;buf（已经由用户态execve()传来的文件头缓冲区）当作ELF头结构elfhdr读取，并做一系列基本一致性检查：
+struct elfhdr *elf_ex = (struct elfhdr *)bprm-&gt;buf;// 检查魔数（ELF 标识）是否匹配，若不匹配直接返回-ENOEXEC（不是ELF）if (memcmp(elf_ex-&gt;e_ident, ELFMAG, SELFMAG) != 0)    goto out;//只接受 ET_EXEC（普通可执行文件）或 ET_DYN（位置无关可执行/共享对象，如 PIE / 动态解释器本身），其它类型拒绝。if (elf_ex-&gt;e_type != ET_EXEC &amp;&amp; elf_ex-&gt;e_type != ET_DYN)    goto out;    // 体系结构检查（是否为当前 CPU / 内核支持的 ABI）if (!elf_check_arch(elf_ex))    goto out;    // 检查是否为 FDPIC（特定 ABI），若不支持则拒绝if (elf_check_fdpic(elf_ex))    goto out;    // 确保内核可以对该文件做 mmap（以后要用 mmap 映射段），否则拒绝if (!bprm-&gt;file-&gt;f_op-&gt;mmap)    goto out;
+
+这些检查保证内核只在能正确处理的 ELF 文件上继续后续流程
+
+解析程序头表（Program Headers）：
+
+内核会读取ELF文件中的程序头表。
+// load_elf_phdrs() 从 ELF 文件中读取并返回程序头表（struct elf_phdr[]）。内核把程序头表拷贝到内核空间（elf_phdata），方便后续逐段处理。若读取失败则返回错误。elf_phdata = load_elf_phdrs(elf_ex, bprm-&gt;file);if (!elf_phdata)    goto out;
+
+程序头表包含 PT_LOAD, PT_INTERP, PT_PHDR, PT_GNU_STACK 等条目，后续流程就是基于这些 header 做决策与映射。
+
+寻找PT_INTERP（动态链接器）：
+
+elf_ppnt = elf_phdata;for (i = 0; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type == PT_GNU_PROPERTY) &#123;        elf_property_phdata = elf_ppnt;        continue;    &#125;    if (elf_ppnt-&gt;p_type != PT_INTERP)        continue;    // 读取 p_filesz 字节作为解释器路径（例如 /lib/ld-linux.so.2 或 /lib64/ld-linux-x86-64.so.2），并确保以 &#x27;\0&#x27; 结尾。    if (elf_ppnt-&gt;p_filesz &gt; PATH_MAX || elf_ppnt-&gt;p_filesz &lt; 2)        goto out_free_ph;    elf_interpreter = kmalloc(elf_ppnt-&gt;p_filesz, GFP_KERNEL);    retval = elf_read(bprm-&gt;file, elf_interpreter, elf_ppnt-&gt;p_filesz,                      elf_ppnt-&gt;p_offset);    if (retval &lt; 0)        goto out_free_interp;    if (elf_interpreter[elf_ppnt-&gt;p_filesz - 1] != &#x27;\0&#x27;)        goto out_free_interp;        //打开该解释器文件    interpreter = open_exec(elf_interpreter);    kfree(elf_interpreter);    if (IS_ERR(interpreter))        goto out_free_ph;    would_dump(bprm, interpreter);    interp_elf_ex = kmalloc(sizeof(*interp_elf_ex), GFP_KERNEL);        // 读取解释器本身的 ELF 头（interp_elf_ex），以便后续验证和加载解释器的段    retval = elf_read(interpreter, interp_elf_ex, sizeof(*interp_elf_ex), 0);    if (retval &lt; 0)        goto out_free_dentry;    break;&#125;
+
+
+创建新的内存映像：
+
+这是execve的核心步骤之一，内核会为进程创建新的内存上下文。
+在正式映射之前，内核需要做一系列准备工作:
+// 解析 PT_GNU_PROPERTY（如果有），并把平台/ABI相关信息填到 arch_stateretval = parse_elf_properties(interpreter ?: bprm-&gt;file,                              elf_property_phdata, &amp;arch_state);if (retval)    goto out_free_dentry;// 允许架构特定代码（arch）基于 ELF 和 interpreter 判断是否接受执行，或进行一些架构检查retval = arch_check_elf(elf_ex, !!interpreter, interp_elf_ex, &amp;arch_state);if (retval)    goto out_free_dentry;// 清除当前进程的执行上下文（关闭旧 mm 的执行凭证、释放旧地址空间的某些资源等），为新程序“重新上发条”retval = begin_new_exec(bprm);if (retval)    goto out_free_dentry;// 根据 ELF header 设置进程 persona（兼容/ABI 标志）SET_PERSONALITY2(*elf_ex, &amp;arch_state);// 根据可执行栈标志调整 READ_IMPLIES_EXEC，并根据进程 persona/randomize 标志设置 PF_RANDOMIZE（决定后续地址随机化）。if (elf_read_implies_exec(*elf_ex, executable_stack))    current-&gt;personality |= READ_IMPLIES_EXEC;if (!(current-&gt;personality &amp; ADDR_NO_RANDOMIZE) &amp;&amp; randomize_va_space)    current-&gt;flags |= PF_RANDOMIZE;    // 为进程设置新的 mm、构造用户栈上的 argv/envp/auxv（setup_arg_pages也可能需要STACK_TOP` 位置，受 personality 影响）setup_new_exec(bprm);retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP), executable_stack);if (retval &lt; 0)    goto out_free_dentry;
+
+这些步骤把进程状态配置成可以安全地把新的 ELF 映射进来，并把用户栈准备好5.  核心：mmap映射PT_LOAD段：
+这段是 load_elf_binary() 的核心：遍历所有 PT_LOAD 段并把它们 mmap 到进程地址空间:
+elf_brk = 0;start_code = ~0UL;end_code = 0;start_data = 0;end_data = 0;for (i = 0, elf_ppnt = elf_phdata; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type != PT_LOAD)        continue;    // 把 ELF 段的 p_flags（读/写/执行）与架构状态转换为内核所需的 PROT_READ/PROT_WRITE/PROT_EXEC 权限集合（并处理特殊架构要求）    elf_prot = make_prot(elf_ppnt-&gt;p_flags, &amp;arch_state, !!interpreter, false);        // elf_flags 初始为 MAP_PRIVATE，再根据首次加载、ET_EXEC / ET_DYN、是否已有解释器等条件加上 MAP_FIXED_NOREPLACE 或 MAP_FIXED。    elf_flags = MAP_PRIVATE;    vaddr = elf_ppnt-&gt;p_vaddr;    ......        // 实际把文件（或文件某段）映射到内存并处理 .bss 区（零填充）/文件大小 vs 内存大小差异。返回值可能是映射的起始地址或错误    error = elf_load(bprm-&gt;file, load_bias + vaddr, elf_ppnt, elf_prot, elf_flags, total_size);    if (BAD_ADDR(error)) &#123; retval = IS_ERR_VALUE(error) ? PTR_ERR((void*)error) : -EINVAL; goto out_free_dentry; &#125;    // 首次映射后调整 load_bias（对 ET_DYN），确保后续基址计算正确，reloc_func_desc 也在此填充（用于某些平台函数描述符重定位）。    if (first_pt_load) &#123;        first_pt_load = 0;        if (elf_ex-&gt;e_type == ET_DYN) &#123;            load_bias += error - ELF_PAGESTART(load_bias + vaddr);            reloc_func_desc = load_bias;        &#125;    &#125;    /* 计算 phdr 地址（phdr_addr）、start_code/end_code、elf_brk */    if (elf_ppnt-&gt;p_offset &lt;= elf_ex-&gt;e_phoff &amp;&amp;        elf_ex-&gt;e_phoff &lt; elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_filesz) &#123;        phdr_addr = elf_ex-&gt;e_phoff - elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_vaddr;    &#125;    k = elf_ppnt-&gt;p_vaddr;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; k &lt; start_code)        start_code = k;    if (start_data &lt; k)        start_data = k;    /* 安全检查 p_memsz / TASK_SIZE */    if (BAD_ADDR(k) || elf_ppnt-&gt;p_filesz &gt; elf_ppnt-&gt;p_memsz ||        elf_ppnt-&gt;p_memsz &gt; TASK_SIZE ||        TASK_SIZE - elf_ppnt-&gt;p_memsz &lt; k) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;        // 检查 p_filesz &lt;= p_memsz、p_memsz &lt;= TASK_SIZE、避免地址溢出（防止构造恶意 ELF 导致内核映射超出允许范围）。    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_filesz;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; end_code &lt; k)        end_code = k;    if (end_data &lt; k)        end_data = k;    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_memsz;    if (k &gt; elf_brk)        elf_brk = k;&#125;
+
+
+加载动态链接器（如果存在）：
+
+如果interpreter不为NULL，内核会打开这个文件（ld.so），并加载它。ld.so本身也是一个ELF文件。
+// 在映射完主 ELF 的 PT_LOAD 段后，把所有计算累加 load_bias（基址偏移）以得到真实的地址空间位置，并把 mm-&gt;brk（程序 break/heap 初始位置）设置为 ELF_PAGEALIGN(elf_brk)e_entry = elf_ex-&gt;e_entry + load_bias;phdr_addr += load_bias;elf_brk += load_bias;start_code += load_bias;end_code += load_bias;start_data += load_bias;end_data += load_bias;current-&gt;mm-&gt;start_brk = current-&gt;mm-&gt;brk = ELF_PAGEALIGN(elf_brk);if (interpreter) &#123;    // 加载解释器，调整e_entry入口地址    elf_entry = load_elf_interp(interp_elf_ex,                                interpreter,                                load_bias, interp_elf_phdata,                                &amp;arch_state);                                    if (!IS_ERR_VALUE(elf_entry)) &#123;        interp_load_addr = elf_entry;        elf_entry += interp_elf_ex-&gt;e_entry;    &#125;    if (BAD_ADDR(elf_entry)) &#123;        retval = IS_ERR_VALUE(elf_entry) ? (int)elf_entry : -EINVAL;        goto out_free_dentry;    &#125;    reloc_func_desc = interp_load_addr;        // 对解释器做 allow_write_access()（之前打开时可能为 open_exec() 把文件设为只读/不可写，加载完成后恢复写权限），fput() 释放文件句柄    allow_write_access(interpreter);    fput(interpreter);    kfree(interp_elf_ex);    kfree(interp_elf_phdata);&#125; else &#123;    elf_entry = e_entry;    if (BAD_ADDR(elf_entry)) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;&#125;
+
+设置入口点，让用户态接管：
+
+//释放临时分配的 elf_phdata。kfree(elf_phdata);// 设置当前进程的二进制格式处理器为 ELF（内核内跟踪）set_binfmt(&amp;elf_format);.....// 在用户栈上创建 auxv / ELF program headers 的副本（让动态链接器/用户程序可以访问到 phdr 地址、entry、base 等信息），这一步会把 AT_PHDR/AT_ENTRY/AT_BASE 等 auxv 放到栈上。retval = create_elf_tables(bprm, elf_ex, interp_load_addr, e_entry, phdr_addr);if (retval &lt; 0)    goto out;//更新 mm 的 start_code/end_code/start_data/end_data/start_stack，这些记录对调试器和内存限制有用mm = current-&gt;mm;mm-&gt;end_code = end_code;mm-&gt;start_code = start_code;mm-&gt;start_data = start_data;mm-&gt;end_data = end_data;mm-&gt;start_stack = bprm-&gt;p;/* brk 随机化（ASLR） */if ((current-&gt;flags &amp; PF_RANDOMIZE) &amp;&amp; (randomize_va_space &gt; 1)) &#123;   ......&#125;......regs = current_pt_regs();......//做最终的清理，例如把临时文件名、文件描述符替换为新映像等（bprm 层面的善后）。finalize_exec(bprm);// 实际把 rip/eip/pc 设置为 elf_entry 并切换到用户态开始执行用户程序（/ 动态链接器的入口，如果有 interpreter，则先由解释器接管再加载 libc/程序）START_THREAD(elf_ex, regs, elf_entry, bprm-&gt;p);retval = 0;
+
+至此，用户态程序被“放生”到 CPU 上。内核返回 0 表示 exec 成功（但函数实际上在 START_THREAD 之后不会返回到用户态前继续执行内核路径)
+
+总结将一个 ELF 文件转变为一个运行中的进程，是内核态与用户态运行时精密协作的结果，清晰地体现了 Linux 在设计上的分层与解耦。
+
+内核（binfmt_elf） 负责执行最基础和通用的装载任务。它的核心职责是解析 ELF 程序头（Program Headers），创建进程核心的内存管理结构（mm_struct），并建立虚拟地址空间（VMA）。它通过 mmap 和缺页异常（Demand Paging）机制，高效地将文件的代码和数据段“映射”到这片地址空间，实现了延迟加载。
+
+用户态运行时（ld.so 和 glibc） 负责处理后续特定于语言和链接的复杂逻辑。内核在完成基础映射后，根据 PT_INTERP 段（动态链接）或 e_entry（静态链接）移交控制权。用户态的动态链接器或 C 运行时库接管后续工作，包括加载所有共享库、执行符号重定位（填充 GOT&#x2F;PLT），以及在 main 函数执行前调用 C++ 的全局构造函数（.init_array）。
+
+
+这种分层设计，使得内核保持了极高的灵活性和稳定性，它无需关心你用的是C++、Go还是Python，只要你符合ELF规范。而C++的复杂运行时环境，则被优雅地交给了用户态的libstdc++和glibc去管理。
+最终，一个静态的文件被赋予了生命，成为了一个在虚拟内存中奔跑的、受内核调度的独立进程。
+]]></content>
+      <categories>
+        <category>程序员的自我修养</category>
+        <category>从程序到进程</category>
+      </categories>
+      <tags>
+        <tag>linux</tag>
+        <tag>C++</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>从源码到进程:04.动态库的生成与使用,解密延迟绑定与重定位机制</title>
     <url>/2025/10/15/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/04.%20%E5%8A%A8%E6%80%81%E5%BA%93%E7%9A%84%E7%94%9F%E6%88%90%E4%B8%8E%E4%BD%BF%E7%94%A8,%E8%A7%A3%E5%AF%86%E5%BB%B6%E8%BF%9F%E7%BB%91%E5%AE%9A%E4%B8%8E%E9%87%8D%E5%AE%9A%E4%BD%8D%E6%9C%BA%E5%88%B6/</url>
     <content><![CDATA[动态库的生成与使用,解密延迟绑定与重定位机制前言在之前的文章中，我们讲解了实际静态库的生成与使用，说明了目标文件是怎么生成静态库的，并且说明了一个程序是怎么连接使用静态库的。
@@ -3662,157 +3908,6 @@ PLT（Procedure Linkage Table）
 
 “All problems in computer science can be solved by another level of indirection.”——David Wheeler
 
-]]></content>
-      <categories>
-        <category>程序员的自我修养</category>
-        <category>从程序到进程</category>
-      </categories>
-      <tags>
-        <tag>linux</tag>
-        <tag>C++</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>从源码到进程:05.可执行程序的装载与启动</title>
-    <url>/2025/10/22/%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E8%BF%9B%E7%A8%8B/05.%E5%8F%AF%E6%89%A7%E8%A1%8C%E7%A8%8B%E5%BA%8F%E7%9A%84%E8%A3%85%E8%BD%BD%E4%B8%8E%E5%90%AF%E5%8A%A8/</url>
-    <content><![CDATA[前言在之前的文章中，我们详细讲解了linux系统下动态库的实现机制，并且通过gdb调试验证了动态库加载的过程。
-在这篇文章中，我们将继续从源码到进程这个主题，详细讲解linux下，一个磁盘上的可执行文件，是怎么变成运行在内存上的进程的,也就是可执行程序的装载过程。
-Linux中的进程要理解这个装载的过程，首就要对进程本身有一个理解。
-在Linux中，进程到底是什么？
-它不是一个程序，也不是代码。在内核的视角里，一个进程本质上只是一个数据结构，即大名鼎鼎的task_struct，也就是咱们在课本上经常听的**进程控制块(Process Control Block, PCB)**。
-这个结构体是内核管理和调度一切的抓手，它记录了进程的PID、状态、权限、打开的文件、信号处理器，以及最重要的——它指向的内存映像（mm_struct）。
-进程如何“跑”起来？
-进程的执行依赖于两个核心概念：
-
-**虚拟地址空间 (Virtual Address Space)**：每个进程都拥有自己独立的、从0开始的虚拟地址空间。这是一个“沙盒”，让进程以为自己独占了整个内存。
-**页管理 (Paging)**：CPU的内存管理单元（MMU）负责将进程访问的“虚拟地址”翻译成“物理内存地址”。内核通过维护一张 页表(Page Table) 来实现这种映射。
-
-因此，“加载一个程序”的本质，就是内核去填充这个task_struct，并为其建立一套全新的虚拟地址空间和对应的页表映射，将ELF文件中的内容（代码、数据）“映射”到这个地址空间中。
-进程的构建过程申请资源当我们在shell中执行./hello时，fork()创建了一个子进程（几乎是父进程的克隆），然后这个子进程调用execve(&quot;./hello&quot;, ...)系统调用。这个系统调用，就是程序开始装载的开始。
-execve的使命是：丢弃当前的内存映像，换上一个全新的程序。
-内核此时会：
-
-查找并验证格式：内核会读取文件头部，通过x7fELF魔数识别出这是一个ELF文件，并找到对应的处理器binfmt_elf。
-销毁旧世界：内核会毫不留情地释放当前进程的旧虚拟地址空间（解散旧的mm_struct和所有VMA）。
-创建新骨架：内核会创建一个新的mm_struct（内存描述符）和task_struct中的相关字段，为新程序准备一个干净的“沙盒”。
-
-至此，我们有了一个“空”的进程骨架，得到了我们用来描述的资源。
-填充内容现在，内核需要按照ELF这张“蓝图”，将代码和数据填充到这个新的虚拟地址空间中。
-程序想跑，至少要知道在哪里跑？
-这就是ELF文件“执行视图”（Program Headers）的用武之地。内核会遍历readelf -l看到的每一个PT_LOAD段：
-
-代码段（.text, .rodata, …）：内核看到一个PT_LOAD段，它标记为可读、可执行（R E）。内核会在虚拟地址空间中创建一块区域（VMA, vm_area_struct），并将其权限设置为VM_READ | VM_EXEC。
-数据段（.data, .bss）：内核看到另一个PT_LOAD段，它标记为可读、可写（RW）。内核会创建另一块VMA，并将其权限设置为VM_READ | VM_WRITE。
-
-关键机制：延迟加载（Demand Paging）
-内核在这一步并不会真的去从磁盘读取G字节的数据。它只是建立了“映射关系”。它在页表中将这些虚拟地址标记为“存在”，但“不在物理内存中”。
-当CPU第一次尝试执行位于代码段的某条指令时，MMU发现这个虚拟地址没有对应的物理内存，就会触发一个 缺页异常 (Page Fault) 。
-此时内核才会被唤醒，它检查这个地址是否合法（是否在某个VMA内），然后才去磁盘上读取那一页（通常是4KB）的代码，将其加载到物理内存，更新页表，然后让CPU重新执行那条指令。
-这就是为什么即使是G字节大小的程序，启动也可能非常快的原因。
-对于.bss段（未初始化的全局变量），它在文件中不占空间（FileSiz &lt; MemSiz）。内核会为这部分多出来的虚拟内存映射一个特殊的、全零的“匿名页”，实现了C&#x2F;C++标准中“全局变量默认初始化为0”的承诺。
-设置入口点内核已经把内存空间准备好了。现在，它必须设置一个“入口点”，告诉CPU从哪里开始执行第一条指令。
-这个入口点 不是main ，而是ELF头中指定的e_entry地址。
-此时，控制权交给了 C运行时库 (glibc) 。这里分为两种情况：
-情况一：静态链接_start函数（来自crt1.o）被直接链接到程序中。它就是e_entry。_start的任务很单纯：
-
-从堆栈上准备好argc, argv, envp。
-调用__libc_start_main函数。
-
-情况二：动态链接（现代C++程序的常态）
-内核在解析Program Headers时，会发现一个PT_INTERP段，它指向一个程序：/lib64/ld-linux-x86-64.so.2。
-内核的入口点：内核会将动态链接器 (ld.so) 加载到内存，并将e_entry设置为ld.so的入口点。
-ld.so接管：ld.so首先开始运行。它负责：
-加载程序所依赖的所有共享库（如libstdc++.so, libc.so）。
-对所有跨库的函数调用进行“重定位”（Relocation），填平.got.plt表。
-完成所有库的加载后，ld.so才会跳转到程序自己的e_entry（即_start）。
-
-
-
-无论哪种情况，最终都会调用到glibc中的__libc_start_main。
-C++的特殊性：.init_array的执行__libc_start_main是进入main前最后的处理函数。它除了初始化线程、I&#x2F;O等，还必须处理C++的特殊需求。
-C++允许我们定义具有复杂构造函数的全局对象：
-std::ofstream log_file(&quot;global.log&quot;); // 需要在main之前运行int main() &#123;    log_file &lt;&lt; &quot;Main started&quot; &lt;&lt; std::endl;&#125;
-
-log_file的构造函数必须在main之前执行。编译器和链接器如何实现这一点？
-它们会将这个构造函数的指针（或一个调用它的辅助函数指针）放入一个特殊的、只读的节：**.init_array**。
-__libc_start_main在调用main之前，会执行一个循环，遍历.init_array中的每一个函数指针并调用它们，确保所有全局对象都按顺序被正确构造。
-在main返回后，__libc_start_main还会去遍历.fini_array，执行全局对象的析构函数。
-实验演示与源码剖析gdb调试让我们用GDB来亲眼见证这个过程。elf_load_test.cpp:
-#include &lt;iostream&gt;struct GlobalInitializer &#123;    GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global constructor (.init_array) running!&quot; &lt;&lt; std::endl;    &#125;    ~GlobalInitializer() &#123;        std::cout &lt;&lt; &quot;Global destructor (.fini_array) running!&quot; &lt;&lt; std::endl;    &#125;&#125;;GlobalInitializer g_init; // .init_array 将包含调用其构造函数的代码int main() &#123;    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;    return 0;&#125;
-
-g++ -g -o main elf_load_test.cpp
-
-使用GDB调试：
-
-查看入口点：
-
-# 启动gdb调试gdb ./main# 查看入口信息(gdb) info file## 会出现类似的信息Entry point: 0x10a0 #这是 _start 的地址，不是 main0x0000000000000318 - 0x0000000000000334 is .interp.....0x0000000000003d88 - 0x0000000000003d98 is .init_array
-
-
-在入口点和main打断点：
-
-(gdb) b _startBreakpoint 1 at 0x10a0(gdb) b __libc_start_main_implFunction &quot;__libc_start_main_impl&quot; not defined.Make breakpoint pending on future shared library load? (y or [n]) yBreakpoint 2 (__libc_start_main_impl) pending.(gdb) b mainBreakpoint 3 at 0x1191: file elf_load_test.cpp, line 15.
-
-
-执行起来：
-
-可以看到类似的输出
-(gdb) rStarting program: Breakpoint 1, 0x00007ffff7fe3290 in _start () from /lib64/ld-linux-x86-64.so.2(gdb) cContinuing.[Thread debugging using libthread_db enabled]Using host libthread_db library &quot;/lib/x86_64-linux-gnu/libthread_db.so.1&quot;.Breakpoint 1, 0x00005555555550a0 in _start ()(gdb) cContinuing.Breakpoint 2, __libc_start_main_impl (main=0x555555555189 &lt;main()&gt;, argc=1, argv=0x7fffffffd998, init=0x0, fini=0x0, rtld_fini=0x7ffff7fc9040 &lt;_dl_fini&gt;, stack_end=0x7fffffffd988) at ../csu/libc-start.c:242242	../csu/libc-start.c: 没有那个文件或目录.(gdb) cContinuing.Global constructor (.init_array) running!Breakpoint 3, main () at elf_load_test.cpp:1515	    std::cout &lt;&lt; &quot;main() function running!&quot; &lt;&lt; std::endl;(gdb) cContinuing.main() function running!Global destructor (.fini_array) running!
-
-这清晰地证明了执行顺序：_start -&gt; __libc_start_main -&gt; .init_array (全局构造) -&gt; main的过程。
-linux内核源码剖析之前讲解的理论部分，在现代的Linux内核中都有体现。在Linux内核中的fs/binfmt_elf.c文件就实现了相关的部分，其核心函数是load_elf_binary。
-让我们来看看它（基于现代内核，已简化）的关键步骤：
-
-验证ELF头：
-
-内核首先把bprm-&gt;buf（已经由用户态execve()传来的文件头缓冲区）当作ELF头结构elfhdr读取，并做一系列基本一致性检查：
-struct elfhdr *elf_ex = (struct elfhdr *)bprm-&gt;buf;// 检查魔数（ELF 标识）是否匹配，若不匹配直接返回-ENOEXEC（不是ELF）if (memcmp(elf_ex-&gt;e_ident, ELFMAG, SELFMAG) != 0)    goto out;//只接受 ET_EXEC（普通可执行文件）或 ET_DYN（位置无关可执行/共享对象，如 PIE / 动态解释器本身），其它类型拒绝。if (elf_ex-&gt;e_type != ET_EXEC &amp;&amp; elf_ex-&gt;e_type != ET_DYN)    goto out;    // 体系结构检查（是否为当前 CPU / 内核支持的 ABI）if (!elf_check_arch(elf_ex))    goto out;    // 检查是否为 FDPIC（特定 ABI），若不支持则拒绝if (elf_check_fdpic(elf_ex))    goto out;    // 确保内核可以对该文件做 mmap（以后要用 mmap 映射段），否则拒绝if (!bprm-&gt;file-&gt;f_op-&gt;mmap)    goto out;
-
-这些检查保证内核只在能正确处理的 ELF 文件上继续后续流程
-
-解析程序头表（Program Headers）：
-
-内核会读取ELF文件中的程序头表。
-// load_elf_phdrs() 从 ELF 文件中读取并返回程序头表（struct elf_phdr[]）。内核把程序头表拷贝到内核空间（elf_phdata），方便后续逐段处理。若读取失败则返回错误。elf_phdata = load_elf_phdrs(elf_ex, bprm-&gt;file);if (!elf_phdata)    goto out;
-
-程序头表包含 PT_LOAD, PT_INTERP, PT_PHDR, PT_GNU_STACK 等条目，后续流程就是基于这些 header 做决策与映射。
-
-寻找PT_INTERP（动态链接器）：
-
-elf_ppnt = elf_phdata;for (i = 0; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type == PT_GNU_PROPERTY) &#123;        elf_property_phdata = elf_ppnt;        continue;    &#125;    if (elf_ppnt-&gt;p_type != PT_INTERP)        continue;    // 读取 p_filesz 字节作为解释器路径（例如 /lib/ld-linux.so.2 或 /lib64/ld-linux-x86-64.so.2），并确保以 &#x27;\0&#x27; 结尾。    if (elf_ppnt-&gt;p_filesz &gt; PATH_MAX || elf_ppnt-&gt;p_filesz &lt; 2)        goto out_free_ph;    elf_interpreter = kmalloc(elf_ppnt-&gt;p_filesz, GFP_KERNEL);    retval = elf_read(bprm-&gt;file, elf_interpreter, elf_ppnt-&gt;p_filesz,                      elf_ppnt-&gt;p_offset);    if (retval &lt; 0)        goto out_free_interp;    if (elf_interpreter[elf_ppnt-&gt;p_filesz - 1] != &#x27;\0&#x27;)        goto out_free_interp;        //打开该解释器文件    interpreter = open_exec(elf_interpreter);    kfree(elf_interpreter);    if (IS_ERR(interpreter))        goto out_free_ph;    would_dump(bprm, interpreter);    interp_elf_ex = kmalloc(sizeof(*interp_elf_ex), GFP_KERNEL);        // 读取解释器本身的 ELF 头（interp_elf_ex），以便后续验证和加载解释器的段    retval = elf_read(interpreter, interp_elf_ex, sizeof(*interp_elf_ex), 0);    if (retval &lt; 0)        goto out_free_dentry;    break;&#125;
-
-
-创建新的内存映像：
-
-这是execve的核心步骤之一，内核会为进程创建新的内存上下文。
-在正式映射之前，内核需要做一系列准备工作:
-// 解析 PT_GNU_PROPERTY（如果有），并把平台/ABI相关信息填到 arch_stateretval = parse_elf_properties(interpreter ?: bprm-&gt;file,                              elf_property_phdata, &amp;arch_state);if (retval)    goto out_free_dentry;// 允许架构特定代码（arch）基于 ELF 和 interpreter 判断是否接受执行，或进行一些架构检查retval = arch_check_elf(elf_ex, !!interpreter, interp_elf_ex, &amp;arch_state);if (retval)    goto out_free_dentry;// 清除当前进程的执行上下文（关闭旧 mm 的执行凭证、释放旧地址空间的某些资源等），为新程序“重新上发条”retval = begin_new_exec(bprm);if (retval)    goto out_free_dentry;// 根据 ELF header 设置进程 persona（兼容/ABI 标志）SET_PERSONALITY2(*elf_ex, &amp;arch_state);// 根据可执行栈标志调整 READ_IMPLIES_EXEC，并根据进程 persona/randomize 标志设置 PF_RANDOMIZE（决定后续地址随机化）。if (elf_read_implies_exec(*elf_ex, executable_stack))    current-&gt;personality |= READ_IMPLIES_EXEC;if (!(current-&gt;personality &amp; ADDR_NO_RANDOMIZE) &amp;&amp; randomize_va_space)    current-&gt;flags |= PF_RANDOMIZE;    // 为进程设置新的 mm、构造用户栈上的 argv/envp/auxv（setup_arg_pages也可能需要STACK_TOP` 位置，受 personality 影响）setup_new_exec(bprm);retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP), executable_stack);if (retval &lt; 0)    goto out_free_dentry;
-
-这些步骤把进程状态配置成可以安全地把新的 ELF 映射进来，并把用户栈准备好5.  核心：mmap映射PT_LOAD段：
-这段是 load_elf_binary() 的核心：遍历所有 PT_LOAD 段并把它们 mmap 到进程地址空间:
-elf_brk = 0;start_code = ~0UL;end_code = 0;start_data = 0;end_data = 0;for (i = 0, elf_ppnt = elf_phdata; i &lt; elf_ex-&gt;e_phnum; i++, elf_ppnt++) &#123;    if (elf_ppnt-&gt;p_type != PT_LOAD)        continue;    // 把 ELF 段的 p_flags（读/写/执行）与架构状态转换为内核所需的 PROT_READ/PROT_WRITE/PROT_EXEC 权限集合（并处理特殊架构要求）    elf_prot = make_prot(elf_ppnt-&gt;p_flags, &amp;arch_state, !!interpreter, false);        // elf_flags 初始为 MAP_PRIVATE，再根据首次加载、ET_EXEC / ET_DYN、是否已有解释器等条件加上 MAP_FIXED_NOREPLACE 或 MAP_FIXED。    elf_flags = MAP_PRIVATE;    vaddr = elf_ppnt-&gt;p_vaddr;    ......        // 实际把文件（或文件某段）映射到内存并处理 .bss 区（零填充）/文件大小 vs 内存大小差异。返回值可能是映射的起始地址或错误    error = elf_load(bprm-&gt;file, load_bias + vaddr, elf_ppnt, elf_prot, elf_flags, total_size);    if (BAD_ADDR(error)) &#123; retval = IS_ERR_VALUE(error) ? PTR_ERR((void*)error) : -EINVAL; goto out_free_dentry; &#125;    // 首次映射后调整 load_bias（对 ET_DYN），确保后续基址计算正确，reloc_func_desc 也在此填充（用于某些平台函数描述符重定位）。    if (first_pt_load) &#123;        first_pt_load = 0;        if (elf_ex-&gt;e_type == ET_DYN) &#123;            load_bias += error - ELF_PAGESTART(load_bias + vaddr);            reloc_func_desc = load_bias;        &#125;    &#125;    /* 计算 phdr 地址（phdr_addr）、start_code/end_code、elf_brk */    if (elf_ppnt-&gt;p_offset &lt;= elf_ex-&gt;e_phoff &amp;&amp;        elf_ex-&gt;e_phoff &lt; elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_filesz) &#123;        phdr_addr = elf_ex-&gt;e_phoff - elf_ppnt-&gt;p_offset + elf_ppnt-&gt;p_vaddr;    &#125;    k = elf_ppnt-&gt;p_vaddr;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; k &lt; start_code)        start_code = k;    if (start_data &lt; k)        start_data = k;    /* 安全检查 p_memsz / TASK_SIZE */    if (BAD_ADDR(k) || elf_ppnt-&gt;p_filesz &gt; elf_ppnt-&gt;p_memsz ||        elf_ppnt-&gt;p_memsz &gt; TASK_SIZE ||        TASK_SIZE - elf_ppnt-&gt;p_memsz &lt; k) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;        // 检查 p_filesz &lt;= p_memsz、p_memsz &lt;= TASK_SIZE、避免地址溢出（防止构造恶意 ELF 导致内核映射超出允许范围）。    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_filesz;    if ((elf_ppnt-&gt;p_flags &amp; PF_X) &amp;&amp; end_code &lt; k)        end_code = k;    if (end_data &lt; k)        end_data = k;    k = elf_ppnt-&gt;p_vaddr + elf_ppnt-&gt;p_memsz;    if (k &gt; elf_brk)        elf_brk = k;&#125;
-
-
-加载动态链接器（如果存在）：
-
-如果interpreter不为NULL，内核会打开这个文件（ld.so），并加载它。ld.so本身也是一个ELF文件。
-// 在映射完主 ELF 的 PT_LOAD 段后，把所有计算累加 load_bias（基址偏移）以得到真实的地址空间位置，并把 mm-&gt;brk（程序 break/heap 初始位置）设置为 ELF_PAGEALIGN(elf_brk)e_entry = elf_ex-&gt;e_entry + load_bias;phdr_addr += load_bias;elf_brk += load_bias;start_code += load_bias;end_code += load_bias;start_data += load_bias;end_data += load_bias;current-&gt;mm-&gt;start_brk = current-&gt;mm-&gt;brk = ELF_PAGEALIGN(elf_brk);if (interpreter) &#123;    // 加载解释器，调整e_entry入口地址    elf_entry = load_elf_interp(interp_elf_ex,                                interpreter,                                load_bias, interp_elf_phdata,                                &amp;arch_state);                                    if (!IS_ERR_VALUE(elf_entry)) &#123;        interp_load_addr = elf_entry;        elf_entry += interp_elf_ex-&gt;e_entry;    &#125;    if (BAD_ADDR(elf_entry)) &#123;        retval = IS_ERR_VALUE(elf_entry) ? (int)elf_entry : -EINVAL;        goto out_free_dentry;    &#125;    reloc_func_desc = interp_load_addr;        // 对解释器做 allow_write_access()（之前打开时可能为 open_exec() 把文件设为只读/不可写，加载完成后恢复写权限），fput() 释放文件句柄    allow_write_access(interpreter);    fput(interpreter);    kfree(interp_elf_ex);    kfree(interp_elf_phdata);&#125; else &#123;    elf_entry = e_entry;    if (BAD_ADDR(elf_entry)) &#123;        retval = -EINVAL;        goto out_free_dentry;    &#125;&#125;
-
-设置入口点，让用户态接管：
-
-//释放临时分配的 elf_phdata。kfree(elf_phdata);// 设置当前进程的二进制格式处理器为 ELF（内核内跟踪）set_binfmt(&amp;elf_format);.....// 在用户栈上创建 auxv / ELF program headers 的副本（让动态链接器/用户程序可以访问到 phdr 地址、entry、base 等信息），这一步会把 AT_PHDR/AT_ENTRY/AT_BASE 等 auxv 放到栈上。retval = create_elf_tables(bprm, elf_ex, interp_load_addr, e_entry, phdr_addr);if (retval &lt; 0)    goto out;//更新 mm 的 start_code/end_code/start_data/end_data/start_stack，这些记录对调试器和内存限制有用mm = current-&gt;mm;mm-&gt;end_code = end_code;mm-&gt;start_code = start_code;mm-&gt;start_data = start_data;mm-&gt;end_data = end_data;mm-&gt;start_stack = bprm-&gt;p;/* brk 随机化（ASLR） */if ((current-&gt;flags &amp; PF_RANDOMIZE) &amp;&amp; (randomize_va_space &gt; 1)) &#123;   ......&#125;......regs = current_pt_regs();......//做最终的清理，例如把临时文件名、文件描述符替换为新映像等（bprm 层面的善后）。finalize_exec(bprm);// 实际把 rip/eip/pc 设置为 elf_entry 并切换到用户态开始执行用户程序（/ 动态链接器的入口，如果有 interpreter，则先由解释器接管再加载 libc/程序）START_THREAD(elf_ex, regs, elf_entry, bprm-&gt;p);retval = 0;
-
-至此，用户态程序被“放生”到 CPU 上。内核返回 0 表示 exec 成功（但函数实际上在 START_THREAD 之后不会返回到用户态前继续执行内核路径)
-
-总结将一个 ELF 文件转变为一个运行中的进程，是内核态与用户态运行时精密协作的结果，清晰地体现了 Linux 在设计上的分层与解耦。
-
-内核（binfmt_elf） 负责执行最基础和通用的装载任务。它的核心职责是解析 ELF 程序头（Program Headers），创建进程核心的内存管理结构（mm_struct），并建立虚拟地址空间（VMA）。它通过 mmap 和缺页异常（Demand Paging）机制，高效地将文件的代码和数据段“映射”到这片地址空间，实现了延迟加载。
-
-用户态运行时（ld.so 和 glibc） 负责处理后续特定于语言和链接的复杂逻辑。内核在完成基础映射后，根据 PT_INTERP 段（动态链接）或 e_entry（静态链接）移交控制权。用户态的动态链接器或 C 运行时库接管后续工作，包括加载所有共享库、执行符号重定位（填充 GOT&#x2F;PLT），以及在 main 函数执行前调用 C++ 的全局构造函数（.init_array）。
-
-
-这种分层设计，使得内核保持了极高的灵活性和稳定性，它无需关心你用的是C++、Go还是Python，只要你符合ELF规范。而C++的复杂运行时环境，则被优雅地交给了用户态的libstdc++和glibc去管理。
-最终，一个静态的文件被赋予了生命，成为了一个在虚拟内存中奔跑的、受内核调度的独立进程。
 ]]></content>
       <categories>
         <category>程序员的自我修养</category>
