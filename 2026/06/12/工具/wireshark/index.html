@@ -1,0 +1,256 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>使用 Wireshark 确认激光雷达 IP 地址 | ToBrightMoon的计算机世界</title><meta name="author" content="ToBrightMoon"><meta name="copyright" content="ToBrightMoon"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="写作目的激光雷达是机器人和自动驾驶领域中最常用的传感器之一。 无论是进行 SLAM、定位导航还是感知算法开发，第一步往往都是先获取激光雷达的数据。而想要获取数据，就必须先与激光雷达建立网络通信。 实际工作中，经常会遇到这样一种情况：  新购买的激光雷达，不知道默认 IP； 接手同事留下的设备，IP 已经被修改过； 实验室设备多人共用，没人记得当前配置； 厂家文档丢失或者型号不明确。  这时候如果盲">
+<meta property="og:type" content="article">
+<meta property="og:title" content="使用 Wireshark 确认激光雷达 IP 地址">
+<meta property="og:url" content="https://tobrightmoon.github.io/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/index.html">
+<meta property="og:site_name" content="ToBrightMoon的计算机世界">
+<meta property="og:description" content="写作目的激光雷达是机器人和自动驾驶领域中最常用的传感器之一。 无论是进行 SLAM、定位导航还是感知算法开发，第一步往往都是先获取激光雷达的数据。而想要获取数据，就必须先与激光雷达建立网络通信。 实际工作中，经常会遇到这样一种情况：  新购买的激光雷达，不知道默认 IP； 接手同事留下的设备，IP 已经被修改过； 实验室设备多人共用，没人记得当前配置； 厂家文档丢失或者型号不明确。  这时候如果盲">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://tobrightmoon.github.io/images/cover/think_cover.jpg">
+<meta property="article:published_time" content="2026-06-12T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-06-13T00:35:16.508Z">
+<meta property="article:author" content="ToBrightMoon">
+<meta property="article:tag" content="网络">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://tobrightmoon.github.io/images/cover/think_cover.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "使用 Wireshark 确认激光雷达 IP 地址",
+  "url": "https://tobrightmoon.github.io/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/",
+  "image": "https://tobrightmoon.github.io/images/cover/think_cover.jpg",
+  "datePublished": "2026-06-12T16:00:00.000Z",
+  "dateModified": "2026-06-13T00:35:16.508Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "ToBrightMoon",
+      "url": "https://tobrightmoon.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/images/cpp.png"><link rel="canonical" href="https://tobrightmoon.github.io/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '使用 Wireshark 确认激光雷达 IP 地址',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 7.3.0"></head><body><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/images/cover/think_cover.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><img class="site-icon" src="/images/cpp.png" alt="Logo"><span class="site-name">ToBrightMoon的计算机世界</span></a><a class="nav-page-title" href="/"><span class="site-name">使用 Wireshark 确认激光雷达 IP 地址</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"></div></nav><div id="post-info"><h1 class="post-title">使用 Wireshark 确认激光雷达 IP 地址</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-06-12T16:00:00.000Z" title="发表于 2026-06-13 00:00:00">2026-06-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-06-13T00:35:16.508Z" title="更新于 2026-06-13 08:35:16">2026-06-13</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/wireshark/">wireshark</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h2 id="写作目的"><a href="#写作目的" class="headerlink" title="写作目的"></a>写作目的</h2><p>激光雷达是机器人和自动驾驶领域中最常用的传感器之一。</p>
+<p>无论是进行 SLAM、定位导航还是感知算法开发，第一步往往都是先获取激光雷达的数据。而想要获取数据，就必须先与激光雷达建立网络通信。</p>
+<p>实际工作中，经常会遇到这样一种情况：</p>
+<ul>
+<li>新购买的激光雷达，不知道默认 IP；</li>
+<li>接手同事留下的设备，IP 已经被修改过；</li>
+<li>实验室设备多人共用，没人记得当前配置；</li>
+<li>厂家文档丢失或者型号不明确。</li>
+</ul>
+<p>这时候如果盲目修改电脑网段进行尝试，效率会非常低。</p>
+<p>其实有一个非常实用的方法：</p>
+<p><strong>直接抓取激光雷达发送出来的数据包，从数据包中查看其 IP 地址。</strong></p>
+<p>这个工具就是网络分析神器——Wireshark。</p>
+<p>事实上，不只是激光雷达，任何通过网线进行通信的未知设备，都可以通过这种方式快速确定 IP 地址。</p>
+<h2 id="Wireshark-安装"><a href="#Wireshark-安装" class="headerlink" title="Wireshark 安装"></a>Wireshark 安装</h2><p>Ubuntu 下直接安装即可：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">sudo</span> apt update</span><br><span class="line"><span class="built_in">sudo</span> apt install wireshark</span><br></pre></td></tr></table></figure>
+
+<p>安装完成后可以直接启动：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">sudo</span> wireshark</span><br></pre></td></tr></table></figure>
+
+<p>如果经常使用 Wireshark，建议将当前用户加入 Wireshark 用户组：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">sudo</span> usermod -aG wireshark <span class="variable">$USER</span></span><br></pre></td></tr></table></figure>
+
+<p>重新登录后即可直接启动：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">wireshark</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="Wireshark-进行抓包"><a href="#Wireshark-进行抓包" class="headerlink" title="Wireshark 进行抓包"></a>Wireshark 进行抓包</h2><h3 id="1-连接激光雷达"><a href="#1-连接激光雷达" class="headerlink" title="1. 连接激光雷达"></a>1. 连接激光雷达</h3><p>首先将激光雷达通过网线连接到电脑。</p>
+<p>连接后无需知道激光雷达 IP。</p>
+<p>因为我们的目标就是通过抓包找到它。</p>
+<hr>
+<h3 id="2-选择网卡"><a href="#2-选择网卡" class="headerlink" title="2. 选择网卡"></a>2. 选择网卡</h3><p>启动 Wireshark 后，可以看到当前机器上的所有网络接口。</p>
+<p>通常选择：</p>
+<ul>
+<li>Ethernet</li>
+<li>enp*</li>
+<li>eth*</li>
+</ul>
+<p>对应的有线网卡。</p>
+<p>比如我的有限网卡就是 <code>enp12s0</code></p>
+<p><img src="/../../images/wireshark/wireshark.png" alt="img.png"></p>
+<p>开始抓包。</p>
+<h3 id="3-查看数据包"><a href="#3-查看数据包" class="headerlink" title="3. 查看数据包"></a>3. 查看数据包</h3><p>大部分机械式激光雷达会持续向外发送 UDP 数据。</p>
+<p>因此即使电脑 IP 配置不正确，也能看到大量的数据包。</p>
+<p>此时可以观察：</p>
+<ul>
+<li>Source（源 IP）</li>
+<li>Destination（目标 IP）</li>
+</ul>
+<p>例如：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">Source:      192.168.1.201</span><br><span class="line">Destination: 255.255.255.255</span><br></pre></td></tr></table></figure>
+
+<p>或者：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">Source:      192.168.10.108</span><br><span class="line">Destination: 192.168.10.100</span><br></pre></td></tr></table></figure>
+
+<p>其中 Source 一般就是激光雷达的 IP 地址。</p>
+<h2 id="比如我我的激光雷达ip是192-168-3-101，可以从source中看出来"><a href="#比如我我的激光雷达ip是192-168-3-101，可以从source中看出来" class="headerlink" title="比如我我的激光雷达ip是192.168.3.101，可以从source中看出来"></a>比如我我的激光雷达ip是192.168.3.101，可以从source中看出来<br><img src="/../../images/wireshark/wireshark_lidar.png" alt="img.png"></h2><h3 id="4-使用过滤器"><a href="#4-使用过滤器" class="headerlink" title="4. 使用过滤器"></a>4. 使用过滤器</h3><p>如果数据包较多，可以使用过滤条件。</p>
+<p>查看 UDP 数据：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">udp</span><br></pre></td></tr></table></figure>
+
+<p>查看指定端口：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">udp.port == 2368</span><br></pre></td></tr></table></figure>
+
+<p>很多激光雷达默认使用：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">2368</span><br></pre></td></tr></table></figure>
+
+<p>或者：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">6699</span><br></pre></td></tr></table></figure>
+
+<p>等端口发送点云数据。</p>
+<p>不同厂家的端口号可能不同。</p>
+<p>过滤后会更容易找到激光雷达发送的数据包。</p>
+<h2 id="为什么这种方法有效"><a href="#为什么这种方法有效" class="headerlink" title="为什么这种方法有效"></a>为什么这种方法有效</h2><p>从计算机网络的角度来看，设备之间进行通信一定会产生网络数据包。</p>
+<p>而数据包中天然包含：</p>
+<ul>
+<li>源 IP</li>
+<li>目的 IP</li>
+<li>MAC 地址</li>
+<li>协议类型</li>
+<li>端口号</li>
+</ul>
+<p>Wireshark 本质上就是将网卡接收到的数据包解析出来并展示给用户。</p>
+<p>因此只要激光雷达正在发送数据，我们就能够从数据包中找到它的网络信息。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>当我们拿到一个 IP 未知的激光雷达时，不必急于猜测网段或者修改电脑配置。</p>
+<p>最简单的方法就是：</p>
+<ol>
+<li>将激光雷达连接到电脑；</li>
+<li>使用 Wireshark 抓包；</li>
+<li>查看激光雷达发送的数据；</li>
+<li>从 Source IP 中确定设备地址。</li>
+</ol>
+<p>这个方法不仅适用于激光雷达，也适用于各种通过以太网通信的工业设备、机器人设备以及网络传感器。</p>
+<p>学习和理解计算机网络知识，会让很多看似复杂的问题变得非常简单。</p>
+<p>而 Wireshark 则是理解网络通信过程最值得掌握的工具之一。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://tobrightmoon.github.io">ToBrightMoon</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://tobrightmoon.github.io/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/">https://tobrightmoon.github.io/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://tobrightmoon.github.io" target="_blank">ToBrightMoon的计算机世界</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%BD%91%E7%BB%9C/">网络</a></div><div class="post-share"><div class="social-share" data-image="/images/cover/think_cover.jpg" data-sites="facebook,twitter,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/06/07/amcl/02.amcl%E9%A2%84%E6%B5%8B%E4%B8%8E%E6%9B%B4%E6%96%B0%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E5%B8%A7%E7%B2%92%E5%AD%90%E5%A6%82%E4%BD%95%E9%A9%B1%E5%8A%A8%E7%B2%92%E5%AD%90%E6%BB%A4%E6%B3%A2/" title="AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波"><img class="cover" src="/images/amcl/00/amcl.png" onerror="onerror=null;src='/img/404.jpg'" alt="cover of next post"><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波</div></div><div class="info-2"><div class="info-item-1">前言在上一篇文章中，我们利用源码论证了，状态是 map 下的 sample-&gt;pose（base） 。 这篇文章就来说明：在一帧激光数据中，怎么完成预测与更新的。 大致结论 粒子滤波使用蒙特卡罗方法实现贝叶斯滤波框架：用很多带权粒子近似后验。 在 AMCL中，每个粒子都会经历两个过程：  预测   将 odom 系的 delta 输入 motion_model_-&gt;odometryUpdate,更新 sample-&gt;pose（map）   更新   利用 激光 LaserData + 地图，调用Laser::sensorUpdate → pf_update_sensor，完成sample-&gt;weight的更新  与卡尔曼滤波的差别：粒子滤波在更新步 不改状态，只改 权重；最终位姿靠粒子群的统计量给出。预测里加噪声是粒子滤波的灵魂：不加噪声，所有粒子运动一致，就失去「用样本估计分布」的意义。 下面按 laserReceived 的真实顺序，从源码跟一遍。 总线：一帧激光里的顺序12345678910111213141516......&#125; else ...</div></div></div></a></nav></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/images/avatar.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">ToBrightMoon</div><div class="author-info-description">记录我的开发与成长，分享自己在计算机世界的点点滴滴</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">42</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">18</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">17</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/ToBrightmoon"><i class="fab fa-github"></i><span>Follow Me</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/ToBrightmoon" target="_blank" title="Github"><i class="fab fa-github" style="color: #24292e;"></i></a><a class="social-icon" href="https://www.zhihu.com/people/meng-zhong-ren-5-90" target="_blank" title="知乎"><i class="fab fa-zhihu" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">个人博客</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%86%99%E4%BD%9C%E7%9B%AE%E7%9A%84"><span class="toc-number">1.</span> <span class="toc-text">写作目的</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#Wireshark-%E5%AE%89%E8%A3%85"><span class="toc-number">2.</span> <span class="toc-text">Wireshark 安装</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#Wireshark-%E8%BF%9B%E8%A1%8C%E6%8A%93%E5%8C%85"><span class="toc-number">3.</span> <span class="toc-text">Wireshark 进行抓包</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E8%BF%9E%E6%8E%A5%E6%BF%80%E5%85%89%E9%9B%B7%E8%BE%BE"><span class="toc-number">3.1.</span> <span class="toc-text">1. 连接激光雷达</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E9%80%89%E6%8B%A9%E7%BD%91%E5%8D%A1"><span class="toc-number">3.2.</span> <span class="toc-text">2. 选择网卡</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E6%9F%A5%E7%9C%8B%E6%95%B0%E6%8D%AE%E5%8C%85"><span class="toc-number">3.3.</span> <span class="toc-text">3. 查看数据包</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%AF%94%E5%A6%82%E6%88%91%E6%88%91%E7%9A%84%E6%BF%80%E5%85%89%E9%9B%B7%E8%BE%BEip%E6%98%AF192-168-3-101%EF%BC%8C%E5%8F%AF%E4%BB%A5%E4%BB%8Esource%E4%B8%AD%E7%9C%8B%E5%87%BA%E6%9D%A5"><span class="toc-number">4.</span> <span class="toc-text">比如我我的激光雷达ip是192.168.3.101，可以从source中看出来</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-%E4%BD%BF%E7%94%A8%E8%BF%87%E6%BB%A4%E5%99%A8"><span class="toc-number">4.1.</span> <span class="toc-text">4. 使用过滤器</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E8%BF%99%E7%A7%8D%E6%96%B9%E6%B3%95%E6%9C%89%E6%95%88"><span class="toc-number">5.</span> <span class="toc-text">为什么这种方法有效</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">6.</span> <span class="toc-text">总结</span></a></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item"><a class="thumbnail" href="/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/" title="使用 Wireshark 确认激光雷达 IP 地址"><img src="/images/cover/think_cover.jpg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="使用 Wireshark 确认激光雷达 IP 地址"/></a><div class="content"><a class="title" href="/2026/06/12/%E5%B7%A5%E5%85%B7/wireshark/" title="使用 Wireshark 确认激光雷达 IP 地址">使用 Wireshark 确认激光雷达 IP 地址</a><time datetime="2026-06-12T16:00:00.000Z" title="发表于 2026-06-13 00:00:00">2026-06-13</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2026/06/07/amcl/02.amcl%E9%A2%84%E6%B5%8B%E4%B8%8E%E6%9B%B4%E6%96%B0%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E5%B8%A7%E7%B2%92%E5%AD%90%E5%A6%82%E4%BD%95%E9%A9%B1%E5%8A%A8%E7%B2%92%E5%AD%90%E6%BB%A4%E6%B3%A2/" title="AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波"><img src="/images/amcl/00/amcl.png" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波"/></a><div class="content"><a class="title" href="/2026/06/07/amcl/02.amcl%E9%A2%84%E6%B5%8B%E4%B8%8E%E6%9B%B4%E6%96%B0%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E5%B8%A7%E7%B2%92%E5%AD%90%E5%A6%82%E4%BD%95%E9%A9%B1%E5%8A%A8%E7%B2%92%E5%AD%90%E6%BB%A4%E6%B3%A2/" title="AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波">AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波</a><time datetime="2026-06-07T16:00:00.000Z" title="发表于 2026-06-08 00:00:00">2026-06-08</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2026/06/05/amcl/01.%20Amcl%E4%BC%B0%E8%AE%A1%E7%9A%84%E7%8A%B6%E6%80%81%E4%B8%8E%E4%BC%A0%E6%84%9F%E5%99%A8%E6%95%B0%E6%8D%AE%E7%9A%84%E4%BD%BF%E7%94%A8/" title="AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析"><img src="/images/amcl/00/amcl.png" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析"/></a><div class="content"><a class="title" href="/2026/06/05/amcl/01.%20Amcl%E4%BC%B0%E8%AE%A1%E7%9A%84%E7%8A%B6%E6%80%81%E4%B8%8E%E4%BC%A0%E6%84%9F%E5%99%A8%E6%95%B0%E6%8D%AE%E7%9A%84%E4%BD%BF%E7%94%A8/" title="AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析">AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析</a><time datetime="2026-06-05T16:00:00.000Z" title="发表于 2026-06-06 00:00:00">2026-06-06</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2026/05/29/amcl/00.%E4%BB%8E%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E5%88%B0%20laserReceived/" title="AMCL源码分析:01.从系统架构到 laserReceived"><img src="/images/amcl/00/amcl.png" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="AMCL源码分析:01.从系统架构到 laserReceived"/></a><div class="content"><a class="title" href="/2026/05/29/amcl/00.%E4%BB%8E%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E5%88%B0%20laserReceived/" title="AMCL源码分析:01.从系统架构到 laserReceived">AMCL源码分析:01.从系统架构到 laserReceived</a><time datetime="2026-05-29T16:00:00.000Z" title="发表于 2026-05-30 00:00:00">2026-05-30</time></div></div><div class="aside-list-item"><a class="thumbnail" href="/2026/05/24/thinks/%E4%BA%BA%E6%B0%91%E7%9A%84%E5%90%8D%E4%B9%89-%E7%A5%81%E5%90%8C%E4%BC%9F-%E6%84%9F%E6%83%85/" title="从泥泞走来的感情之路：祁同伟、宋思明的心理合围”"><img src="/images/cover/think_cover.jpg" onerror="this.onerror=null;this.src='/img/404.jpg'" alt="从泥泞走来的感情之路：祁同伟、宋思明的心理合围”"/></a><div class="content"><a class="title" href="/2026/05/24/thinks/%E4%BA%BA%E6%B0%91%E7%9A%84%E5%90%8D%E4%B9%89-%E7%A5%81%E5%90%8C%E4%BC%9F-%E6%84%9F%E6%83%85/" title="从泥泞走来的感情之路：祁同伟、宋思明的心理合围”">从泥泞走来的感情之路：祁同伟、宋思明的心理合围”</a><time datetime="2026-05-24T16:00:00.000Z" title="发表于 2026-05-25 00:00:00">2026-05-25</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By ToBrightMoon</span><span class="framework-info"><span>框架 </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 7.3.0</a><span class="footer-separator">|</span><span>主题 </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.4.3</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js"></script><script src="/js/main.js"></script><div class="js-pjax"></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
