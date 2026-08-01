@@ -1,6 +1,427 @@
 <?xml version="1.0" encoding="utf-8"?>
 <search>
   <entry>
+    <title>AMCL源码分析:01.从系统架构到 laserReceived</title>
+    <url>/2026/05/29/amcl/00.%E4%BB%8E%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E5%88%B0%20laserReceived/</url>
+    <content><![CDATA[
+源码版本：ros-navigation&#x2F;navigation2 · humble 分支 · 包 nav2_amcl
+
+前言这篇文章是我读 nav2_amcl 时的笔记整理：先建立整体框架，再落到一帧激光 scan 在代码里怎么走。
+写法上遵循「从大到小」——先说明 AMCL 是什么、粒子滤波在思想上解决什么问题，再拆目录结构，最后盯住 AmclNode::laserReceived 这条主路径。
+
+AMCL 是什么AMCL（Adaptive Monte Carlo Localization） 是 Nav2 里用静态栅格地图做定位的模块：在 map 坐标系下估计机器人位姿，并发布 map → odom 的 TF，用来修正里程计漂移。
+需要特别强调的一点：
+
+它是定位，不是建图。SLAM &#x2F; slam_toolbox &#x2F; gmapping 一类负责「边走边画地图」；AMCL 假设地图已经建好，只在已知地图上回答「我在哪」。 建图与定位是两件不同的事，不要混在一个节点里理解。
+
+在系统里，它通常与 map_server 一起由 nav2_bringup 的 localization_launch 拉起，节点名一般为 amcl。
+算法在思想上是什么粒子滤波：用很多「可能」逼近一个「真实」现实世界充满不确定性：里程计会滑、激光有噪声、地图也不完美。因此不能轻易的得到真实的结果。
+粒子滤波的做法是——用大量粒子表示「机器人可能在哪」的分布；每个粒子是一次采样，粒子越多，对分布的刻画越细，月逼近真实的结果，但算力也越高。
+同时，真实世界还有一个更微妙的点：当事件已经发生，其可能性其实已经坍塌了，只是我们不知道而已
+所以需要传感器量测：用当前激光与地图比对，看哪些粒子更「像真的」——每个粒子带有 weight（权重），权重越大，表示该位姿假设与观测越一致。
+重采样与 Adaptive针对两件事，工程上一定会做 重采样：
+
+算力：不能无限增加粒子，要用高权粒子替换低权粒子，把计算集中在「还有希望」的区域；
+确定性：观测不断进来，低权粒子代表的可能性可以淘汰。
+
+AMCL 就是在 2D 激光 + 栅格地图场景下对上述粒子滤波的具体实现，Nav2 里默认激光模型是 likelihood_field（似然场）。
+它相比「教科书粒子滤波」多出的自适应主要体现在：
+
+
+
+机制
+作用
+
+
+
+KLD 采样
+根据粒子空间占用（kd-tree 叶节点数）决定本轮需要多少粒子，而不是固定死个数
+
+
+分簇统计
+粒子按位姿聚类后，取权重最大的簇的均值、协方差，输出一个 /amcl_pose，而不是随便挑一个粒子
+
+
+w_slow &#x2F; w_fast
+观测持续很差时，重采样阶段按比例全局随机撒点，防止整团粒子跟丢
+
+
+预测与更新粒子滤波是贝叶斯滤波的一种蒙特卡洛实现，一帧里仍然可以记成两大步：
+
+
+
+步骤
+在 AMCL 里谁来做
+改什么
+
+
+
+预测
+MotionModel::odometryUpdate
+粒子的 pose（根据 odom 增量 + 高斯噪声）
+
+
+更新
+Laser::sensorUpdate → pf_update_sensor
+粒子的 weight（激光 + 地图）
+
+
+之后还有 重采样（pf_update_resample）和 输出（getMaxWeightHyp → 位姿与 TF）。
+代码结构：包内大致分几块nav2_amcl 不是单文件算法，而是「ROS 壳 + C 粒子滤波 + 传感器&#x2F;地图」的分层：
+
+
+
+目录 &#x2F; 文件
+职责
+
+
+
+src/amcl_node.cpp
+主节点 AmclNode：订阅发布、lifecycle、**laserReceived 总调度**
+
+
+src/pf/
+粒子滤波核心（pf.c）：采样、权重归一化、重采样、KLD、聚类
+
+
+src/map/
+栅格地图 map_t、占据栅格、距离场 map_update_cspace
+
+
+src/sensors/laser/
+激光观测模型（似然场、beam 等），继承 Laser
+
+
+src/motion_model/
+运动模型插件（差速、全向），预测阶段改 pose
+
+
+src/main.cpp
+只创建 AmclNode 并 spin
+
+
+进程入口极简，没有第二个「定位线程」：
+int main(int argc, char ** argv)&#123;  rclcpp::init(argc, argv);  auto node = std::make_shared&lt;nav2_amcl::AmclNode&gt;();  rclcpp::spin(node-&gt;get_node_base_interface());  rclcpp::shutdown();
+
+真正的滤波循环在激光回调里同步跑完；spin 负责把 map、初值等其它回调也驱动起来。
+ROS 层：订阅、发布与初始化关键成员：数据从哪进、从哪出AmclNode 继承 nav2_util::LifecycleNode，通过节点的状态变化完成自身状态的切换，和「定位数据」直接相关的成员可以分成以下几个部分（声明见 amcl_node.hpp）：
+地图：     map_sub_  → mapReceived初值：     initial_pose_sub_  → initialPoseReceived激光：     laser_scan_sub_ + laser_scan_filter_  → laserReceived里程计：   不订阅话题，用 tf_buffer_ 查 odom → base 的 TF输出：     pose_pub_（amcl_pose）、particle_cloud_pub_、tf_broadcaster_
+
+为了保证这一帧 scan 在 odom 坐标系下可对齐之后，再进 laserReceived，避免 TF 未到就算滤波，激光同时使用message_filters + tf2_ros::MessageFilter：。
+on_configure：按固定顺序搭架子节点不会一启动就滤波。on_configure 里按依赖顺序初始化（节选）：
+AmclNode::on_configure(const rclcpp_lifecycle::State &amp; /*state*/)&#123;  RCLCPP_INFO(get_logger(), &quot;Configuring&quot;);  callback_group_ = create_callback_group(    rclcpp::CallbackGroupType::MutuallyExclusive, false);  initParameters();  initTransforms();  initParticleFilter();  initLaserScan();  initMessageFilters();  initPubSub();  initServices();  initOdometry();  executor_ = std::make_shared&lt;rclcpp::executors::SingleThreadedExecutor&gt;();  executor_-&gt;add_callback_group(callback_group_, get_node_base_interface());  executor_thread_ = std::make_unique&lt;nav2_util::NodeThread&gt;(executor_);  return nav2_util::CallbackReturn::SUCCESS;&#125;
+
+要点：
+
+**initParticleFilter**：先 pf_alloc，此时还没有有效 map_ 上的距离场；
+**initMessageFilters**：把 laserReceived 注册到激光专用 callback group；
+**initPubSub**：地图、初值订阅，以及 lifecycle 发布者；
+**末尾 NodeThread**：单独 executor 跑激光回调，避免和 TF 定时器互卡。
+
+initTransforms 创建 tf_buffer_ &#x2F; tf_listener_ &#x2F; tf_broadcaster_；
+initMessageFilters 与 initPubSub 的代码逻辑是：scan 走滤波线程，map 与 initialpose 走默认回调组。
+on_activate：打开「闸门」configure 之后 active_ 仍为 false，激光回调会直接 return。on_activate 里激活发布者并置位：
+AmclNode::on_activate(const rclcpp_lifecycle::State &amp; /*state*/)&#123;  RCLCPP_INFO(get_logger(), &quot;Activating&quot;);  pose_pub_-&gt;on_activate();  particle_cloud_pub_-&gt;on_activate();  first_pose_sent_ = false;  active_ = true;
+
+Nav2 里通常由 lifecycle_manager 自动 configure &#x2F; activate；单独调试时才需要手敲 ros2 lifecycle set。
+另外两条数据线（进 laserReceived 之前）定位是数据驱动的，除了激光，还有两条线必须先就绪。
+静态地图 /map → map_void AmclNode::mapReceived(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)&#123;  ...  handleMapMessage(*msg);  first_map_received_ = true;&#125;void AmclNode::handleMapMessage(const nav_msgs::msg::OccupancyGrid &amp; msg)&#123;  std::lock_guard&lt;std::recursive_mutex&gt; cfl(mutex_);  ...  freeMapDependentMemory();  map_ = convertMap(msg);
+
+
+convertMap：ROS 栅格 → C 结构 map_t；
+**freeMapDependentMemory 会清空 lasers_**：换图后旧的 LikelihoodFieldModel 不能继续用旧 map 指针；
+距离场 occ_dist 在创建 Laser 对象时由 map_update_cspace 建立，不在 mapReceived 里做。
+
+没有 first_map_received_，laserReceived 会打 Waiting for map.... 并 return。
+初始位姿 /initialpose → pf_init用户通过 RViz「2D Pose Estimate」或话题 /initialpose 提交估计。handleInitialPose 在 map 帧下重撒粒子：
+pf_init(pf_, pf_init_pose_mean, pf_init_pose_cov);pf_init_ = false;...initial_pose_is_known_ = true;
+
+没有已知初值时，publishAmclPose &#x2F; publishParticleCloud 会直接 return——有 scan 也可能没有位姿输出。
+
+主路径：laserReceived 一帧怎么走实现定位**主要的入口就是 AmclNode::laserReceived**。下面按执行顺序拆（与源码一致）。
+就绪检查void AmclNode::laserReceived(sensor_msgs::msg::LaserScan::ConstSharedPtr laser_scan)&#123;  std::lock_guard&lt;std::recursive_mutex&gt; cfl(mutex_);  if (!active_) &#123;return;&#125;  if (!first_map_received_) &#123;    if (checkElapsedTime(2s, last_time_printed_msg_)) &#123;      RCLCPP_WARN(get_logger(), &quot;Waiting for map....&quot;);      last_time_printed_msg_ = now();    &#125;    return;  &#125;
+
+未 activate、没有地图，都不继续。整函数在 mutex_ 下执行，与 mapReceived、handleInitialPose 互斥。
+激光模型对象：第一次见到该 frame_idif (frame_to_laser_.find(laser_scan_frame_id) == frame_to_laser_.end()) &#123;  if (!addNewScanner(laser_index, laser_scan, laser_scan_frame_id, laser_pose)) &#123;    return;  // could not find transform  &#125;&#125; else &#123;  laser_index = frame_to_laser_[laser_scan-&gt;header.frame_id];&#125;
+
+addNewScanner 里 createLaserObject() 按参数创建 LikelihoodFieldModel 等，**此时才绑定当前 map_**。
+所以顺序必须是：先有 map，再有 Laser 实例。
+里程计：查 TF，算增量 deltaif (!getOdomPose(    latest_odom_pose_, pose.v[0], pose.v[1], pose.v[2],    laser_scan-&gt;header.stamp, base_frame_id_))&#123;  RCLCPP_ERROR(get_logger(), &quot;Couldn&#x27;t determine robot&#x27;s pose associated with laser scan&quot;);  return;&#125;
+
+注意：AMCL 不订阅 /odom 话题，而是在 getOdomPose 里查 TF（odom → base）。
+与上次保存的 pf_odom_pose_ 做差得到 **delta**，供运动模型做预测。
+是否在本帧做观测更新，由 shouldUpdateFilter 根据 update_min_d、update_min_a 判断；机器人几乎不动时可以跳过更新，这是省电策略，不是故障。
+预测：只改 poseif (lasers_update_[laser_index]) &#123;  motion_model_-&gt;odometryUpdate(pf_, pose, delta);&#125;
+
+差速模型在 differential_motion_model.cpp 里把 delta 拆成旋转-平移-旋转，对每个粒子加噪声更新位姿，不动 weight。
+更新：只改 weightif (lasers_update_[laser_index]) &#123;  updateFilter(laser_index, laser_scan, pose);
+
+updateFilter 把 LaserScan 转成 LaserData（距离 + bearing），再调用：
+lasers_[laser_index]-&gt;sensorUpdate(pf_, reinterpret_cast&lt;nav2_amcl::LaserData *&gt;(&amp;ldata));lasers_update_[laser_index] = false;pf_odom_pose_ = pose;
+
+似然场模型里，sensorUpdate 最终进 pf_update_sensor，对每个粒子、每条降采样光束查 **occ_dist**（光束终点离障碍越近，权重乘性越大），再归一化并更新 w_slow &#x2F; w_fast。
+重采样：复制高权、必要时全局恢复if (!(++resample_count_ % resample_interval_)) &#123;  pf_update_resample(pf_, reinterpret_cast&lt;void *&gt;(map_));  resampled = true;&#125;
+
+pf_update_resample（pf.c）里：双缓冲集合切换、按权重轮盘赌复制 pose、按 KLD 决定粒子数、按 w_diff 决定是否调用 random_pose_fn(map_) 撒随机粒子。
+pf 里维护 两个 sample set（sets[0] &#x2F; sets[1]），就是为了重采样时读写分离；current_set 指向当前在用的一套。
+输出：粒子云、位姿、map → odom  if (!force_update_) &#123;    publishParticleCloud(set);  &#125;&#125;if (resampled || force_publication || !first_pose_sent_) &#123;  ...  if (getMaxWeightHyp(hyps, max_weight_hyps, max_weight_hyp)) &#123;    publishAmclPose(laser_scan, hyps, max_weight_hyp);    calculateMaptoOdomTransform(laser_scan, hyps, max_weight_hyp);    ...      sendMapToOdomTransform(transform_expiration);
+
+
+**publishParticleCloud**：把当前粒子集发到 /particle_cloud；
+getMaxWeightHyp：对所有簇按权重排序，取最大权簇的均值和协方差；
+**calculateMaptoOdomTransform + sendMapToOdomTransform**：发布 map → odom，把里程计系「拧」到与地图一致。
+
+若本帧未重采样且已有有效 TF，末尾还可能重复发送上一次 map→odom，避免 TF 树断档。
+把一帧串成一张表
+
+
+顺序
+代码位置
+粒子滤波语义
+
+
+
+1
+门闩 active_ &#x2F; first_map_received_
+数据未就绪不算
+
+
+2
+getOdomPose + shouldUpdateFilter
+准备 delta
+
+
+3
+motion_model_-&gt;odometryUpdate
+预测 → pose
+
+
+4
+updateFilter → sensorUpdate
+更新 → weight
+
+
+5
+pf_update_resample
+重采样 + KLD + 恢复
+
+
+6
+publishParticleCloud &#x2F; publishAmclPose &#x2F; TF
+输出
+
+
+
+小结
+AMCL &#x3D; 已知地图上的蒙特卡洛定位，不是建图。
+思想 &#x3D; 粒子表分布，预测改 pose、观测改 weight，重采样 + KLD + 分簇输出。
+代码 &#x3D; AmclNode 接线，pf &#x2F; map &#x2F; Laser &#x2F; MotionModel 分工；**一帧的总线在 laserReceived**。
+
+]]></content>
+      <categories>
+        <category>Ros</category>
+        <category>状态估计</category>
+        <category>机器人</category>
+      </categories>
+      <tags>
+        <tag>amcl</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析</title>
+    <url>/2026/06/05/amcl/01.%20Amcl%E4%BC%B0%E8%AE%A1%E7%9A%84%E7%8A%B6%E6%80%81%E4%B8%8E%E4%BC%A0%E6%84%9F%E5%99%A8%E6%95%B0%E6%8D%AE%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[
+源码版本：ros-navigation&#x2F;navigation2 · humble 分支 · 包 nav2_amcl
+
+前言很多 AMCL 教程都会说：
+
+AMCL 用于机器人定位。
+
+但很少继续说明：定位什么？
+更准确一点说：
+
+粒子滤波器内部维护的状态量是什么？
+这个状态量属于哪个坐标系？
+激光数据进入滤波器后，又是如何与这个状态量发生联系的？
+
+这些问题如果不弄清楚，后面阅读运动模型、观测模型、重采样时都会比较混乱。
+因此这篇文章只回答一个问题：
+
+AMCL 到底在估计谁的位姿？
+
+手册上的标准答案首先，在 ROS 1 Wiki &#x2F; Nav2 AMCL 官方文档 中，关于坐标系发布（Published Transforms）的定义非常明确：
+
+AMCL 核心估计的，就是 base_link（机器人机体）在 map（静态全局地图）坐标系下的位姿变换。
+
+
+在工程实现上，为了避免与里程计节点发布的 odom → base_link 产生双重父节点的冲突，AMCL 采用了一种间接修正的技巧：它不直接发布 map → base_link，而是通过查阅里程计的 TF，发布 map → odom 的变换。
+这就引出了我们在源码中必须死盯的三个基本参数。
+在 AmclNode 构造函数和 initParameters 回调中，我们可以看到这三个参数的作用与意义：
+// nav2_amcl/src/amcl_node.cppget_parameter(&quot;global_frame_id&quot;, global_frame_id_); // 默认: &quot;map&quot; (全局静态世界)get_parameter(&quot;base_frame_id&quot;, base_frame_id_);     // 默认: &quot;base_footprint&quot; (机器人底盘投影)get_parameter(&quot;odom_frame_id&quot;, odom_frame_id_);     // 默认: &quot;odom&quot; (存在累积漂移的里程计坐标系)
+
+后续主要的位姿变化也是在这三个位姿坐标系展开。
+AMCL中维护的状态想要知道真正估计的状态，知道我们估计的结果，可以从粒子结构体里。
+在 pf.hpp 中：
+typedef struct&#123;  pf_vector_t pose;  double weight;&#125; pf_sample_t;
+
+一个粒子只有两个核心成员：pose 与 weight
+其中：weight表示当前粒子的可信度。而pose才是滤波器真正维护的状态。
+也就是说：
+
+AMCL 本质上是在维护大量 pose 假设。
+
+粒子云中的每一个粒子，都代表机器人可能存在的位置。
+初始第一帧位姿AMCL 是一套蒙特卡洛（粒子滤波）方法，任何迭代算法都需要一个初始值作为起点，amcl也不例外。
+在AMCL的源码，通过 on_configure，完成了初始信息的回调函数的注册
+void AmclNode::initPubSub()&#123;  RCLCPP_INFO(get_logger(), &quot;initPubSub&quot;);  ......  initial_pose_sub_ = create_subscription&lt;geometry_msgs::msg::PoseWithCovarianceStamped&gt;(    &quot;initialpose&quot;, rclcpp::SystemDefaultsQoS(),    std::bind(&amp;AmclNode::initialPoseReceived, this, std::placeholders::_1));    ......  RCLCPP_INFO(get_logger(), &quot;Subscribed to map topic.&quot;);&#125;
+
+用户在 RViz 中点击 2D Pose Estimate 或向 /initialpose 话题发出的消息，进入AmclNode::initialPoseReceived中
+初值的校验代码在使用初值的时候，会进行数值与坐标系的校验，保证数值与坐标系的合规性。
+if (!nav2_util::validateMsg(*msg)) &#123; return; &#125; // 位姿本身不能含有 NaN 损坏数据if (nav2_util::strip_leading_slash(msg-&gt;header.frame_id) != global_frame_id_) &#123;  // 拦截：传入的初值必须是在 global_frame_id_（即 map）下的绝对位姿！  return; &#125;### 消除传输延迟的底盘补偿同时，为了补偿，在你发送消息与收到消息之间可能因为机器人运动带来的位姿变化，`handleInitialPose` 内部做了一次巧妙的 **时间戳回溯补偿** ：```c++// 1. 查找从 initialpose 的历史时间戳到 AMCL 当前时刻，底盘自己走了多少相对运动tx_odom = tf_buffer_-&gt;lookupTransform(base_frame_id_, tf2_ros::fromMsg(msg.header.stamp),                                       base_frame_id_, tf2_time, odom_frame_id_);// 2. 将用户指定的旧图上位姿，乘上这段时间的里程计运动增量，更新为当前时刻的最准位姿tf2::Transform pose_new = pose_old * tx_odom_tf2;
+
+滤波器的几何底色：全员 map 系计算完成后，初值通过 pf_init 注入粒子滤波器：
+pf_init_pose_mean.v[0] = pose_new.getOrigin().x();pf_init_pose_mean.v[1] = pose_new.getOrigin().y();pf_init_pose_mean.v[2] = tf2::getYaw(pose_new.getRotation());pf_init(pf_, pf_init_pose_mean, pf_init_pose_cov);
+
+结论的确认但是现在仅仅能确认的是，位姿是在map坐标系下的，不能确认到底是哪一个传感器在map下的坐标系，所以继续从源码出发。
+在处理初始位姿时：
+tx_odom = tf_buffer_-&gt;lookupTransform(    base_frame_id_,    ...,    base_frame_id_,    ...,    odom_frame_id_);
+
+这里出现的始终是 base_frame_id_,整个初始化过程都没有出现 laser,并且激光的外参也没有注册完成，所以sample-&gt;pose不可能表示激光位姿。它表示的只能是：T_map_base，既机器人底盘在map中的位姿。
+
+结论：由此开始，AMCL 底层滤波器核心 pf_t 内部维护的所有粒子 sample-&gt;pose，其内在的数学语义全部在 map 坐标系下。
+
+它们代表了机器人在静态地图中的成百上千种可能的位置假设。
+传感器数据流：局部雷达到全局地图的投影链条明确了粒子全都在 map 系下之后，我们来看一帧局部的激光雷达点云（在 laser_frame 下）进来时，是如何与地图产生碰撞并完成闭环的。
+动态注册外参在 laserReceived 主数据总线中，AMCL 支持多雷达输入。
+首先判断，这个激光传感器是不是出现过，没有出现就调用addNewScanner,否则就直接得到某个某个激光器的索引，方便后续查询
+...... std::string laser_scan_frame_id = nav2_util::strip_leading_slash(laser_scan-&gt;header.frame_id); last_laser_received_ts_ = now(); int laser_index = -1; geometry_msgs::msg::PoseStamped laser_pose; // Do we have the base-&gt;base_laser Tx yet? if (frame_to_laser_.find(laser_scan_frame_id) == frame_to_laser_.end()) &#123;   if (!addNewScanner(laser_index, laser_scan, laser_scan_frame_id, laser_pose)) &#123;     return;  // could not find transform   &#125; &#125; else &#123;   // we have the laser pose, retrieve laser index   laser_index = frame_to_laser_[laser_scan-&gt;header.frame_id]; &#125; ......
+
+然后在 addNewScanner 动态测算外参：
+// 查询当前雷达 frame 到 base_frame_id_ 的静态 TF 外参tf_buffer_-&gt;transform(ident, laser_pose, base_frame_id_, transform_tolerance_);pf_vector_t laser_pose_v;laser_pose_v.v[0] = laser_pose.pose.position.x; // 雷达相对于底盘中心的 X 轴偏移 (米)laser_pose_v.v[1] = laser_pose.pose.position.y; // 雷达相对于底盘中心的 Y 轴偏移 (米)laser_pose_v.v[2] = 0; // 航向角初置 0，后续计算lasers_[laser_index]-&gt;SetLaserPose(laser_pose_v); // 将该外参牢牢绑定在对应的 LaserModel 实例中
+
+
+结论：lasers_[laser_index]-&gt;laser_pose_ 存储的是 laser to base 的静态外参**。它只取决于硬件安装位置，完全不随机器人的运动而改变。
+
+似然场的坐标转换当数据经过校验，完成运动更新之后，updateFilter 最终会将雷达降采样数据灌入 LikelihoodFieldModel::sensorFunction 中。
+对于每一个粒子，代码将进行数据转换，完成数据从激光系到map系的转换：
+for (j = 0; j &lt; set-&gt;sample_count; j++) &#123;    sample = set-&gt;samples + j;    pose = sample-&gt;pose; // 第一步：拿到当前粒子在 map 下的【底盘假设位姿】 (X_map, Y_map, Yaw_map)    // 第二步：复合静态外参！将该假设位姿，变换为该粒子视角下，【雷达在 map 下的假设位姿】    pose = pf_vector_coord_add(self-&gt;laser_pose_, pose);     for (i = 0; i &lt; data-&gt;range_count; i += step) &#123;        double obs_range = data-&gt;ranges[i][0];     // 拿到当前激光束的局部测量距离值 (局部米)        double obs_bearing = data-&gt;ranges[i][1];   // 拿到当前激光束在雷达极坐标系下的夹角 (局部弧度)        // 第三步：利用三角函数，将局部测距终点（Endpoint）直接投影至地图【map 坐标系】下        hit.v[0] = pose.v[0] + obs_range * cos(pose.v[2] + obs_bearing);        hit.v[1] = pose.v[1] + obs_range * sin(pose.v[2] + obs_bearing);        // 第四步：拿这个 map 系下的终点坐标 hit.v，去查 map_t 栅格地图里的边界距离场 (occ_dist)        // 离障碍物越近，该粒子的生存权重 (weight) 乘性越高！不动 pose，只改 weight！    &#125;&#125;
+
+综上，整个雷达点云的处理就是，当第一帧出现时计算外参，当更新时利用外参得到激光点云在全局坐标系下的位置。
+五、 总结这一篇回答了一个的问题：
+
+AMCL 到底在估计什么？
+
+从源码可以看到：
+
+粒子内部维护的是 sample-&gt;pose
+sample-&gt;pose 从初始化开始就在 map 坐标系下
+它描述的是机器人底盘 base
+激光坐标系只是观测阶段通过外参投影到地图
+整个滤波器真正估计的状态始终是：
+
+
+T_map_base即：机器人在地图中的位姿
+
+]]></content>
+      <categories>
+        <category>Ros</category>
+        <category>状态估计</category>
+        <category>机器人</category>
+      </categories>
+      <tags>
+        <tag>amcl</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波</title>
+    <url>/2026/06/07/amcl/02.amcl%E9%A2%84%E6%B5%8B%E4%B8%8E%E6%9B%B4%E6%96%B0%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E5%B8%A7%E7%B2%92%E5%AD%90%E5%A6%82%E4%BD%95%E9%A9%B1%E5%8A%A8%E7%B2%92%E5%AD%90%E6%BB%A4%E6%B3%A2/</url>
+    <content><![CDATA[前言在上一篇文章中，我们利用源码论证了，状态是 map 下的 sample-&gt;pose（base） 。
+这篇文章就来说明：在一帧激光数据中，怎么完成预测与更新的。
+大致结论
+粒子滤波使用蒙特卡罗方法实现贝叶斯滤波框架：用很多带权粒子近似后验。
+在 AMCL中，每个粒子都会经历两个过程：
+
+预测
+
+
+将 odom 系的 delta 输入 motion_model_-&gt;odometryUpdate,更新 sample-&gt;pose（map）
+
+
+更新
+
+
+利用 激光 LaserData + 地图，调用Laser::sensorUpdate → pf_update_sensor，完成sample-&gt;weight的更新
+
+与卡尔曼滤波的差别：粒子滤波在更新步 不改状态，只改 权重；最终位姿靠粒子群的统计量给出。预测里加噪声是粒子滤波的灵魂：不加噪声，所有粒子运动一致，就失去「用样本估计分布」的意义。
+下面按 laserReceived 的真实顺序，从源码跟一遍。
+总线：一帧激光里的顺序......&#125; else &#123;  if (shouldUpdateFilter(pose, delta)) &#123;    for (unsigned int i = 0; i &lt; lasers_update_.size(); i++) &#123;      lasers_update_[i] = true;    &#125;  &#125;  if (lasers_update_[laser_index]) &#123;    motion_model_-&gt;odometryUpdate(pf_, pose, delta);  &#125;  ...&#125;if (lasers_update_[laser_index]) &#123;  updateFilter(laser_index, laser_scan, pose);  if (!(++resample_count_ % resample_interval_)) &#123;    pf_update_resample(pf_, reinterpret_cast&lt;void *&gt;(map_));
+
+
+预测：信息从哪来、怎么作用到每个粒子运动模型插件：initOdometryon_configure 里加载车体运动模型（由 robot_model_type 决定，默认差速）：
+motion_model_ = plugin_loader_.createSharedInstance(robot_model_type_);motion_model_-&gt;initialize(alpha1_, alpha2_, alpha3_, alpha4_, alpha5_);latest_odom_pose_ = geometry_msgs::msg::PoseStamped();
+
+alpha1_～alpha5_ 控制里程计噪声强度（对应《概率机器人》Table 5.5）。
+getOdomPose + delta：预测的信息来源每帧激光回调里，先查 base 在 odom 下的位姿 pose：
+if (!getOdomPose(..., laser_scan-&gt;header.stamp, base_frame_id_))
+
+与上次观测更新后记录的 pf_odom_pose_ 做差，得到 odom 系增量 delta：
+bool AmclNode::shouldUpdateFilter(const pf_vector_t pose, pf_vector_t &amp; delta)&#123;  delta.v[0] = pose.v[0] - pf_odom_pose_.v[0];  delta.v[1] = pose.v[1] - pf_odom_pose_.v[1];  delta.v[2] = angleutils::angle_diff(pose.v[2], pf_odom_pose_.v[2]);  bool update = fabs(delta.v[0]) &gt; d_thresh_ ||    fabs(delta.v[1]) &gt; d_thresh_ ||    fabs(delta.v[2]) &gt; a_thresh_;  update = update || force_update_;  return update;&#125;
+
+
+d_thresh_ &#x2F; a_thresh_ 来自参数 update_min_d &#x2F; update_min_a
+小车停着：delta 很小 → shouldUpdateFilter 为 false → 不预测、不观测，避免无意义计算
+force_update_：如 request_nomotion_update 服务可强制更新
+
+只有 lasers_update_[laser_index]==true 时才调用 odometryUpdate。
+差速模型：对每个粒子加噪并改 pose// 预测步：pose/delta 为 odom 系；sample-&gt;pose 为 map 系。void DifferentialMotionModel::odometryUpdate(  pf_t * pf, const pf_vector_t &amp; pose,  const pf_vector_t &amp; delta)&#123;  // 取出粒子集合  pf_sample_set_t * set;  set = pf-&gt;sets + pf-&gt;current_set;  pf_vector_t old_pose = pf_vector_sub(pose, delta);    // 将二维平面上的任意一段运动，分解为三个标准动作：先原地旋转（Rot1），再直线前进（Trans），最后再原地旋转（Rot2）  double delta_rot1, delta_trans, delta_rot2;  double delta_rot1_hat, delta_trans_hat, delta_rot2_hat;  double delta_rot1_noise, delta_rot2_noise;  if (sqrt(      delta.v[1] * delta.v[1] +      delta.v[0] * delta.v[0]) &lt; 0.01)  &#123;    delta_rot1 = 0.0;  &#125; else &#123;    delta_rot1 = angleutils::angle_diff(      atan2(delta.v[1], delta.v[0]),      old_pose.v[2]);  &#125;  delta_trans = sqrt(    delta.v[0] * delta.v[0] +    delta.v[1] * delta.v[1]);  delta_rot2 = angleutils::angle_diff(delta.v[2], delta_rot1);  // 保证向前开和向后开都是噪声都是相同的基数  delta_rot1_noise = std::min(    fabs(angleutils::angle_diff(delta_rot1, 0.0)),    fabs(angleutils::angle_diff(delta_rot1, M_PI)));  delta_rot2_noise = std::min(    fabs(angleutils::angle_diff(delta_rot2, 0.0)),    fabs(angleutils::angle_diff(delta_rot2, M_PI)));  for (int i = 0; i &lt; set-&gt;sample_count; i++) &#123;    pf_sample_t * sample = set-&gt;samples + i;    // 1. 采样第一阶段旋转（受自身旋转和前进距离影响）    delta_rot1_hat = angleutils::angle_diff(      delta_rot1,      pf_ran_gaussian(        sqrt(          alpha1_ * delta_rot1_noise * delta_rot1_noise +          alpha2_ * delta_trans * delta_trans)));             // 2. 采样平移距离（受前进距离和两阶段旋转量影响）    delta_trans_hat = delta_trans -      pf_ran_gaussian(      sqrt(        alpha3_ * delta_trans * delta_trans +        alpha4_ * delta_rot1_noise * delta_rot1_noise +        alpha4_ * delta_rot2_noise * delta_rot2_noise));           // 3/ 采样第二阶段旋转（受自身旋转和前进距离影响）    delta_rot2_hat = angleutils::angle_diff(      delta_rot2,      pf_ran_gaussian(        sqrt(          alpha1_ * delta_rot2_noise * delta_rot2_noise +          alpha2_ * delta_trans * delta_trans)));    // 更新粒子状态    sample-&gt;pose.v[0] += delta_trans_hat *      cos(sample-&gt;pose.v[2] + delta_rot1_hat);    sample-&gt;pose.v[1] += delta_trans_hat *      sin(sample-&gt;pose.v[2] + delta_rot1_hat);    sample-&gt;pose.v[2] += delta_rot1_hat + delta_rot2_hat;  &#125;&#125;
+
+要点：
+
+分解：用 odom 的 delta 和 old_pose 算 Rot1–Trans–Rot2。
+加噪：pf_ran_gaussian 让每个粒子的 *_hat 不同 → 粒子云在 map 下散开。
+积分在 map 航向上做：cos(sample-&gt;pose.v[2] + ...) 用的是 该粒子自己的 map 朝向，不是 odom 航向（经典 AMCL 近似）。
+循环内没有 sample-&gt;weight → 预测 只动 pose。
+
+更新：激光数据怎么变成每个粒子的新权重updateFilter：ROS 消息 → LaserDatabool AmclNode::updateFilter(  const int &amp; laser_index,  const sensor_msgs::msg::LaserScan::ConstSharedPtr &amp; laser_scan,  const pf_vector_t &amp; pose)&#123;  // 重新计算出在机器人视角下，雷达扫描的真实起始角度 angle_min 和两点间的真实角度增量  nav2_amcl::LaserData ldata;  ldata.laser = lasers_[laser_index];  ldata.range_count = laser_scan-&gt;ranges.size();    geometry_msgs::msg::QuaternionStamped min_q, inc_q;  min_q.header.stamp = laser_scan-&gt;header.stamp;  min_q.header.frame_id = nav2_util::strip_leading_slash(laser_scan-&gt;header.frame_id);  min_q.quaternion = orientationAroundZAxis(laser_scan-&gt;angle_min);  inc_q.header = min_q.header;  inc_q.quaternion = orientationAroundZAxis(laser_scan-&gt;angle_min + laser_scan-&gt;angle_increment);  try &#123;    tf_buffer_-&gt;transform(min_q, min_q, base_frame_id_);    tf_buffer_-&gt;transform(inc_q, inc_q, base_frame_id_);  &#125; catch (tf2::TransformException &amp; e) &#123;    RCLCPP_WARN(      get_logger(), &quot;Unable to transform min/max laser angles into base frame: %s&quot;,      e.what());    return false;  &#125;  double angle_min = tf2::getYaw(min_q.quaternion);  double angle_increment = tf2::getYaw(inc_q.quaternion) - angle_min;  // wrapping angle to [-pi .. pi]  angle_increment = fmod(angle_increment + 5 * M_PI, 2 * M_PI) - M_PI;  // 去掉太近和太远的点  if (laser_max_range_ &gt; 0.0) &#123;    ldata.range_max = std::min(laser_scan-&gt;range_max, static_cast&lt;float&gt;(laser_max_range_));  &#125; else &#123;    ldata.range_max = laser_scan-&gt;range_max;  &#125;  double range_min;  if (laser_min_range_ &gt; 0.0) &#123;    range_min = std::max(laser_scan-&gt;range_min, static_cast&lt;float&gt;(laser_min_range_));  &#125; else &#123;    range_min = laser_scan-&gt;range_min;  &#125;  // 构建 amcl内部数据结构  ldata.ranges = new double[ldata.range_count][2];  for (int i = 0; i &lt; ldata.range_count; i++) &#123;    if (laser_scan-&gt;ranges[i] &lt;= range_min) &#123;      ldata.ranges[i][0] = ldata.range_max;    &#125; else &#123;      ldata.ranges[i][0] = laser_scan-&gt;ranges[i];    &#125;    // Compute bearing    ldata.ranges[i][1] = angle_min +      (i * angle_increment);  &#125;  lasers_[laser_index]-&gt;sensorUpdate(pf_, reinterpret_cast&lt;nav2_amcl::LaserData *&gt;(&amp;ldata));  lasers_update_[laser_index] = false;  pf_odom_pose_ = pose;  return true;&#125;
+
+注意：pf_odom_pose_ 在 观测末尾 才更新，所以 delta 是「距上次完整观测」的 odom 位移，不是距上次预测。
+sensorUpdate → pf_update_sensor：统一入口各观测模型（Beam &#x2F; LikelihoodField &#x2F; …）都走：
+pf_update_sensor(pf, (pf_sensor_model_fn_t) sensorFunction, data);
+
+pf_update_sensor 干两件事：调用 sensorFunction 改 weight + 归一化与 w_slow&#x2F;w_fast。
+sensorFunction：以 Beam 模型理解（《概率机器人》光束模型）for (j = 0; j &lt; set-&gt;sample_count; j++) &#123;  sample = set-&gt;samples + j;  pose = sample-&gt;pose;  pose = pf_vector_coord_add(self-&gt;laser_pose_, pose);  // map 下雷达位姿  p = 1.0;  for (i = 0; i &lt; data-&gt;range_count; i += step) &#123;    map_range = map_calc_range(self-&gt;map_, pose.v[0], pose.v[1],      pose.v[2] + obs_bearing, data-&gt;range_max);    z = obs_range - map_range;    pz += z_hit * exp(-z²/2σ²);   // 击中    ...                            // 短读、丢失、随机噪声    p += pz * pz * pz;             // 立方和聚合多光束（ad-hoc，但好用）  &#125;  sample-&gt;weight *= p;  total_weight += sample-&gt;weight;&#125;return total_weight;
+
+对单个粒子 j：
+
+假设该粒子的 pose 正确 → 在 map 上投影每条 beam；
+比较 实测距离 与 地图射线距离 map_range；
+混合模型得 pz，多束合成 p；
+**weight *= p，不碰 pose**。
+
+Nav2 默认似然场（简写）：beam 终点查 occ_dist，高斯似然 + 随机项，同样 p += pz³、weight *= p：
+pf_update_sensor：归一化 + 粒子群「健康度」void pf_update_sensor(pf_t * pf, pf_sensor_model_fn_t sensor_fn, void * sensor_data)&#123;  total = (*sensor_fn)(sensor_data, set);  if (total &gt; 0.0) &#123;    for (i = 0; i &lt; set-&gt;sample_count; i++) &#123;      sample-&gt;weight /= total;    // 归一化      w_avg += sample-&gt;weight;    &#125;    w_avg /= set-&gt;sample_count;    pf-&gt;w_slow += pf-&gt;alpha_slow * (w_avg - pf-&gt;w_slow);    pf-&gt;w_fast += pf-&gt;alpha_fast * (w_avg - pf-&gt;w_fast);  &#125; else &#123;    sample-&gt;weight = 1.0 / set-&gt;sample_count;  // 全失效则均匀  &#125;&#125;
+
+
+归一化：所有粒子 weight 之和 &#x3D; 1
+**w_slow &#x2F; w_fast**：长期&#x2F;短期平均匹配质量；w_fast 突然低于 w_slow 时，重采样会随机撒点
+
+小结
+
+预测：odom delta + 运动模型噪声 → 每个粒子 map 下 pose 不同。
+更新：每个粒子用自己的 pose 解释激光 → weight 反映「这个 pose 有多可信」。
+合起来才是贝叶斯滤波里的一步「运动更新 + 测量更新」；重采样与位姿输出在后续篇展开。
+
+]]></content>
+      <categories>
+        <category>Ros</category>
+        <category>状态估计</category>
+        <category>机器人</category>
+      </categories>
+      <tags>
+        <tag>amcl</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>Linux下的内存管理:01.从 malloc 到缺页中断——一次完整的内存分配剖析</title>
     <url>/2025/10/31/Linux%E4%B8%8B%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/01.%E4%BB%8E%20malloc%20%E5%88%B0%E7%BC%BA%E9%A1%B5%E4%B8%AD%E6%96%AD%E2%80%94%E2%80%94%E4%B8%80%E6%AC%A1%E5%AE%8C%E6%95%B4%E7%9A%84%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E5%89%96%E6%9E%90/</url>
     <content><![CDATA[前言在之前的文章中，我们讲述了，从源码到进程中的过程，了解了源码是怎么变成进程，linux系统是怎么使用静态库与动态库的。
@@ -583,427 +1004,6 @@ run_benchmark.sh(主脚本)#!/bin/bashset -eBIN=./benchmarkJEMALLOC=/path/to/lib
       <tags>
         <tag>linux</tag>
         <tag>C++</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>AMCL源码分析:01.从系统架构到 laserReceived</title>
-    <url>/2026/05/29/amcl/00.%E4%BB%8E%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E5%88%B0%20laserReceived/</url>
-    <content><![CDATA[
-源码版本：ros-navigation&#x2F;navigation2 · humble 分支 · 包 nav2_amcl
-
-前言这篇文章是我读 nav2_amcl 时的笔记整理：先建立整体框架，再落到一帧激光 scan 在代码里怎么走。
-写法上遵循「从大到小」——先说明 AMCL 是什么、粒子滤波在思想上解决什么问题，再拆目录结构，最后盯住 AmclNode::laserReceived 这条主路径。
-
-AMCL 是什么AMCL（Adaptive Monte Carlo Localization） 是 Nav2 里用静态栅格地图做定位的模块：在 map 坐标系下估计机器人位姿，并发布 map → odom 的 TF，用来修正里程计漂移。
-需要特别强调的一点：
-
-它是定位，不是建图。SLAM &#x2F; slam_toolbox &#x2F; gmapping 一类负责「边走边画地图」；AMCL 假设地图已经建好，只在已知地图上回答「我在哪」。 建图与定位是两件不同的事，不要混在一个节点里理解。
-
-在系统里，它通常与 map_server 一起由 nav2_bringup 的 localization_launch 拉起，节点名一般为 amcl。
-算法在思想上是什么粒子滤波：用很多「可能」逼近一个「真实」现实世界充满不确定性：里程计会滑、激光有噪声、地图也不完美。因此不能轻易的得到真实的结果。
-粒子滤波的做法是——用大量粒子表示「机器人可能在哪」的分布；每个粒子是一次采样，粒子越多，对分布的刻画越细，月逼近真实的结果，但算力也越高。
-同时，真实世界还有一个更微妙的点：当事件已经发生，其可能性其实已经坍塌了，只是我们不知道而已
-所以需要传感器量测：用当前激光与地图比对，看哪些粒子更「像真的」——每个粒子带有 weight（权重），权重越大，表示该位姿假设与观测越一致。
-重采样与 Adaptive针对两件事，工程上一定会做 重采样：
-
-算力：不能无限增加粒子，要用高权粒子替换低权粒子，把计算集中在「还有希望」的区域；
-确定性：观测不断进来，低权粒子代表的可能性可以淘汰。
-
-AMCL 就是在 2D 激光 + 栅格地图场景下对上述粒子滤波的具体实现，Nav2 里默认激光模型是 likelihood_field（似然场）。
-它相比「教科书粒子滤波」多出的自适应主要体现在：
-
-
-
-机制
-作用
-
-
-
-KLD 采样
-根据粒子空间占用（kd-tree 叶节点数）决定本轮需要多少粒子，而不是固定死个数
-
-
-分簇统计
-粒子按位姿聚类后，取权重最大的簇的均值、协方差，输出一个 /amcl_pose，而不是随便挑一个粒子
-
-
-w_slow &#x2F; w_fast
-观测持续很差时，重采样阶段按比例全局随机撒点，防止整团粒子跟丢
-
-
-预测与更新粒子滤波是贝叶斯滤波的一种蒙特卡洛实现，一帧里仍然可以记成两大步：
-
-
-
-步骤
-在 AMCL 里谁来做
-改什么
-
-
-
-预测
-MotionModel::odometryUpdate
-粒子的 pose（根据 odom 增量 + 高斯噪声）
-
-
-更新
-Laser::sensorUpdate → pf_update_sensor
-粒子的 weight（激光 + 地图）
-
-
-之后还有 重采样（pf_update_resample）和 输出（getMaxWeightHyp → 位姿与 TF）。
-代码结构：包内大致分几块nav2_amcl 不是单文件算法，而是「ROS 壳 + C 粒子滤波 + 传感器&#x2F;地图」的分层：
-
-
-
-目录 &#x2F; 文件
-职责
-
-
-
-src/amcl_node.cpp
-主节点 AmclNode：订阅发布、lifecycle、**laserReceived 总调度**
-
-
-src/pf/
-粒子滤波核心（pf.c）：采样、权重归一化、重采样、KLD、聚类
-
-
-src/map/
-栅格地图 map_t、占据栅格、距离场 map_update_cspace
-
-
-src/sensors/laser/
-激光观测模型（似然场、beam 等），继承 Laser
-
-
-src/motion_model/
-运动模型插件（差速、全向），预测阶段改 pose
-
-
-src/main.cpp
-只创建 AmclNode 并 spin
-
-
-进程入口极简，没有第二个「定位线程」：
-int main(int argc, char ** argv)&#123;  rclcpp::init(argc, argv);  auto node = std::make_shared&lt;nav2_amcl::AmclNode&gt;();  rclcpp::spin(node-&gt;get_node_base_interface());  rclcpp::shutdown();
-
-真正的滤波循环在激光回调里同步跑完；spin 负责把 map、初值等其它回调也驱动起来。
-ROS 层：订阅、发布与初始化关键成员：数据从哪进、从哪出AmclNode 继承 nav2_util::LifecycleNode，通过节点的状态变化完成自身状态的切换，和「定位数据」直接相关的成员可以分成以下几个部分（声明见 amcl_node.hpp）：
-地图：     map_sub_  → mapReceived初值：     initial_pose_sub_  → initialPoseReceived激光：     laser_scan_sub_ + laser_scan_filter_  → laserReceived里程计：   不订阅话题，用 tf_buffer_ 查 odom → base 的 TF输出：     pose_pub_（amcl_pose）、particle_cloud_pub_、tf_broadcaster_
-
-为了保证这一帧 scan 在 odom 坐标系下可对齐之后，再进 laserReceived，避免 TF 未到就算滤波，激光同时使用message_filters + tf2_ros::MessageFilter：。
-on_configure：按固定顺序搭架子节点不会一启动就滤波。on_configure 里按依赖顺序初始化（节选）：
-AmclNode::on_configure(const rclcpp_lifecycle::State &amp; /*state*/)&#123;  RCLCPP_INFO(get_logger(), &quot;Configuring&quot;);  callback_group_ = create_callback_group(    rclcpp::CallbackGroupType::MutuallyExclusive, false);  initParameters();  initTransforms();  initParticleFilter();  initLaserScan();  initMessageFilters();  initPubSub();  initServices();  initOdometry();  executor_ = std::make_shared&lt;rclcpp::executors::SingleThreadedExecutor&gt;();  executor_-&gt;add_callback_group(callback_group_, get_node_base_interface());  executor_thread_ = std::make_unique&lt;nav2_util::NodeThread&gt;(executor_);  return nav2_util::CallbackReturn::SUCCESS;&#125;
-
-要点：
-
-**initParticleFilter**：先 pf_alloc，此时还没有有效 map_ 上的距离场；
-**initMessageFilters**：把 laserReceived 注册到激光专用 callback group；
-**initPubSub**：地图、初值订阅，以及 lifecycle 发布者；
-**末尾 NodeThread**：单独 executor 跑激光回调，避免和 TF 定时器互卡。
-
-initTransforms 创建 tf_buffer_ &#x2F; tf_listener_ &#x2F; tf_broadcaster_；
-initMessageFilters 与 initPubSub 的代码逻辑是：scan 走滤波线程，map 与 initialpose 走默认回调组。
-on_activate：打开「闸门」configure 之后 active_ 仍为 false，激光回调会直接 return。on_activate 里激活发布者并置位：
-AmclNode::on_activate(const rclcpp_lifecycle::State &amp; /*state*/)&#123;  RCLCPP_INFO(get_logger(), &quot;Activating&quot;);  pose_pub_-&gt;on_activate();  particle_cloud_pub_-&gt;on_activate();  first_pose_sent_ = false;  active_ = true;
-
-Nav2 里通常由 lifecycle_manager 自动 configure &#x2F; activate；单独调试时才需要手敲 ros2 lifecycle set。
-另外两条数据线（进 laserReceived 之前）定位是数据驱动的，除了激光，还有两条线必须先就绪。
-静态地图 /map → map_void AmclNode::mapReceived(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)&#123;  ...  handleMapMessage(*msg);  first_map_received_ = true;&#125;void AmclNode::handleMapMessage(const nav_msgs::msg::OccupancyGrid &amp; msg)&#123;  std::lock_guard&lt;std::recursive_mutex&gt; cfl(mutex_);  ...  freeMapDependentMemory();  map_ = convertMap(msg);
-
-
-convertMap：ROS 栅格 → C 结构 map_t；
-**freeMapDependentMemory 会清空 lasers_**：换图后旧的 LikelihoodFieldModel 不能继续用旧 map 指针；
-距离场 occ_dist 在创建 Laser 对象时由 map_update_cspace 建立，不在 mapReceived 里做。
-
-没有 first_map_received_，laserReceived 会打 Waiting for map.... 并 return。
-初始位姿 /initialpose → pf_init用户通过 RViz「2D Pose Estimate」或话题 /initialpose 提交估计。handleInitialPose 在 map 帧下重撒粒子：
-pf_init(pf_, pf_init_pose_mean, pf_init_pose_cov);pf_init_ = false;...initial_pose_is_known_ = true;
-
-没有已知初值时，publishAmclPose &#x2F; publishParticleCloud 会直接 return——有 scan 也可能没有位姿输出。
-
-主路径：laserReceived 一帧怎么走实现定位**主要的入口就是 AmclNode::laserReceived**。下面按执行顺序拆（与源码一致）。
-就绪检查void AmclNode::laserReceived(sensor_msgs::msg::LaserScan::ConstSharedPtr laser_scan)&#123;  std::lock_guard&lt;std::recursive_mutex&gt; cfl(mutex_);  if (!active_) &#123;return;&#125;  if (!first_map_received_) &#123;    if (checkElapsedTime(2s, last_time_printed_msg_)) &#123;      RCLCPP_WARN(get_logger(), &quot;Waiting for map....&quot;);      last_time_printed_msg_ = now();    &#125;    return;  &#125;
-
-未 activate、没有地图，都不继续。整函数在 mutex_ 下执行，与 mapReceived、handleInitialPose 互斥。
-激光模型对象：第一次见到该 frame_idif (frame_to_laser_.find(laser_scan_frame_id) == frame_to_laser_.end()) &#123;  if (!addNewScanner(laser_index, laser_scan, laser_scan_frame_id, laser_pose)) &#123;    return;  // could not find transform  &#125;&#125; else &#123;  laser_index = frame_to_laser_[laser_scan-&gt;header.frame_id];&#125;
-
-addNewScanner 里 createLaserObject() 按参数创建 LikelihoodFieldModel 等，**此时才绑定当前 map_**。
-所以顺序必须是：先有 map，再有 Laser 实例。
-里程计：查 TF，算增量 deltaif (!getOdomPose(    latest_odom_pose_, pose.v[0], pose.v[1], pose.v[2],    laser_scan-&gt;header.stamp, base_frame_id_))&#123;  RCLCPP_ERROR(get_logger(), &quot;Couldn&#x27;t determine robot&#x27;s pose associated with laser scan&quot;);  return;&#125;
-
-注意：AMCL 不订阅 /odom 话题，而是在 getOdomPose 里查 TF（odom → base）。
-与上次保存的 pf_odom_pose_ 做差得到 **delta**，供运动模型做预测。
-是否在本帧做观测更新，由 shouldUpdateFilter 根据 update_min_d、update_min_a 判断；机器人几乎不动时可以跳过更新，这是省电策略，不是故障。
-预测：只改 poseif (lasers_update_[laser_index]) &#123;  motion_model_-&gt;odometryUpdate(pf_, pose, delta);&#125;
-
-差速模型在 differential_motion_model.cpp 里把 delta 拆成旋转-平移-旋转，对每个粒子加噪声更新位姿，不动 weight。
-更新：只改 weightif (lasers_update_[laser_index]) &#123;  updateFilter(laser_index, laser_scan, pose);
-
-updateFilter 把 LaserScan 转成 LaserData（距离 + bearing），再调用：
-lasers_[laser_index]-&gt;sensorUpdate(pf_, reinterpret_cast&lt;nav2_amcl::LaserData *&gt;(&amp;ldata));lasers_update_[laser_index] = false;pf_odom_pose_ = pose;
-
-似然场模型里，sensorUpdate 最终进 pf_update_sensor，对每个粒子、每条降采样光束查 **occ_dist**（光束终点离障碍越近，权重乘性越大），再归一化并更新 w_slow &#x2F; w_fast。
-重采样：复制高权、必要时全局恢复if (!(++resample_count_ % resample_interval_)) &#123;  pf_update_resample(pf_, reinterpret_cast&lt;void *&gt;(map_));  resampled = true;&#125;
-
-pf_update_resample（pf.c）里：双缓冲集合切换、按权重轮盘赌复制 pose、按 KLD 决定粒子数、按 w_diff 决定是否调用 random_pose_fn(map_) 撒随机粒子。
-pf 里维护 两个 sample set（sets[0] &#x2F; sets[1]），就是为了重采样时读写分离；current_set 指向当前在用的一套。
-输出：粒子云、位姿、map → odom  if (!force_update_) &#123;    publishParticleCloud(set);  &#125;&#125;if (resampled || force_publication || !first_pose_sent_) &#123;  ...  if (getMaxWeightHyp(hyps, max_weight_hyps, max_weight_hyp)) &#123;    publishAmclPose(laser_scan, hyps, max_weight_hyp);    calculateMaptoOdomTransform(laser_scan, hyps, max_weight_hyp);    ...      sendMapToOdomTransform(transform_expiration);
-
-
-**publishParticleCloud**：把当前粒子集发到 /particle_cloud；
-getMaxWeightHyp：对所有簇按权重排序，取最大权簇的均值和协方差；
-**calculateMaptoOdomTransform + sendMapToOdomTransform**：发布 map → odom，把里程计系「拧」到与地图一致。
-
-若本帧未重采样且已有有效 TF，末尾还可能重复发送上一次 map→odom，避免 TF 树断档。
-把一帧串成一张表
-
-
-顺序
-代码位置
-粒子滤波语义
-
-
-
-1
-门闩 active_ &#x2F; first_map_received_
-数据未就绪不算
-
-
-2
-getOdomPose + shouldUpdateFilter
-准备 delta
-
-
-3
-motion_model_-&gt;odometryUpdate
-预测 → pose
-
-
-4
-updateFilter → sensorUpdate
-更新 → weight
-
-
-5
-pf_update_resample
-重采样 + KLD + 恢复
-
-
-6
-publishParticleCloud &#x2F; publishAmclPose &#x2F; TF
-输出
-
-
-
-小结
-AMCL &#x3D; 已知地图上的蒙特卡洛定位，不是建图。
-思想 &#x3D; 粒子表分布，预测改 pose、观测改 weight，重采样 + KLD + 分簇输出。
-代码 &#x3D; AmclNode 接线，pf &#x2F; map &#x2F; Laser &#x2F; MotionModel 分工；**一帧的总线在 laserReceived**。
-
-]]></content>
-      <categories>
-        <category>Ros</category>
-        <category>状态估计</category>
-        <category>机器人</category>
-      </categories>
-      <tags>
-        <tag>amcl</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>AMCL源码分析:02.AMCL 到底在估计什么？从坐标系到传感器投影的源码分析</title>
-    <url>/2026/06/05/amcl/01.%20Amcl%E4%BC%B0%E8%AE%A1%E7%9A%84%E7%8A%B6%E6%80%81%E4%B8%8E%E4%BC%A0%E6%84%9F%E5%99%A8%E6%95%B0%E6%8D%AE%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
-    <content><![CDATA[
-源码版本：ros-navigation&#x2F;navigation2 · humble 分支 · 包 nav2_amcl
-
-前言很多 AMCL 教程都会说：
-
-AMCL 用于机器人定位。
-
-但很少继续说明：定位什么？
-更准确一点说：
-
-粒子滤波器内部维护的状态量是什么？
-这个状态量属于哪个坐标系？
-激光数据进入滤波器后，又是如何与这个状态量发生联系的？
-
-这些问题如果不弄清楚，后面阅读运动模型、观测模型、重采样时都会比较混乱。
-因此这篇文章只回答一个问题：
-
-AMCL 到底在估计谁的位姿？
-
-手册上的标准答案首先，在 ROS 1 Wiki &#x2F; Nav2 AMCL 官方文档 中，关于坐标系发布（Published Transforms）的定义非常明确：
-
-AMCL 核心估计的，就是 base_link（机器人机体）在 map（静态全局地图）坐标系下的位姿变换。
-
-
-在工程实现上，为了避免与里程计节点发布的 odom → base_link 产生双重父节点的冲突，AMCL 采用了一种间接修正的技巧：它不直接发布 map → base_link，而是通过查阅里程计的 TF，发布 map → odom 的变换。
-这就引出了我们在源码中必须死盯的三个基本参数。
-在 AmclNode 构造函数和 initParameters 回调中，我们可以看到这三个参数的作用与意义：
-// nav2_amcl/src/amcl_node.cppget_parameter(&quot;global_frame_id&quot;, global_frame_id_); // 默认: &quot;map&quot; (全局静态世界)get_parameter(&quot;base_frame_id&quot;, base_frame_id_);     // 默认: &quot;base_footprint&quot; (机器人底盘投影)get_parameter(&quot;odom_frame_id&quot;, odom_frame_id_);     // 默认: &quot;odom&quot; (存在累积漂移的里程计坐标系)
-
-后续主要的位姿变化也是在这三个位姿坐标系展开。
-AMCL中维护的状态想要知道真正估计的状态，知道我们估计的结果，可以从粒子结构体里。
-在 pf.hpp 中：
-typedef struct&#123;  pf_vector_t pose;  double weight;&#125; pf_sample_t;
-
-一个粒子只有两个核心成员：pose 与 weight
-其中：weight表示当前粒子的可信度。而pose才是滤波器真正维护的状态。
-也就是说：
-
-AMCL 本质上是在维护大量 pose 假设。
-
-粒子云中的每一个粒子，都代表机器人可能存在的位置。
-初始第一帧位姿AMCL 是一套蒙特卡洛（粒子滤波）方法，任何迭代算法都需要一个初始值作为起点，amcl也不例外。
-在AMCL的源码，通过 on_configure，完成了初始信息的回调函数的注册
-void AmclNode::initPubSub()&#123;  RCLCPP_INFO(get_logger(), &quot;initPubSub&quot;);  ......  initial_pose_sub_ = create_subscription&lt;geometry_msgs::msg::PoseWithCovarianceStamped&gt;(    &quot;initialpose&quot;, rclcpp::SystemDefaultsQoS(),    std::bind(&amp;AmclNode::initialPoseReceived, this, std::placeholders::_1));    ......  RCLCPP_INFO(get_logger(), &quot;Subscribed to map topic.&quot;);&#125;
-
-用户在 RViz 中点击 2D Pose Estimate 或向 /initialpose 话题发出的消息，进入AmclNode::initialPoseReceived中
-初值的校验代码在使用初值的时候，会进行数值与坐标系的校验，保证数值与坐标系的合规性。
-if (!nav2_util::validateMsg(*msg)) &#123; return; &#125; // 位姿本身不能含有 NaN 损坏数据if (nav2_util::strip_leading_slash(msg-&gt;header.frame_id) != global_frame_id_) &#123;  // 拦截：传入的初值必须是在 global_frame_id_（即 map）下的绝对位姿！  return; &#125;### 消除传输延迟的底盘补偿同时，为了补偿，在你发送消息与收到消息之间可能因为机器人运动带来的位姿变化，`handleInitialPose` 内部做了一次巧妙的 **时间戳回溯补偿** ：```c++// 1. 查找从 initialpose 的历史时间戳到 AMCL 当前时刻，底盘自己走了多少相对运动tx_odom = tf_buffer_-&gt;lookupTransform(base_frame_id_, tf2_ros::fromMsg(msg.header.stamp),                                       base_frame_id_, tf2_time, odom_frame_id_);// 2. 将用户指定的旧图上位姿，乘上这段时间的里程计运动增量，更新为当前时刻的最准位姿tf2::Transform pose_new = pose_old * tx_odom_tf2;
-
-滤波器的几何底色：全员 map 系计算完成后，初值通过 pf_init 注入粒子滤波器：
-pf_init_pose_mean.v[0] = pose_new.getOrigin().x();pf_init_pose_mean.v[1] = pose_new.getOrigin().y();pf_init_pose_mean.v[2] = tf2::getYaw(pose_new.getRotation());pf_init(pf_, pf_init_pose_mean, pf_init_pose_cov);
-
-结论的确认但是现在仅仅能确认的是，位姿是在map坐标系下的，不能确认到底是哪一个传感器在map下的坐标系，所以继续从源码出发。
-在处理初始位姿时：
-tx_odom = tf_buffer_-&gt;lookupTransform(    base_frame_id_,    ...,    base_frame_id_,    ...,    odom_frame_id_);
-
-这里出现的始终是 base_frame_id_,整个初始化过程都没有出现 laser,并且激光的外参也没有注册完成，所以sample-&gt;pose不可能表示激光位姿。它表示的只能是：T_map_base，既机器人底盘在map中的位姿。
-
-结论：由此开始，AMCL 底层滤波器核心 pf_t 内部维护的所有粒子 sample-&gt;pose，其内在的数学语义全部在 map 坐标系下。
-
-它们代表了机器人在静态地图中的成百上千种可能的位置假设。
-传感器数据流：局部雷达到全局地图的投影链条明确了粒子全都在 map 系下之后，我们来看一帧局部的激光雷达点云（在 laser_frame 下）进来时，是如何与地图产生碰撞并完成闭环的。
-动态注册外参在 laserReceived 主数据总线中，AMCL 支持多雷达输入。
-首先判断，这个激光传感器是不是出现过，没有出现就调用addNewScanner,否则就直接得到某个某个激光器的索引，方便后续查询
-...... std::string laser_scan_frame_id = nav2_util::strip_leading_slash(laser_scan-&gt;header.frame_id); last_laser_received_ts_ = now(); int laser_index = -1; geometry_msgs::msg::PoseStamped laser_pose; // Do we have the base-&gt;base_laser Tx yet? if (frame_to_laser_.find(laser_scan_frame_id) == frame_to_laser_.end()) &#123;   if (!addNewScanner(laser_index, laser_scan, laser_scan_frame_id, laser_pose)) &#123;     return;  // could not find transform   &#125; &#125; else &#123;   // we have the laser pose, retrieve laser index   laser_index = frame_to_laser_[laser_scan-&gt;header.frame_id]; &#125; ......
-
-然后在 addNewScanner 动态测算外参：
-// 查询当前雷达 frame 到 base_frame_id_ 的静态 TF 外参tf_buffer_-&gt;transform(ident, laser_pose, base_frame_id_, transform_tolerance_);pf_vector_t laser_pose_v;laser_pose_v.v[0] = laser_pose.pose.position.x; // 雷达相对于底盘中心的 X 轴偏移 (米)laser_pose_v.v[1] = laser_pose.pose.position.y; // 雷达相对于底盘中心的 Y 轴偏移 (米)laser_pose_v.v[2] = 0; // 航向角初置 0，后续计算lasers_[laser_index]-&gt;SetLaserPose(laser_pose_v); // 将该外参牢牢绑定在对应的 LaserModel 实例中
-
-
-结论：lasers_[laser_index]-&gt;laser_pose_ 存储的是 laser to base 的静态外参**。它只取决于硬件安装位置，完全不随机器人的运动而改变。
-
-似然场的坐标转换当数据经过校验，完成运动更新之后，updateFilter 最终会将雷达降采样数据灌入 LikelihoodFieldModel::sensorFunction 中。
-对于每一个粒子，代码将进行数据转换，完成数据从激光系到map系的转换：
-for (j = 0; j &lt; set-&gt;sample_count; j++) &#123;    sample = set-&gt;samples + j;    pose = sample-&gt;pose; // 第一步：拿到当前粒子在 map 下的【底盘假设位姿】 (X_map, Y_map, Yaw_map)    // 第二步：复合静态外参！将该假设位姿，变换为该粒子视角下，【雷达在 map 下的假设位姿】    pose = pf_vector_coord_add(self-&gt;laser_pose_, pose);     for (i = 0; i &lt; data-&gt;range_count; i += step) &#123;        double obs_range = data-&gt;ranges[i][0];     // 拿到当前激光束的局部测量距离值 (局部米)        double obs_bearing = data-&gt;ranges[i][1];   // 拿到当前激光束在雷达极坐标系下的夹角 (局部弧度)        // 第三步：利用三角函数，将局部测距终点（Endpoint）直接投影至地图【map 坐标系】下        hit.v[0] = pose.v[0] + obs_range * cos(pose.v[2] + obs_bearing);        hit.v[1] = pose.v[1] + obs_range * sin(pose.v[2] + obs_bearing);        // 第四步：拿这个 map 系下的终点坐标 hit.v，去查 map_t 栅格地图里的边界距离场 (occ_dist)        // 离障碍物越近，该粒子的生存权重 (weight) 乘性越高！不动 pose，只改 weight！    &#125;&#125;
-
-综上，整个雷达点云的处理就是，当第一帧出现时计算外参，当更新时利用外参得到激光点云在全局坐标系下的位置。
-五、 总结这一篇回答了一个的问题：
-
-AMCL 到底在估计什么？
-
-从源码可以看到：
-
-粒子内部维护的是 sample-&gt;pose
-sample-&gt;pose 从初始化开始就在 map 坐标系下
-它描述的是机器人底盘 base
-激光坐标系只是观测阶段通过外参投影到地图
-整个滤波器真正估计的状态始终是：
-
-
-T_map_base即：机器人在地图中的位姿
-
-]]></content>
-      <categories>
-        <category>Ros</category>
-        <category>状态估计</category>
-        <category>机器人</category>
-      </categories>
-      <tags>
-        <tag>amcl</tag>
-      </tags>
-  </entry>
-  <entry>
-    <title>AMCL源码分析:03.AMCL 预测与更新源码解析：一帧激光如何驱动粒子滤波</title>
-    <url>/2026/06/07/amcl/02.amcl%E9%A2%84%E6%B5%8B%E4%B8%8E%E6%9B%B4%E6%96%B0%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E5%B8%A7%E7%B2%92%E5%AD%90%E5%A6%82%E4%BD%95%E9%A9%B1%E5%8A%A8%E7%B2%92%E5%AD%90%E6%BB%A4%E6%B3%A2/</url>
-    <content><![CDATA[前言在上一篇文章中，我们利用源码论证了，状态是 map 下的 sample-&gt;pose（base） 。
-这篇文章就来说明：在一帧激光数据中，怎么完成预测与更新的。
-大致结论
-粒子滤波使用蒙特卡罗方法实现贝叶斯滤波框架：用很多带权粒子近似后验。
-在 AMCL中，每个粒子都会经历两个过程：
-
-预测
-
-
-将 odom 系的 delta 输入 motion_model_-&gt;odometryUpdate,更新 sample-&gt;pose（map）
-
-
-更新
-
-
-利用 激光 LaserData + 地图，调用Laser::sensorUpdate → pf_update_sensor，完成sample-&gt;weight的更新
-
-与卡尔曼滤波的差别：粒子滤波在更新步 不改状态，只改 权重；最终位姿靠粒子群的统计量给出。预测里加噪声是粒子滤波的灵魂：不加噪声，所有粒子运动一致，就失去「用样本估计分布」的意义。
-下面按 laserReceived 的真实顺序，从源码跟一遍。
-总线：一帧激光里的顺序......&#125; else &#123;  if (shouldUpdateFilter(pose, delta)) &#123;    for (unsigned int i = 0; i &lt; lasers_update_.size(); i++) &#123;      lasers_update_[i] = true;    &#125;  &#125;  if (lasers_update_[laser_index]) &#123;    motion_model_-&gt;odometryUpdate(pf_, pose, delta);  &#125;  ...&#125;if (lasers_update_[laser_index]) &#123;  updateFilter(laser_index, laser_scan, pose);  if (!(++resample_count_ % resample_interval_)) &#123;    pf_update_resample(pf_, reinterpret_cast&lt;void *&gt;(map_));
-
-
-预测：信息从哪来、怎么作用到每个粒子运动模型插件：initOdometryon_configure 里加载车体运动模型（由 robot_model_type 决定，默认差速）：
-motion_model_ = plugin_loader_.createSharedInstance(robot_model_type_);motion_model_-&gt;initialize(alpha1_, alpha2_, alpha3_, alpha4_, alpha5_);latest_odom_pose_ = geometry_msgs::msg::PoseStamped();
-
-alpha1_～alpha5_ 控制里程计噪声强度（对应《概率机器人》Table 5.5）。
-getOdomPose + delta：预测的信息来源每帧激光回调里，先查 base 在 odom 下的位姿 pose：
-if (!getOdomPose(..., laser_scan-&gt;header.stamp, base_frame_id_))
-
-与上次观测更新后记录的 pf_odom_pose_ 做差，得到 odom 系增量 delta：
-bool AmclNode::shouldUpdateFilter(const pf_vector_t pose, pf_vector_t &amp; delta)&#123;  delta.v[0] = pose.v[0] - pf_odom_pose_.v[0];  delta.v[1] = pose.v[1] - pf_odom_pose_.v[1];  delta.v[2] = angleutils::angle_diff(pose.v[2], pf_odom_pose_.v[2]);  bool update = fabs(delta.v[0]) &gt; d_thresh_ ||    fabs(delta.v[1]) &gt; d_thresh_ ||    fabs(delta.v[2]) &gt; a_thresh_;  update = update || force_update_;  return update;&#125;
-
-
-d_thresh_ &#x2F; a_thresh_ 来自参数 update_min_d &#x2F; update_min_a
-小车停着：delta 很小 → shouldUpdateFilter 为 false → 不预测、不观测，避免无意义计算
-force_update_：如 request_nomotion_update 服务可强制更新
-
-只有 lasers_update_[laser_index]==true 时才调用 odometryUpdate。
-差速模型：对每个粒子加噪并改 pose// 预测步：pose/delta 为 odom 系；sample-&gt;pose 为 map 系。void DifferentialMotionModel::odometryUpdate(  pf_t * pf, const pf_vector_t &amp; pose,  const pf_vector_t &amp; delta)&#123;  // 取出粒子集合  pf_sample_set_t * set;  set = pf-&gt;sets + pf-&gt;current_set;  pf_vector_t old_pose = pf_vector_sub(pose, delta);    // 将二维平面上的任意一段运动，分解为三个标准动作：先原地旋转（Rot1），再直线前进（Trans），最后再原地旋转（Rot2）  double delta_rot1, delta_trans, delta_rot2;  double delta_rot1_hat, delta_trans_hat, delta_rot2_hat;  double delta_rot1_noise, delta_rot2_noise;  if (sqrt(      delta.v[1] * delta.v[1] +      delta.v[0] * delta.v[0]) &lt; 0.01)  &#123;    delta_rot1 = 0.0;  &#125; else &#123;    delta_rot1 = angleutils::angle_diff(      atan2(delta.v[1], delta.v[0]),      old_pose.v[2]);  &#125;  delta_trans = sqrt(    delta.v[0] * delta.v[0] +    delta.v[1] * delta.v[1]);  delta_rot2 = angleutils::angle_diff(delta.v[2], delta_rot1);  // 保证向前开和向后开都是噪声都是相同的基数  delta_rot1_noise = std::min(    fabs(angleutils::angle_diff(delta_rot1, 0.0)),    fabs(angleutils::angle_diff(delta_rot1, M_PI)));  delta_rot2_noise = std::min(    fabs(angleutils::angle_diff(delta_rot2, 0.0)),    fabs(angleutils::angle_diff(delta_rot2, M_PI)));  for (int i = 0; i &lt; set-&gt;sample_count; i++) &#123;    pf_sample_t * sample = set-&gt;samples + i;    // 1. 采样第一阶段旋转（受自身旋转和前进距离影响）    delta_rot1_hat = angleutils::angle_diff(      delta_rot1,      pf_ran_gaussian(        sqrt(          alpha1_ * delta_rot1_noise * delta_rot1_noise +          alpha2_ * delta_trans * delta_trans)));             // 2. 采样平移距离（受前进距离和两阶段旋转量影响）    delta_trans_hat = delta_trans -      pf_ran_gaussian(      sqrt(        alpha3_ * delta_trans * delta_trans +        alpha4_ * delta_rot1_noise * delta_rot1_noise +        alpha4_ * delta_rot2_noise * delta_rot2_noise));           // 3/ 采样第二阶段旋转（受自身旋转和前进距离影响）    delta_rot2_hat = angleutils::angle_diff(      delta_rot2,      pf_ran_gaussian(        sqrt(          alpha1_ * delta_rot2_noise * delta_rot2_noise +          alpha2_ * delta_trans * delta_trans)));    // 更新粒子状态    sample-&gt;pose.v[0] += delta_trans_hat *      cos(sample-&gt;pose.v[2] + delta_rot1_hat);    sample-&gt;pose.v[1] += delta_trans_hat *      sin(sample-&gt;pose.v[2] + delta_rot1_hat);    sample-&gt;pose.v[2] += delta_rot1_hat + delta_rot2_hat;  &#125;&#125;
-
-要点：
-
-分解：用 odom 的 delta 和 old_pose 算 Rot1–Trans–Rot2。
-加噪：pf_ran_gaussian 让每个粒子的 *_hat 不同 → 粒子云在 map 下散开。
-积分在 map 航向上做：cos(sample-&gt;pose.v[2] + ...) 用的是 该粒子自己的 map 朝向，不是 odom 航向（经典 AMCL 近似）。
-循环内没有 sample-&gt;weight → 预测 只动 pose。
-
-更新：激光数据怎么变成每个粒子的新权重updateFilter：ROS 消息 → LaserDatabool AmclNode::updateFilter(  const int &amp; laser_index,  const sensor_msgs::msg::LaserScan::ConstSharedPtr &amp; laser_scan,  const pf_vector_t &amp; pose)&#123;  // 重新计算出在机器人视角下，雷达扫描的真实起始角度 angle_min 和两点间的真实角度增量  nav2_amcl::LaserData ldata;  ldata.laser = lasers_[laser_index];  ldata.range_count = laser_scan-&gt;ranges.size();    geometry_msgs::msg::QuaternionStamped min_q, inc_q;  min_q.header.stamp = laser_scan-&gt;header.stamp;  min_q.header.frame_id = nav2_util::strip_leading_slash(laser_scan-&gt;header.frame_id);  min_q.quaternion = orientationAroundZAxis(laser_scan-&gt;angle_min);  inc_q.header = min_q.header;  inc_q.quaternion = orientationAroundZAxis(laser_scan-&gt;angle_min + laser_scan-&gt;angle_increment);  try &#123;    tf_buffer_-&gt;transform(min_q, min_q, base_frame_id_);    tf_buffer_-&gt;transform(inc_q, inc_q, base_frame_id_);  &#125; catch (tf2::TransformException &amp; e) &#123;    RCLCPP_WARN(      get_logger(), &quot;Unable to transform min/max laser angles into base frame: %s&quot;,      e.what());    return false;  &#125;  double angle_min = tf2::getYaw(min_q.quaternion);  double angle_increment = tf2::getYaw(inc_q.quaternion) - angle_min;  // wrapping angle to [-pi .. pi]  angle_increment = fmod(angle_increment + 5 * M_PI, 2 * M_PI) - M_PI;  // 去掉太近和太远的点  if (laser_max_range_ &gt; 0.0) &#123;    ldata.range_max = std::min(laser_scan-&gt;range_max, static_cast&lt;float&gt;(laser_max_range_));  &#125; else &#123;    ldata.range_max = laser_scan-&gt;range_max;  &#125;  double range_min;  if (laser_min_range_ &gt; 0.0) &#123;    range_min = std::max(laser_scan-&gt;range_min, static_cast&lt;float&gt;(laser_min_range_));  &#125; else &#123;    range_min = laser_scan-&gt;range_min;  &#125;  // 构建 amcl内部数据结构  ldata.ranges = new double[ldata.range_count][2];  for (int i = 0; i &lt; ldata.range_count; i++) &#123;    if (laser_scan-&gt;ranges[i] &lt;= range_min) &#123;      ldata.ranges[i][0] = ldata.range_max;    &#125; else &#123;      ldata.ranges[i][0] = laser_scan-&gt;ranges[i];    &#125;    // Compute bearing    ldata.ranges[i][1] = angle_min +      (i * angle_increment);  &#125;  lasers_[laser_index]-&gt;sensorUpdate(pf_, reinterpret_cast&lt;nav2_amcl::LaserData *&gt;(&amp;ldata));  lasers_update_[laser_index] = false;  pf_odom_pose_ = pose;  return true;&#125;
-
-注意：pf_odom_pose_ 在 观测末尾 才更新，所以 delta 是「距上次完整观测」的 odom 位移，不是距上次预测。
-sensorUpdate → pf_update_sensor：统一入口各观测模型（Beam &#x2F; LikelihoodField &#x2F; …）都走：
-pf_update_sensor(pf, (pf_sensor_model_fn_t) sensorFunction, data);
-
-pf_update_sensor 干两件事：调用 sensorFunction 改 weight + 归一化与 w_slow&#x2F;w_fast。
-sensorFunction：以 Beam 模型理解（《概率机器人》光束模型）for (j = 0; j &lt; set-&gt;sample_count; j++) &#123;  sample = set-&gt;samples + j;  pose = sample-&gt;pose;  pose = pf_vector_coord_add(self-&gt;laser_pose_, pose);  // map 下雷达位姿  p = 1.0;  for (i = 0; i &lt; data-&gt;range_count; i += step) &#123;    map_range = map_calc_range(self-&gt;map_, pose.v[0], pose.v[1],      pose.v[2] + obs_bearing, data-&gt;range_max);    z = obs_range - map_range;    pz += z_hit * exp(-z²/2σ²);   // 击中    ...                            // 短读、丢失、随机噪声    p += pz * pz * pz;             // 立方和聚合多光束（ad-hoc，但好用）  &#125;  sample-&gt;weight *= p;  total_weight += sample-&gt;weight;&#125;return total_weight;
-
-对单个粒子 j：
-
-假设该粒子的 pose 正确 → 在 map 上投影每条 beam；
-比较 实测距离 与 地图射线距离 map_range；
-混合模型得 pz，多束合成 p；
-**weight *= p，不碰 pose**。
-
-Nav2 默认似然场（简写）：beam 终点查 occ_dist，高斯似然 + 随机项，同样 p += pz³、weight *= p：
-pf_update_sensor：归一化 + 粒子群「健康度」void pf_update_sensor(pf_t * pf, pf_sensor_model_fn_t sensor_fn, void * sensor_data)&#123;  total = (*sensor_fn)(sensor_data, set);  if (total &gt; 0.0) &#123;    for (i = 0; i &lt; set-&gt;sample_count; i++) &#123;      sample-&gt;weight /= total;    // 归一化      w_avg += sample-&gt;weight;    &#125;    w_avg /= set-&gt;sample_count;    pf-&gt;w_slow += pf-&gt;alpha_slow * (w_avg - pf-&gt;w_slow);    pf-&gt;w_fast += pf-&gt;alpha_fast * (w_avg - pf-&gt;w_fast);  &#125; else &#123;    sample-&gt;weight = 1.0 / set-&gt;sample_count;  // 全失效则均匀  &#125;&#125;
-
-
-归一化：所有粒子 weight 之和 &#x3D; 1
-**w_slow &#x2F; w_fast**：长期&#x2F;短期平均匹配质量；w_fast 突然低于 w_slow 时，重采样会随机撒点
-
-小结
-
-预测：odom delta + 运动模型噪声 → 每个粒子 map 下 pose 不同。
-更新：每个粒子用自己的 pose 解释激光 → weight 反映「这个 pose 有多可信」。
-合起来才是贝叶斯滤波里的一步「运动更新 + 测量更新」；重采样与位姿输出在后续篇展开。
-
-]]></content>
-      <categories>
-        <category>Ros</category>
-        <category>状态估计</category>
-        <category>机器人</category>
-      </categories>
-      <tags>
-        <tag>amcl</tag>
       </tags>
   </entry>
   <entry>
@@ -1983,57 +1983,6 @@ reader-&gt;Read() 循环结束后，必须调用 reader-&gt;Finish() 来获取�
       </tags>
   </entry>
   <entry>
-    <title>grpc实践之路:03.Qt与grpc的集成使用</title>
-    <url>/2025/07/07/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:03.Qt%E4%B8%8Egrpc%E7%9A%84%E9%9B%86%E6%88%90%E4%BD%BF%E7%94%A8/</url>
-    <content><![CDATA[前言在之前的文章中，我们从一个Qt应用的角度出发，探讨了怎么使用grpc作为进程间通信的手段，进行点对点的调用，并且讲解了怎么处理服务端产生的流数据。但是，既然都没涉及到Qt相关的内容，本篇文章就讲解下在Qt中怎么去使用Grpc作为客户端的集成。
-Qt作为一个主要应用在GUI中的应用框架，在其中最大的挑战就是：如何避免阻塞 UI 主线程。当然可以利用QThread和信号槽的机制去解决这个问题，但是却有些繁琐，需要我们自己去进行线程管理和对象的生命周期。但是，好消息是自动 Qt6.9版本之后，Qt 官方已经正式提供了对 gRPC 的原生支持 (Qt Grpc 模块)。这意味着我们不再需要手动创建线程来包装gRPC 调用了。Qt 将 gRPC与它核心的事件循环和信号槽机制完美地融合在了一起。
-本文，我们将探索这个“官方解决方案”，看看如何利用 Qt Grpc 模块，以一种前所未有的、极其优雅的方式，在 Qt 应用中实践 gRPC 通信。
-
-准备工作：CMake 与 Qt gRPC 模块要使用 Qt 官方的 gRPC 支持，首先你需要确保在安装 Qt 时，已经勾选并安装了 Qt Protobuf 和 Qt Grpc 这两个模块，并且安装好了Grpc和Protobuf。
-并且Qt官方也提供了Grpc的函数去处理grpc的原生命令
-CMakeLists.txt
-cmake_minimum_required(VERSION 3.16)  project(MyGrpcQtProject)#配置你的项目,保证先安装了grpc和protobuf# 找到 Qt6，并确保 Protobuf 和 Grpc 组件可用  find_package(Qt6 REQUIRED COMPONENTS Protobuf Grpc)  qt_standard_project_setup()# 添加你的可执行文件  qt_add_executable(MyApp main.cpp clientguide.cpp) # 假设你的客户端逻辑在 clientguide.cpp# Qt 提供的 magic command，自动处理 .proto 文件！  # 它会调用 protoc 和 grpc_cpp_plugin 生成 Qt 风格的代码  qt_add_grpc(MyApp CLIENT # 或者 SERVER, BIDI  PROTO_FILES  path/to/your/service.proto  )# 链接到 Qt 提供的库  target_link_libraries(MyApp PRIVATE Qt6::Protobuf Qt6::Grpc)
-
-qt_add_grpc 这个命令了它会自动处理代码生成和编译，也不需要去手动处理proto文件的生成c代码了
-代码生成我们还是使用之前类似的 .proto 文件，但这次，由 qt_add_grpc 生成的文件会有些不同，它们是为 Qt 量身定做的。
-clientguide.proto
-syntax = &quot;proto3&quot;;  package client.guide; // enclosing namespacemessage Request &#123; /* ... */ &#125;  message Response &#123; /* ... */ &#125;service ClientGuideService &#123;  rpc UnaryCall (Request) returns (Response);  rpc ServerStreaming (Request) returns (stream Response);&#125;
-
-生成的文件名会带有 .qpb.h 和 .grpc.qpb.h 的后缀。它们不仅包含了 Protobuf 消息的 C++ 类，更重要的是，生成的 gRPC Stub 和Service 基类，其所有方法都原生返回 Qt 的异步对象，并通过信号槽来通知结果。
-下面是生成Qt grpc中源码生成的示意图
-实践：一个纯 Qt 风格的体验现在，让我们看看 Qt 官方示例中的客户端代码是如何利用这些新工具的。
-clientguide.cpp (核心逻辑)
-1. 初始化：创建 Channel 和 Client Stub//引入Qt生成的头文件#include &quot;clientguide.qpb.h&quot;#include &quot;clientguide_client.grpc.qpb.h&quot;//! [gen-includes]#include &lt;QtGrpc/QGrpcHttp2Channel&gt;#include &lt;QtGrpc/QGrpcServerStream.h&gt;#include &lt;QtCore/QCommandLineParser&gt;#include &lt;QtCore/QCoreApplication&gt;#include &lt;QtCore/QDateTime&gt;#include &lt;QtCore/QProcess&gt;#include &lt;QtCore/QThread&gt;#include &lt;QtCore/QUrl&gt;#include &lt;limits&gt;#include &lt;memory&gt;using namespace client;void startServerProcess();QDebug operator&lt;&lt;(QDebug debug, const guide::Response &amp;response);class ClientGuide : public QObject&#123;public:    explicit ClientGuide(std::shared_ptr&lt;QAbstractGrpcChannel&gt; channel)    &#123;        // 将 Qt 的 Channel 附加到 Qt 生成的 Client Stub 上         // 这一步和原生 gRPC 类似，但 Channel 和 Client 都是 Qt gRPC 提供的类型。        m_client.attachChannel(std::move(channel));    &#125;    static guide::Request createRequest(int32_t num, bool fail = false)    &#123;        guide::Request request;        request.setNum(num);        request.setTime(fail ? std::numeric_limits&lt;int64_t&gt;::max()                             : QDateTime::currentMSecsSinceEpoch());        return request;    &#125;       void unaryCall(const guide::Request &amp;request)    &#123;        std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);        const auto *replyPtr = reply.get();        QObject::connect(            replyPtr, &amp;QGrpcCallReply::finished, replyPtr,            [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;                if (status.isOk()) &#123;                    if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                        qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;                    else                        qDebug(&quot;Client (UnaryCall) deserialization failed&quot;);                &#125; else &#123;                    qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;                &#125;            &#125;,            Qt::SingleShotConnection);    &#125;    void serverStreaming(const guide::Request &amp;initialRequest)    &#123;        std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);        const auto *streamPtr = stream.get();        QObject::connect(            streamPtr, &amp;QGrpcServerStream::finished, streamPtr,            [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;                if (status.isOk())                    qDebug(&quot;Client (ServerStreaming) finished&quot;);                else                    qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;            &#125;,            Qt::SingleShotConnection);        QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, streamPtr, [streamPtr] &#123;            if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())                qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;            else                qDebug(&quot;Client (ServerStream) deserialization failed&quot;);        &#125;);    &#125;private:    guide::ClientGuideService::Client m_client;&#125;;int main(int argc, char *argv[])&#123;    QCoreApplication app(argc, argv);    QCommandLineParser parser;    QCommandLineOption enableUnary(&quot;U&quot;, &quot;Enable UnaryCalls&quot;);    QCommandLineOption enableSStream(&quot;S&quot;, &quot;Enable ServerStream&quot;);    parser.addHelpOption();    parser.addOption(enableUnary);    parser.addOption(enableSStream);    parser.process(app);    bool defaultRun = !parser.isSet(enableUnary) &amp;&amp; !parser.isSet(enableSStream)        &amp;&amp; !parser.isSet(enableCStream) &amp;&amp; !parser.isSet(enableBStream);    qDebug(&quot;Welcome to the clientguide!&quot;);    qDebug(&quot;Starting the server process ...&quot;);    startServerProcess();    //! [basic-0]    auto channel = std::make_shared&lt;QGrpcHttp2Channel&gt;(        QUrl(&quot;http://localhost:50056&quot;)        /* without channel options. */    );    ClientGuide clientGuide(channel);        if (defaultRun || parser.isSet(enableUnary)) &#123;        clientGuide.unaryCall(ClientGuide::createRequest(1));        clientGuide.unaryCall(ClientGuide::createRequest(2, true)); // fail the RPC        clientGuide.unaryCall(ClientGuide::createRequest(3));    &#125;    if (defaultRun || parser.isSet(enableSStream)) &#123;        clientGuide.serverStreaming(ClientGuide::createRequest(3));    &#125;    return app.exec();&#125;
-
-2. Unary RPC (点对点调用)Qt生成的客户端可以让我们直接利用信号槽的机制，不必为了避免阻塞UI，自动手动处理线程
-void ClientGuide::unaryCall(const guide::Request &amp;request)  &#123;  // 调用 RPC 方法，不再返回 Status，而是返回一个 QGrpcCallReply 指针！  std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);    // QGrpcCallReply 是一个 QObject，我们可以连接它的 finished 信号！      QObject::connect(reply.get(), &amp;QGrpcCallReply::finished, this,          // Lambda 表达式作为槽函数          [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;              // 这个 Lambda 将在 Qt 的事件循环中被安全地调用，不会阻塞              if (status.isOk()) &#123;                  if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                      qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;              &#125; else &#123;                  qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;              &#125;          &#125;);  &#125;
-
-m_client.UnaryCall 立即返回一个 QGrpcCallReply 对象，完全不会阻塞。我们只需要连接它的 finished信号，就可以在未来的某个时刻，当 RPC 调用完成时，在槽函数中处理结果。整个过程是纯异步、事件驱动的，完美融入了 Qt 的体系。
-下面的是调用过程的示意图:
-3. Server Streaming (服务端流)处理流式数据也变得异常简单。调用流式 RPC 方法会返回一个 QGrpcServerStream 对象。
-void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#123;  // 调用流式 RPC，返回一个 QGrpcServerStream 指针  std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);  const auto *streamPtr = stream.get();    // 连接 finished 信号，处理流结束事件      QObject::connect(streamPtr, &amp;QGrpcServerStream::finished, this,          [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;              if (status.isOk())                  qDebug(&quot;Client (ServerStreaming) finished&quot;);              else                  qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;          &#125;);            // 连接 messageReceived 信号，处理每一条从服务端推送来的消息！      QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, this, [streamPtr] &#123;          if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())              qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;      &#125;);  &#125;
-
-我们无需编写 while 循环读取响应数据了，取而代之的是连接 messageReceived信号。每当服务端推送一条新消息，这个信号就会被发射一次，我们的槽函数就会被调用一次。这正是我们梦寐以求的、真正的事件驱动的流式数据处理方式！
-个人思考：Qt gRPC 封装的优雅之处Qt的接口设计和使用方式确实有很多可取之处,Qt gRPC 模块的封装，堪称教科书级别的“框架集成”：
-
-使用风格的统一： 将grpc的调用过程统一成信号槽的方式与Qt的控件使用完全一致。
-原生信号槽的胜利： 整个 gRPC 的生命周期——发起调用、收到消息、调用结束——都被映射成了 Qt 的信号。这使得 gRPC的异步事件能像按钮点击、鼠标移动一样，被无缝地集成到 Qt 的事件循环中。
-使用更加简单： 开发者不再需要关心线程问题，只需关注业务逻辑。Qt 将这一切都隐藏在了QGrpcCallReply 和 QGrpcServerStream 对象的背后，提供了极其简洁和符合直觉的 API。
-
-总结与展望本文，我们探索了 Qt 官方提供的 Qt Grpc 模块，见证了它如何将 gRPC 的强大功能与 Qt 优雅的信号槽机制完美结合。通过使用QGrpcCallReply 和 QGrpcServerStream，我们以一种纯异步、事件驱动的方式，轻松地实现了 Unary 和 Streaming RPC，彻底解决了在 GUI应用中进行网络通信的核心痛点。
-这无疑是 Qt C++ 开发者的一大福音。它极大地降低了在桌面和移动应用中使用 gRPC 的门槛，让我们能更专注于创造富有价值的应用本身。
-]]></content>
-      <categories>
-        <category>动手实践-三方库</category>
-        <category>grpc</category>
-      </categories>
-      <tags>
-        <tag>C++</tag>
-        <tag>grpc</tag>
-        <tag>进程间通信</tag>
-      </tags>
-  </entry>
-  <entry>
     <title>grpc实践之路:04.grpc异步回调接口的使用</title>
     <url>/2025/07/14/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:04.%E5%BC%82%E6%AD%A5%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E4%BD%BF%E7%94%A8/</url>
     <content><![CDATA[前言在之前的文章中，我们实现的服务端模型都有一个共同的特点：它们是同步的。无论是 Unary RPC 还是流式 RPC，我们的服务端实现在 RPC 处理函数中都会阻塞，直到该次请求处理完成。这意味着，为了同时服务多个客户端，gRPC 的同步服务器不得不在其内部的线程池中为每一个并发请求分配一个线程。这种“一个请求一个线程”的模式，在并发量不高时简单有效。但试想一下，当成千上万的客户端同时涌入时，服务器的线程资源会被迅速耗尽，系统将不堪重负。
@@ -2082,6 +2031,57 @@ gRPC 框架内部已经为我们处理好了线程池、完成队列、以及事
 
 总结与展望本文，我们迈出了从“能用”到“高性能”的关键一步。通过学习和实践 gRPC 最新的 Callback API (Reactor 模式)，我们构建了一个真正意义上的异步服务端。
 我们深入理解了如何通过实现 ServerUnaryReactor 和 ServerWriteReactor，将业务逻辑与 gRPC 的事件循环解耦，从而让我们的服务能够用少量的线程处理海量的并发请求。
+]]></content>
+      <categories>
+        <category>动手实践-三方库</category>
+        <category>grpc</category>
+      </categories>
+      <tags>
+        <tag>C++</tag>
+        <tag>grpc</tag>
+        <tag>进程间通信</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>grpc实践之路:03.Qt与grpc的集成使用</title>
+    <url>/2025/07/07/grpc/grpc%E5%AE%9E%E8%B7%B5%E4%B9%8B%E8%B7%AF:03.Qt%E4%B8%8Egrpc%E7%9A%84%E9%9B%86%E6%88%90%E4%BD%BF%E7%94%A8/</url>
+    <content><![CDATA[前言在之前的文章中，我们从一个Qt应用的角度出发，探讨了怎么使用grpc作为进程间通信的手段，进行点对点的调用，并且讲解了怎么处理服务端产生的流数据。但是，既然都没涉及到Qt相关的内容，本篇文章就讲解下在Qt中怎么去使用Grpc作为客户端的集成。
+Qt作为一个主要应用在GUI中的应用框架，在其中最大的挑战就是：如何避免阻塞 UI 主线程。当然可以利用QThread和信号槽的机制去解决这个问题，但是却有些繁琐，需要我们自己去进行线程管理和对象的生命周期。但是，好消息是自动 Qt6.9版本之后，Qt 官方已经正式提供了对 gRPC 的原生支持 (Qt Grpc 模块)。这意味着我们不再需要手动创建线程来包装gRPC 调用了。Qt 将 gRPC与它核心的事件循环和信号槽机制完美地融合在了一起。
+本文，我们将探索这个“官方解决方案”，看看如何利用 Qt Grpc 模块，以一种前所未有的、极其优雅的方式，在 Qt 应用中实践 gRPC 通信。
+
+准备工作：CMake 与 Qt gRPC 模块要使用 Qt 官方的 gRPC 支持，首先你需要确保在安装 Qt 时，已经勾选并安装了 Qt Protobuf 和 Qt Grpc 这两个模块，并且安装好了Grpc和Protobuf。
+并且Qt官方也提供了Grpc的函数去处理grpc的原生命令
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.16)  project(MyGrpcQtProject)#配置你的项目,保证先安装了grpc和protobuf# 找到 Qt6，并确保 Protobuf 和 Grpc 组件可用  find_package(Qt6 REQUIRED COMPONENTS Protobuf Grpc)  qt_standard_project_setup()# 添加你的可执行文件  qt_add_executable(MyApp main.cpp clientguide.cpp) # 假设你的客户端逻辑在 clientguide.cpp# Qt 提供的 magic command，自动处理 .proto 文件！  # 它会调用 protoc 和 grpc_cpp_plugin 生成 Qt 风格的代码  qt_add_grpc(MyApp CLIENT # 或者 SERVER, BIDI  PROTO_FILES  path/to/your/service.proto  )# 链接到 Qt 提供的库  target_link_libraries(MyApp PRIVATE Qt6::Protobuf Qt6::Grpc)
+
+qt_add_grpc 这个命令了它会自动处理代码生成和编译，也不需要去手动处理proto文件的生成c代码了
+代码生成我们还是使用之前类似的 .proto 文件，但这次，由 qt_add_grpc 生成的文件会有些不同，它们是为 Qt 量身定做的。
+clientguide.proto
+syntax = &quot;proto3&quot;;  package client.guide; // enclosing namespacemessage Request &#123; /* ... */ &#125;  message Response &#123; /* ... */ &#125;service ClientGuideService &#123;  rpc UnaryCall (Request) returns (Response);  rpc ServerStreaming (Request) returns (stream Response);&#125;
+
+生成的文件名会带有 .qpb.h 和 .grpc.qpb.h 的后缀。它们不仅包含了 Protobuf 消息的 C++ 类，更重要的是，生成的 gRPC Stub 和Service 基类，其所有方法都原生返回 Qt 的异步对象，并通过信号槽来通知结果。
+下面是生成Qt grpc中源码生成的示意图
+实践：一个纯 Qt 风格的体验现在，让我们看看 Qt 官方示例中的客户端代码是如何利用这些新工具的。
+clientguide.cpp (核心逻辑)
+1. 初始化：创建 Channel 和 Client Stub//引入Qt生成的头文件#include &quot;clientguide.qpb.h&quot;#include &quot;clientguide_client.grpc.qpb.h&quot;//! [gen-includes]#include &lt;QtGrpc/QGrpcHttp2Channel&gt;#include &lt;QtGrpc/QGrpcServerStream.h&gt;#include &lt;QtCore/QCommandLineParser&gt;#include &lt;QtCore/QCoreApplication&gt;#include &lt;QtCore/QDateTime&gt;#include &lt;QtCore/QProcess&gt;#include &lt;QtCore/QThread&gt;#include &lt;QtCore/QUrl&gt;#include &lt;limits&gt;#include &lt;memory&gt;using namespace client;void startServerProcess();QDebug operator&lt;&lt;(QDebug debug, const guide::Response &amp;response);class ClientGuide : public QObject&#123;public:    explicit ClientGuide(std::shared_ptr&lt;QAbstractGrpcChannel&gt; channel)    &#123;        // 将 Qt 的 Channel 附加到 Qt 生成的 Client Stub 上         // 这一步和原生 gRPC 类似，但 Channel 和 Client 都是 Qt gRPC 提供的类型。        m_client.attachChannel(std::move(channel));    &#125;    static guide::Request createRequest(int32_t num, bool fail = false)    &#123;        guide::Request request;        request.setNum(num);        request.setTime(fail ? std::numeric_limits&lt;int64_t&gt;::max()                             : QDateTime::currentMSecsSinceEpoch());        return request;    &#125;       void unaryCall(const guide::Request &amp;request)    &#123;        std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);        const auto *replyPtr = reply.get();        QObject::connect(            replyPtr, &amp;QGrpcCallReply::finished, replyPtr,            [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;                if (status.isOk()) &#123;                    if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                        qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;                    else                        qDebug(&quot;Client (UnaryCall) deserialization failed&quot;);                &#125; else &#123;                    qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;                &#125;            &#125;,            Qt::SingleShotConnection);    &#125;    void serverStreaming(const guide::Request &amp;initialRequest)    &#123;        std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);        const auto *streamPtr = stream.get();        QObject::connect(            streamPtr, &amp;QGrpcServerStream::finished, streamPtr,            [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;                if (status.isOk())                    qDebug(&quot;Client (ServerStreaming) finished&quot;);                else                    qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;            &#125;,            Qt::SingleShotConnection);        QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, streamPtr, [streamPtr] &#123;            if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())                qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;            else                qDebug(&quot;Client (ServerStream) deserialization failed&quot;);        &#125;);    &#125;private:    guide::ClientGuideService::Client m_client;&#125;;int main(int argc, char *argv[])&#123;    QCoreApplication app(argc, argv);    QCommandLineParser parser;    QCommandLineOption enableUnary(&quot;U&quot;, &quot;Enable UnaryCalls&quot;);    QCommandLineOption enableSStream(&quot;S&quot;, &quot;Enable ServerStream&quot;);    parser.addHelpOption();    parser.addOption(enableUnary);    parser.addOption(enableSStream);    parser.process(app);    bool defaultRun = !parser.isSet(enableUnary) &amp;&amp; !parser.isSet(enableSStream)        &amp;&amp; !parser.isSet(enableCStream) &amp;&amp; !parser.isSet(enableBStream);    qDebug(&quot;Welcome to the clientguide!&quot;);    qDebug(&quot;Starting the server process ...&quot;);    startServerProcess();    //! [basic-0]    auto channel = std::make_shared&lt;QGrpcHttp2Channel&gt;(        QUrl(&quot;http://localhost:50056&quot;)        /* without channel options. */    );    ClientGuide clientGuide(channel);        if (defaultRun || parser.isSet(enableUnary)) &#123;        clientGuide.unaryCall(ClientGuide::createRequest(1));        clientGuide.unaryCall(ClientGuide::createRequest(2, true)); // fail the RPC        clientGuide.unaryCall(ClientGuide::createRequest(3));    &#125;    if (defaultRun || parser.isSet(enableSStream)) &#123;        clientGuide.serverStreaming(ClientGuide::createRequest(3));    &#125;    return app.exec();&#125;
+
+2. Unary RPC (点对点调用)Qt生成的客户端可以让我们直接利用信号槽的机制，不必为了避免阻塞UI，自动手动处理线程
+void ClientGuide::unaryCall(const guide::Request &amp;request)  &#123;  // 调用 RPC 方法，不再返回 Status，而是返回一个 QGrpcCallReply 指针！  std::unique_ptr&lt;QGrpcCallReply&gt; reply = m_client.UnaryCall(request);    // QGrpcCallReply 是一个 QObject，我们可以连接它的 finished 信号！      QObject::connect(reply.get(), &amp;QGrpcCallReply::finished, this,          // Lambda 表达式作为槽函数          [reply = std::move(reply)](const QGrpcStatus &amp;status) &#123;              // 这个 Lambda 将在 Qt 的事件循环中被安全地调用，不会阻塞              if (status.isOk()) &#123;                  if (const auto response = reply-&gt;read&lt;guide::Response&gt;())                      qDebug() &lt;&lt; &quot;Client (UnaryCall) finished, received:&quot; &lt;&lt; *response;              &#125; else &#123;                  qDebug() &lt;&lt; &quot;Client (UnaryCall) failed:&quot; &lt;&lt; status;              &#125;          &#125;);  &#125;
+
+m_client.UnaryCall 立即返回一个 QGrpcCallReply 对象，完全不会阻塞。我们只需要连接它的 finished信号，就可以在未来的某个时刻，当 RPC 调用完成时，在槽函数中处理结果。整个过程是纯异步、事件驱动的，完美融入了 Qt 的体系。
+下面的是调用过程的示意图:
+3. Server Streaming (服务端流)处理流式数据也变得异常简单。调用流式 RPC 方法会返回一个 QGrpcServerStream 对象。
+void ClientGuide::serverStreaming(const guide::Request &amp;initialRequest)  &#123;  // 调用流式 RPC，返回一个 QGrpcServerStream 指针  std::unique_ptr&lt;QGrpcServerStream&gt; stream = m_client.ServerStreaming(initialRequest);  const auto *streamPtr = stream.get();    // 连接 finished 信号，处理流结束事件      QObject::connect(streamPtr, &amp;QGrpcServerStream::finished, this,          [stream = std::move(stream)](const QGrpcStatus &amp;status) &#123;              if (status.isOk())                  qDebug(&quot;Client (ServerStreaming) finished&quot;);              else                  qDebug() &lt;&lt; &quot;Client (ServerStreaming) failed:&quot; &lt;&lt; status;          &#125;);            // 连接 messageReceived 信号，处理每一条从服务端推送来的消息！      QObject::connect(streamPtr, &amp;QGrpcServerStream::messageReceived, this, [streamPtr] &#123;          if (const auto response = streamPtr-&gt;read&lt;guide::Response&gt;())              qDebug() &lt;&lt; &quot;Client (ServerStream) received:&quot; &lt;&lt; *response;      &#125;);  &#125;
+
+我们无需编写 while 循环读取响应数据了，取而代之的是连接 messageReceived信号。每当服务端推送一条新消息，这个信号就会被发射一次，我们的槽函数就会被调用一次。这正是我们梦寐以求的、真正的事件驱动的流式数据处理方式！
+个人思考：Qt gRPC 封装的优雅之处Qt的接口设计和使用方式确实有很多可取之处,Qt gRPC 模块的封装，堪称教科书级别的“框架集成”：
+
+使用风格的统一： 将grpc的调用过程统一成信号槽的方式与Qt的控件使用完全一致。
+原生信号槽的胜利： 整个 gRPC 的生命周期——发起调用、收到消息、调用结束——都被映射成了 Qt 的信号。这使得 gRPC的异步事件能像按钮点击、鼠标移动一样，被无缝地集成到 Qt 的事件循环中。
+使用更加简单： 开发者不再需要关心线程问题，只需关注业务逻辑。Qt 将这一切都隐藏在了QGrpcCallReply 和 QGrpcServerStream 对象的背后，提供了极其简洁和符合直觉的 API。
+
+总结与展望本文，我们探索了 Qt 官方提供的 Qt Grpc 模块，见证了它如何将 gRPC 的强大功能与 Qt 优雅的信号槽机制完美结合。通过使用QGrpcCallReply 和 QGrpcServerStream，我们以一种纯异步、事件驱动的方式，轻松地实现了 Unary 和 Streaming RPC，彻底解决了在 GUI应用中进行网络通信的核心痛点。
+这无疑是 Qt C++ 开发者的一大福音。它极大地降低了在桌面和移动应用中使用 gRPC 的门槛，让我们能更专注于创造富有价值的应用本身。
 ]]></content>
       <categories>
         <category>动手实践-三方库</category>
@@ -4971,6 +4971,212 @@ Wireshark 本质上就是将网卡接收到的数据包解析出来并展示给�
       </categories>
       <tags>
         <tag>网络</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>从贝叶斯滤波到拓展卡尔曼滤波</title>
+    <url>/2026/07/31/%E7%8A%B6%E6%80%81%E4%BC%B0%E8%AE%A1/%E8%B4%9D%E5%8F%B6%E6%96%AF%E8%A7%92%E5%BA%A6%E6%8E%A8%E5%AF%BC%E6%8B%93%E5%B1%95%E5%8D%A1%E5%B0%94%E6%9B%BC%E6%BB%A4%E6%B3%A2/</url>
+    <content><![CDATA[
+本文承接上一篇《从贝叶斯滤波到线性卡尔曼滤波》，继续在贝叶斯滤波框架下讨论：当系统变为非线性时，如何通过一阶线性化得到拓展卡尔曼滤波（EKF）。推导仍参考希莫-萨日伽的《贝叶斯滤波与平滑》。
+
+从线性到非线性上一篇已经说明：在线性系统 + 高斯噪声假设下，贝叶斯滤波的解析解就是线性卡尔曼滤波（LKF）。
+回忆一下那条推导链真正依赖什么。贝叶斯滤波本身只给出递归骨架：
+$$p(\mathbf{x}k \mid \mathbf{y}{1:k})\propto p(\mathbf{y}_k \mid \mathbf{x}_k), p(\mathbf{x}k \mid \mathbf{y}{1:k-1})\tag{1}$$
+而要把式 (1) 算成闭式高斯递推，上一篇用的是：
+
+预测：用上一时刻后验 $p(\mathbf{x}{k-1} \mid \mathbf{y}{1:k-1})$ 与状态转移密度 $p(\mathbf{x}k \mid \mathbf{x}{k-1})$，经定理 1 得到联合，再边缘化出预测；
+更新：用预测与量测密度 $p(\mathbf{y}_k \mid \mathbf{x}_k)$，再经定理 1、定理 2 得到后验。
+
+定理 1 的关键假设是：条件分布的均值对状态必须是线性的。也就是说，LKF 真正吃定的，并不是「预测碰巧是高斯」，而是：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1})&#x3D; \mathcal{N}(\mathbf{A}{k-1}\mathbf{x}{k-1},, \mathbf{Q}_{k-1})\quad\text{—— 转移密度是线性高斯}$$
+$$p(\mathbf{y}_k \mid \mathbf{x}_k)&#x3D; \mathcal{N}(\mathbf{H}_k\mathbf{x}_k,, \mathbf{R}_k)\quad\text{—— 量测密度是线性高斯}$$
+一旦系统变成非线性：
+$$\mathbf{x}k &#x3D; \mathbf{f}(\mathbf{x}{k-1}) + \mathbf{q}{k-1},\qquad\mathbf{q}{k-1} \sim \mathcal{N}(\mathbf{0},, \mathbf{Q}_{k-1})\tag{2}$$
+$$\mathbf{y}_k &#x3D; \mathbf{h}(\mathbf{x}_k) + \mathbf{r}_k,\qquad\mathbf{r}_k \sim \mathcal{N}(\mathbf{0},, \mathbf{R}_k)\tag{3}$$
+转移密度与量测密度立刻变成：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1})&#x3D; \mathcal{N}!\bigl(\mathbf{f}(\mathbf{x}{k-1}),, \mathbf{Q}{k-1}\bigr)\tag{4}$$
+$$p(\mathbf{y}_k \mid \mathbf{x}_k)&#x3D; \mathcal{N}!\bigl(\mathbf{h}(\mathbf{x}_k),, \mathbf{R}_k\bigr)\tag{5}$$
+二者条件于状态后仍是高斯，但条件均值 $\mathbf{f}(\cdot)$、$\mathbf{h}(\cdot)$ 对状态非线性，不再满足定理 1。这才是问题的核心：
+
+需要处理的，是转移密度 $p(\mathbf{x}k \mid \mathbf{x}{k-1})$ 与量测密度 $p(\mathbf{y}_k \mid \mathbf{x}_k)$。预测分布不再保持高斯，只是前者无法套用定理 1 之后的结果。
+
+EKF 的核心想法：在当前估计点附近，用一阶泰勒展开把 $\mathbf{f}$、$\mathbf{h}$ 局部线性化，使这两个条件密度重新回到定理 1 要求的线性高斯形式，于是上一篇的推导几乎原样可用。
+
+预备：仍然需要那两个定理上一篇给出的两个高斯分布定理仍然是推导工具，这里只复述结论，便于对照。
+定理 1：边缘 + 条件 $\Rightarrow$ 联合若 $\mathbf{X} \sim \mathcal{N}(\mathbf{m},, \mathbf{P})$，且$\mathbf{y} \mid \mathbf{X} \sim \mathcal{N}(\mathbf{H}\mathbf{X} + \mathbf{u},, \mathbf{R})$，则
+$$\begin{pmatrix} \mathbf{X} \ \mathbf{y} \end{pmatrix}\sim \mathcal{N}!\left(\begin{pmatrix} \mathbf{m} \ \mathbf{H}\mathbf{m} + \mathbf{u} \end{pmatrix},;\begin{pmatrix}\mathbf{P} &amp; \mathbf{P}\mathbf{H}^\top \\mathbf{H}\mathbf{P} &amp; \mathbf{H}\mathbf{P}\mathbf{H}^\top + \mathbf{R}\end{pmatrix}\right)\tag{6}$$
+注意前提：条件均值必须对 $\mathbf{X}$ 线性。这正是非线性模型下最先被破坏的条件。
+定理 2：联合 $\Rightarrow$ 条件若联合为式 (6) 的分块形式，则
+$$\mathbf{X} \mid \mathbf{y}\sim \mathcal{N}!\left(\mathbf{a} + \mathbf{C}\mathbf{B}^{-1}(\mathbf{y} - \mathbf{b}),;\mathbf{A} - \mathbf{C}\mathbf{B}^{-1}\mathbf{C}^\top\right)\tag{7}$$
+
+EKF 并不改写这两个定理，它改写的是：如何把非线性的转移 &#x2F; 量测密度近似成定理 1 所要求的线性条件均值形式。
+
+
+问题定义状态方程（非线性过程模型）：式 (2)
+观测方程（非线性测量模型）：式 (3)
+上一时刻后验（已知）：
+$$p(\mathbf{x}{k-1} \mid \mathbf{y}{1:k-1})&#x3D; \mathcal{N}(\mathbf{m}{k-1},, \mathbf{P}{k-1})\tag{8}$$
+目标：求当前时刻后验 $p(\mathbf{x}k \mid \mathbf{y}{1:k})$。
+由贝叶斯公式与马尔可夫性，递归中真正用到的两个条件密度是：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1})&#x3D; \mathcal{N}!\bigl(\mathbf{f}(\mathbf{x}{k-1}),, \mathbf{Q}{k-1}\bigr)\quad\text{—— 状态转移密度}\tag{9}$$
+$$p(\mathbf{y}_k \mid \mathbf{x}_k)&#x3D; \mathcal{N}!\bigl(\mathbf{h}(\mathbf{x}_k),, \mathbf{R}_k\bigr)\quad\text{—— 量测密度 &#x2F; 似然}\tag{10}$$
+以及由前者与上一时刻后验推出的预测：
+$$p(\mathbf{x}k \mid \mathbf{y}{1:k-1})\quad\text{—— 预测分布，由转移密度推出}\tag{11}$$
+非线性模型下，式 (9)(10) 不再是线性高斯；EKF 要做的，就是先把它们近似回去。
+
+推导总思路整体仍是三步，但每一步的入口都是「先处理对应的条件密度」：
+$$\boxed{\begin{aligned}\text{Step 1} &amp;\quad \text{线性化转移密度 } p(\mathbf{x}k \mid \mathbf{x}{k-1});\Rightarrow; \text{预测 } p(\mathbf{x}k \mid \mathbf{y}{1:k-1}) \\text{Step 2} &amp;\quad \text{线性化量测密度 } p(\mathbf{y}_k \mid \mathbf{x}_k);\Rightarrow; \text{联合 } p(\mathbf{x}_k, \mathbf{y}k \mid \mathbf{y}{1:k-1}) \\text{Step 3} &amp;\quad \text{定理 2 } \Rightarrow p(\mathbf{x}k \mid \mathbf{y}{1:k})\end{aligned}}$$
+与 LKF 的差别可以一句话说清：
+
+LKF 中，转移密度与量测密度本身就是线性高斯，$\mathbf{A}_{k-1}$、$\mathbf{H}_k$ 是系统给定的；EKF 中，先用雅可比把这两个密度局部线性化，再走同一套定理。
+
+
+第一步：预测（时间更新）利用马尔可夫性与上一篇相同，要算 $p(\mathbf{x}k \mid \mathbf{y}{1:k-1})$，先写联合：
+$$p(\mathbf{x}k, \mathbf{x}{k-1} \mid \mathbf{y}{1:k-1})&#x3D; p(\mathbf{x}k \mid \mathbf{x}{k-1}, \mathbf{y}{1:k-1}),p(\mathbf{x}{k-1} \mid \mathbf{y}{1:k-1})\tag{12}$$
+由马尔可夫性：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1}, \mathbf{y}_{1:k-1})&#x3D; p(\mathbf{x}k \mid \mathbf{x}{k-1})\tag{13}$$
+于是预测步的两个输入是：
+
+上一时刻后验：$p(\mathbf{x}{k-1} \mid \mathbf{y}{1:k-1}) &#x3D; \mathcal{N}(\mathbf{m}{k-1},, \mathbf{P}{k-1})$（高斯，没问题）
+状态转移密度：$p(\mathbf{x}k \mid \mathbf{x}{k-1}) &#x3D; \mathcal{N}!\bigl(\mathbf{f}(\mathbf{x}{k-1}),, \mathbf{Q}{k-1}\bigr)$
+
+卡住的地方在后者：条件均值 $\mathbf{f}(\mathbf{x}{k-1})$ 对 $\mathbf{x}{k-1}$ 非线性，不满足定理 1 的线性条件均值假设。因此无法从「高斯后验 × 转移密度」直接得到高斯联合，也就无法闭式求出预测。
+一阶泰勒线性化转移密度在上一时刻后验均值 $\mathbf{m}_{k-1}$ 处展开 $\mathbf{f}$：
+$$\begin{aligned}\mathbf{x}k&amp;&#x3D; \mathbf{f}(\mathbf{x}{k-1}) + \mathbf{q}{k-1} \&amp;\approx \mathbf{f}(\mathbf{m}{k-1}) + \mathbf{A}{k-1},(\mathbf{x}{k-1} - \mathbf{m}{k-1}) + \mathbf{q}{k-1}\end{aligned}\tag{14}$$
+其中雅可比：
+$$\mathbf{A}{k-1}\triangleq\left.\frac{\partial \mathbf{f}(\mathbf{x})}{\partial \mathbf{x}}\right|{\mathbf{x}&#x3D;\mathbf{m}_{k-1}}\tag{15}$$
+于是转移密度被近似回线性高斯：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1})\approx\mathcal{N}!\bigl(\mathbf{f}(\mathbf{m}{k-1}) + \mathbf{A}{k-1},(\mathbf{x}{k-1} - \mathbf{m}{k-1}),,\mathbf{Q}_{k-1}\bigr)\tag{16}$$
+对照定理 1：这里 $\mathbf{H} &#x3D; \mathbf{A}{k-1}$，$\mathbf{u} &#x3D; \mathbf{f}(\mathbf{m}{k-1}) - \mathbf{A}{k-1}\mathbf{m}{k-1}$，$\mathbf{R} &#x3D; \mathbf{Q}_{k-1}$。
+应用定理 1 并边缘化现在两个输入都符合定理 1，联合分布的边缘即为预测：
+$$p(\mathbf{x}k \mid \mathbf{y}{1:k-1})\approx \mathcal{N}(\mathbf{m}_k^-,, \mathbf{P}_k^-)\tag{17}$$
+其中：
+$$\boxed{\mathbf{m}k^- &#x3D; \mathbf{f}(\mathbf{m}{k-1})}\tag{18}$$
+$$\boxed{\mathbf{P}k^- &#x3D; \mathbf{A}{k-1},\mathbf{P}{k-1},\mathbf{A}{k-1}^\top + \mathbf{Q}_{k-1}}\tag{19}$$
+这就是 EKF 的预测步。
+要点再强调一次：我们近似的是转移密度式 (16)；预测式 (17) 是它与上一时刻后验经定理 1 后的结果。均值用完整的 $\mathbf{f}(\mathbf{m}{k-1})$ 传播，协方差用线性化后的 $\mathbf{A}{k-1}$ 传播——「均值走非线性、协方差走线性化」由此而来。
+
+第二步：构造联合分布预测已得：
+$$p(\mathbf{x}k \mid \mathbf{y}{1:k-1}) \approx \mathcal{N}(\mathbf{m}_k^-,, \mathbf{P}_k^-)\tag{20}$$
+更新步还需要量测密度：
+$$p(\mathbf{y}_k \mid \mathbf{x}_k)&#x3D; \mathcal{N}!\bigl(\mathbf{h}(\mathbf{x}_k),, \mathbf{R}_k\bigr)\tag{21}$$
+同样的逻辑：预测可以近似为高斯，但量测密度的条件均值 $\mathbf{h}(\mathbf{x}_k)$ 非线性，定理 1 仍然不能直接用。需要处理的仍是这个条件密度本身。
+在预测均值处线性化量测密度$$\begin{aligned}\mathbf{y}_k&amp;&#x3D; \mathbf{h}(\mathbf{x}_k) + \mathbf{r}_k \&amp;\approx \mathbf{h}(\mathbf{m}_k^-) + \mathbf{H}_k,(\mathbf{x}_k - \mathbf{m}_k^-) + \mathbf{r}_k\end{aligned}\tag{22}$$
+其中：
+$$\mathbf{H}k\triangleq\left.\frac{\partial \mathbf{h}(\mathbf{x})}{\partial \mathbf{x}}\right|{\mathbf{x}&#x3D;\mathbf{m}_k^-}\tag{23}$$
+于是量测密度被近似回线性高斯：
+$$p(\mathbf{y}_k \mid \mathbf{x}_k)\approx\mathcal{N}!\bigl(\mathbf{h}(\mathbf{m}_k^-) + \mathbf{H}_k,(\mathbf{x}_k - \mathbf{m}_k^-),,\mathbf{R}_k\bigr)\tag{24}$$
+对照定理 1：$\mathbf{H} &#x3D; \mathbf{H}_k$，$\mathbf{u} &#x3D; \mathbf{h}(\mathbf{m}_k^-) - \mathbf{H}_k\mathbf{m}_k^-$，$\mathbf{R} &#x3D; \mathbf{R}_k$。
+应用定理 1得 $(\mathbf{x}_k,, \mathbf{y}_k)$ 的近似联合：
+$$\begin{pmatrix} \mathbf{x}_k \ \mathbf{y}k \end{pmatrix}\Bigg| \mathbf{y}{1:k-1}\sim \mathcal{N}!\left(\begin{pmatrix} \mathbf{m}_k^- \ \mathbf{h}(\mathbf{m}_k^-) \end{pmatrix},;\begin{pmatrix}\mathbf{P}_k^- &amp; \mathbf{P}_k^- \mathbf{H}_k^\top \\mathbf{H}_k \mathbf{P}_k^- &amp; \mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}_k\end{pmatrix}\right)\tag{25}$$
+引入新息协方差：
+$$\mathbf{S}_k \triangleq \mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}_k\tag{26}$$
+注意：联合均值里的预测观测是 $\mathbf{h}(\mathbf{m}_k^-)$，不是 $\mathbf{H}_k \mathbf{m}_k^-$——因为量测均值仍用非线性 $\mathbf{h}$ 计算，只是把条件均值对状态的依赖线性化了。
+
+第三步：更新（测量更新）对式 (25) 应用定理 2，参数为：
+$$\mathbf{a} &#x3D; \mathbf{m}_k^-,\quad\mathbf{A} &#x3D; \mathbf{P}_k^-,\quad\mathbf{b} &#x3D; \mathbf{h}(\mathbf{m}_k^-),\quad\mathbf{B} &#x3D; \mathbf{S}_k,\quad\mathbf{C} &#x3D; \mathbf{P}_k^- \mathbf{H}_k^\top\tag{27}$$
+得近似后验：
+$$p(\mathbf{x}k \mid \mathbf{y}{1:k})\approx \mathcal{N}(\mathbf{m}_k,, \mathbf{P}_k)\tag{28}$$
+后验均值$$\mathbf{m}_k&#x3D; \mathbf{m}_k^- + \mathbf{P}_k^- \mathbf{H}_k^\top \mathbf{S}_k^{-1}\left(\mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)\right)\tag{29}$$
+定义卡尔曼增益：
+$$\mathbf{K}_k \triangleq \mathbf{P}_k^- \mathbf{H}_k^\top \mathbf{S}_k^{-1}&#x3D; \mathbf{P}_k^- \mathbf{H}_k^\top\left(\mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}_k\right)^{-1}\tag{30}$$
+则：
+$$\boxed{\mathbf{m}_k &#x3D; \mathbf{m}_k^- + \mathbf{K}_k \left(\mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)\right)}\tag{31}$$
+新息为 $\boldsymbol{\nu}_k \triangleq \mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)$。
+后验协方差$$\boxed{\mathbf{P}_k &#x3D; \mathbf{P}_k^- - \mathbf{K}_k \mathbf{H}_k \mathbf{P}_k^-&#x3D; (\mathbf{I} - \mathbf{K}_k \mathbf{H}_k),\mathbf{P}_k^-}\tag{32}$$
+Joseph 形式（数值更稳定）：
+$$\mathbf{P}_k&#x3D; (\mathbf{I} - \mathbf{K}_k \mathbf{H}_k),\mathbf{P}_k^-,(\mathbf{I} - \mathbf{K}_k \mathbf{H}_k)^\top + \mathbf{K}_k \mathbf{R}_k \mathbf{K}_k^\top\tag{33}$$
+这就是 EKF 的更新步。
+
+写成标准 EKF 形式Algorithm: Extended Kalman Filter (EKF)输入：$\mathbf{m}{k-1},, \mathbf{P}{k-1},, \mathbf{y}_k$
+
+① 预测（Predict &#x2F; Time Update）
+先线性化转移密度，再传播：
+$$\mathbf{A}{k-1}&#x3D; \left.\frac{\partial \mathbf{f}}{\partial \mathbf{x}}\right|{\mathbf{m}_{k-1}}\tag{34}$$
+$$\mathbf{m}k^- &#x3D; \mathbf{f}(\mathbf{m}{k-1})\tag{35}$$
+$$\mathbf{P}k^- &#x3D; \mathbf{A}{k-1},\mathbf{P}{k-1},\mathbf{A}{k-1}^\top + \mathbf{Q}_{k-1}\tag{36}$$
+
+② 更新（Update &#x2F; Measurement Update）
+先线性化量测密度，再更新：
+$$\mathbf{H}k&#x3D; \left.\frac{\partial \mathbf{h}}{\partial \mathbf{x}}\right|{\mathbf{m}_k^-}\tag{37}$$
+$$\mathbf{S}_k &#x3D; \mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}_k\qquad\text{（新息协方差）}\tag{38}$$
+$$\mathbf{K}_k &#x3D; \mathbf{P}_k^- \mathbf{H}_k^\top \mathbf{S}_k^{-1}\qquad\text{（卡尔曼增益）}\tag{39}$$
+$$\mathbf{m}_k &#x3D; \mathbf{m}_k^- + \mathbf{K}_k \left(\mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)\right)\qquad\text{（后验均值）}\tag{40}$$
+$$\mathbf{P}_k &#x3D; (\mathbf{I} - \mathbf{K}_k \mathbf{H}_k),\mathbf{P}_k^-\qquad\text{（后验协方差）}\tag{41}$$
+
+输出：$\mathbf{m}_k,, \mathbf{P}_k$
+
+完整算法框图（一行流）$$\boxed{\begin{aligned}&amp;\text{Predict:}\quad\mathbf{A}{k-1}&#x3D;\partial\mathbf{f}&#x2F;\partial\mathbf{x}|{\mathbf{m}{k-1}},;\mathbf{m}k^- &#x3D; \mathbf{f}(\mathbf{m}{k-1}),;\mathbf{P}k^- &#x3D; \mathbf{A}{k-1}\mathbf{P}{k-1}\mathbf{A}{k-1}^\top + \mathbf{Q}{k-1} \[6pt]&amp;\text{Update:}\quad\mathbf{H}k&#x3D;\partial\mathbf{h}&#x2F;\partial\mathbf{x}|{\mathbf{m}_k^-},;\mathbf{K}_k &#x3D; \mathbf{P}_k^- \mathbf{H}_k^\top(\mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}_k)^{-1}, \&amp;\qquad\qquad\mathbf{m}_k &#x3D; \mathbf{m}_k^- + \mathbf{K}_k(\mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)),;\mathbf{P}_k &#x3D; (\mathbf{I} - \mathbf{K}_k \mathbf{H}_k)\mathbf{P}_k^-\end{aligned}}\tag{42}$$
+
+小结与直觉因果链要分清非线性下真正坏掉的是：
+$$p(\mathbf{x}k \mid \mathbf{x}{k-1}),\qquad p(\mathbf{y}_k \mid \mathbf{x}_k)$$
+不再具有定理 1 所需的线性条件均值。
+于是：
+$$\begin{aligned}&amp;\text{转移密度不再是线性高斯}&amp;&amp;\Rightarrow;\text{无法直接用定理 1 做预测} \&amp;\text{量测密度不再是线性高斯}&amp;&amp;\Rightarrow;\text{无法直接用定理 1 构造联合}\end{aligned}$$
+和 LKF 差在哪里
+
+
+项目
+LKF
+EKF
+
+
+
+转移密度
+$\mathcal{N}(\mathbf{A}{k-1}\mathbf{x}{k-1},, \mathbf{Q})$
+先线性化 $\mathbf{f}$，再近似为线性高斯
+
+
+量测密度
+$\mathcal{N}(\mathbf{H}_k\mathbf{x}_k,, \mathbf{R})$
+先线性化 $\mathbf{h}$，再近似为线性高斯
+
+
+预测均值
+$\mathbf{A}{k-1}\mathbf{m}{k-1}$
+$\mathbf{f}(\mathbf{m}_{k-1})$
+
+
+预测协方差
+用系统矩阵 $\mathbf{A}$
+用雅可比 $\mathbf{A}_{k-1}$
+
+
+新息
+$\mathbf{y}_k - \mathbf{H}_k\mathbf{m}_k^-$
+$\mathbf{y}_k - \mathbf{h}(\mathbf{m}_k^-)$
+
+
+更新增益 &#x2F; 协方差
+用系统矩阵 $\mathbf{H}$
+用雅可比 $\mathbf{H}_k$
+
+
+精确性
+线性高斯下精确
+一阶近似，一般不精确
+
+
+几个直觉为什么线性化的对象是 $\mathbf{f}$、$\mathbf{h}$
+因为它们分别定义了转移密度与量测密度的条件均值；定理 1 卡住的正是「条件均值对状态非线性」。
+均值走非线性，协方差走线性
+对转移密度：均值仍用 $\mathbf{f}(\mathbf{m}{k-1})$，不丢掉常数项；对状态扰动的敏感度由雅可比 $\mathbf{A}{k-1}$ 描述，故协方差用 $\mathbf{A}$ 传播。量测同理：新息用 $\mathbf{h}(\mathbf{m}_k^-)$，增益与协方差用 $\mathbf{H}_k$。
+近似何时可靠
+线性化点附近若 $\mathbf{f}$、$\mathbf{h}$ 近似线性，且噪声不太大，局部线性高斯假设往往够用；强非线性时，一阶近似的转移 &#x2F; 量测密度偏差变大，需要 UKF、粒子滤波等。
+贝叶斯视角下的定位
+$$\text{贝叶斯递归骨架不变};\xrightarrow{\text{线性化 }p(\mathbf{x}k|\mathbf{x}{k-1}),; p(\mathbf{y}_k|\mathbf{x}_k)};\text{局部线性高斯};\xrightarrow{\text{定理 1 + 定理 2}};\text{EKF}$$
+上一篇假定转移与量测本来就是线性高斯；本文只是在同一套贝叶斯骨架上，为这两个条件密度补上了「局部线性化」。
+
+如果这篇推导对你有帮助，欢迎点赞收藏。后续可能继续写：无迹卡尔曼滤波（UKF）、误差状态卡尔曼滤波（ESKF），以及它们与 EKF &#x2F; LKF 的对比。
+
+]]></content>
+      <categories>
+        <category>贝叶斯滤波</category>
+        <category>状态估计</category>
+      </categories>
+      <tags>
+        <tag>卡尔曼滤波</tag>
+        <tag>EKF</tag>
       </tags>
   </entry>
   <entry>
